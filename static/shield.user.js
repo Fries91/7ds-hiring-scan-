@@ -627,4 +627,88 @@
     const next = open ?? !isOpen;
     panel.style.display = next ? "block" : "none";
     if (next) startPolling();
-    else stopPo
+    else stopPolling();
+  }
+
+  btn.addEventListener("click", () => toggle());
+
+  // =========================
+  // DRAGGING (💼 + PANEL)
+  // =========================
+  function makeDraggable(node, saveKeyBtnOrPanel) {
+    let dragging = false;
+    let startX = 0, startY = 0, origX = 0, origY = 0;
+    let moved = false;
+
+    function down(e) {
+      const t = e.touches ? e.touches[0] : e;
+      dragging = true;
+      moved = false;
+      startX = t.clientX;
+      startY = t.clientY;
+
+      const r = node.getBoundingClientRect();
+      origX = r.left;
+      origY = r.top;
+
+      // switch to left/top anchoring for smooth drag
+      node.style.right = "auto";
+      node.style.bottom = "auto";
+      node.style.left = origX + "px";
+      node.style.top = origY + "px";
+
+      e.preventDefault?.();
+    }
+
+    function move(e) {
+      if (!dragging) return;
+      const t = e.touches ? e.touches[0] : e;
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
+
+      const x = Math.max(6, Math.min(window.innerWidth - node.offsetWidth - 6, origX + dx));
+      const y = Math.max(6, Math.min(window.innerHeight - node.offsetHeight - 6, origY + dy));
+
+      node.style.left = x + "px";
+      node.style.top = y + "px";
+    }
+
+    function up() {
+      if (!dragging) return;
+      dragging = false;
+
+      const r = node.getBoundingClientRect();
+      if (saveKeyBtnOrPanel === "btn") {
+        savedPos.btnLeft = Math.round(r.left);
+        savedPos.btnTop = Math.round(r.top);
+      } else {
+        savedPos.panelLeft = Math.round(r.left);
+        savedPos.panelTop = Math.round(r.top);
+      }
+      LS.set("h7ds_pos", savedPos);
+
+      // If it was a drag, avoid accidental click toggles
+      if (moved && node === btn) {
+        // do nothing; click will still fire sometimes on mobile, but moved threshold helps a lot
+      }
+    }
+
+    node.addEventListener("mousedown", down);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+
+    node.addEventListener("touchstart", down, { passive: false });
+    window.addEventListener("touchmove", move, { passive: false });
+    window.addEventListener("touchend", up);
+  }
+
+  makeDraggable(btn, "btn");
+  makeDraggable(panel, "panel");
+
+  // Initial render (closed)
+  render();
+
+  // little boot note
+  showToast("💼 Hiring Hub loaded");
+})();
