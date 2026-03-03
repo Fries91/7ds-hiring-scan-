@@ -28,7 +28,7 @@ def health():
 @app.get("/")
 def home():
     # Simple single-page panel (no templates needed)
-    return Response(f"""
+    return Response("""
 <!doctype html>
 <html>
 <head>
