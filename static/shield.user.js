@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS Hiring Hub 💼 (Draggable + CSP-proof) [Applications + Company Train Tracker]
+// @name         7DS Hiring Hub 💼 (MATCHES APP) [Draggable + Tap Open + Applications + Workstats Viewer]
 // @namespace    7ds-wrath-hiring
-// @version      1.0.0
-// @description  💼 Draggable launcher for your Hiring Hub. CSP-proof (no iframe): pulls applications from your Render service, lets you change status, open Torn profiles, and includes per-company Train Tracker dropdowns (local storage).
+// @version      1.2.0
+// @description  💼 Draggable launcher that opens a hiring panel and pulls data from your Render app (/api/applications). Lets you change application status + open profile + fetch applicant workstats via /api/applicant (requires their API key). Built to match your current app.py endpoints and avoid CSP/iframe issues.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -11,44 +11,34 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      sevends-hiring-scan.onrender.com
-// @connect      api.torn.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
   // =========================
-  // CONFIG
+  // CONFIG (MATCH YOUR APP)
   // =========================
   const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // your Render service
-  // If your server has ADMIN_TOKEN enabled, put it here. If server ADMIN_TOKEN is blank, leave this blank too.
-  const ADMIN_TOKEN = ""; // e.g. "your_admin_token"
 
-  // Company cards (local UI + train tracking). Add/edit names here.
-  const DEFAULT_COMPANIES = [
-    { id: "c1", name: "Company 1" },
-    { id: "c2", name: "Company 2" },
-    { id: "c3", name: "Company 3" },
-  ];
+  // If your Render env ADMIN_TOKEN is set (not blank), you MUST set the same value here,
+  // or use the in-panel "Admin Token" box (it saves locally).
+  const ADMIN_TOKEN_DEFAULT = ""; // optional: hardcode it
 
-  // polling
-  const POLL_MS = 20000;
+  const POLL_MS = 15000;
 
   // =========================
-  // SMALL HELPERS
+  // STORAGE HELPERS
   // =========================
-  const LS = {
+  const S = {
     get(key, fallback) {
       try {
-        const v = GM_getValue(key);
-        return v === undefined || v === null || v === "" ? fallback : JSON.parse(v);
+        const raw = GM_getValue(key);
+        if (raw === undefined || raw === null || raw === "") return fallback;
+        return JSON.parse(raw);
       } catch {
-        try {
-          const v = GM_getValue(key);
-          return v === undefined || v === null || v === "" ? fallback : v;
-        } catch {
-          return fallback;
-        }
+        const raw = GM_getValue(key);
+        return raw === undefined || raw === null || raw === "" ? fallback : raw;
       }
     },
     set(key, value) {
@@ -60,78 +50,64 @@
     },
   };
 
-  function el(tag, attrs = {}, children = []) {
-    const n = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs)) {
-      if (k === "class") n.className = v;
-      else if (k === "html") n.innerHTML = v;
-      else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
-      else n.setAttribute(k, v);
-    }
-    for (const c of children) n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-    return n;
-  }
+  function qs(sel, root = document) { return root.querySelector(sel); }
+  function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
-  function nowTS() {
-    const d = new Date();
-    return d.toLocaleString();
-  }
-
-  function reqJSON(url, method = "GET", data = null) {
+  function reqJSON(url, method = "GET", body = null) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method,
         url,
-        headers: data ? { "Content-Type": "application/json" } : {},
-        data: data ? JSON.stringify(data) : null,
+        headers: body ? { "Content-Type": "application/json" } : {},
+        data: body ? JSON.stringify(body) : null,
         timeout: 25000,
         onload: (r) => {
           try {
-            const j = JSON.parse(r.responseText);
-            resolve(j);
-          } catch (e) {
-            reject(new Error("Bad JSON response"));
+            resolve(JSON.parse(r.responseText || "{}"));
+          } catch {
+            reject(new Error("Bad JSON"));
           }
         },
-        onerror: () => reject(new Error("Request failed")),
-        ontimeout: () => reject(new Error("Request timeout")),
+        onerror: () => reject(new Error("Network error")),
+        ontimeout: () => reject(new Error("Timeout")),
       });
     });
   }
 
-  function withAdmin(url) {
-    if (!ADMIN_TOKEN) return url;
-    return url.includes("?") ? `${url}&admin=${encodeURIComponent(ADMIN_TOKEN)}` : `${url}?admin=${encodeURIComponent(ADMIN_TOKEN)}`;
+  function nowNice() {
+    const d = new Date();
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
   // =========================
-  // UI: 💼 + PANEL
+  // UI SETUP
   // =========================
   const BTN_ID = "h7ds-briefcase";
-  const PANEL_ID = "h7ds-panel";
+  const PANEL_ID = "h7ds-hub";
   const TOAST_ID = "h7ds-toast";
 
   if (document.getElementById(BTN_ID)) return;
 
   GM_addStyle(`
-    #${BTN_ID}, #${PANEL_ID}, #${TOAST_ID}, #${PANEL_ID} * { box-sizing:border-box; }
+    #${BTN_ID}, #${PANEL_ID}, #${TOAST_ID}, #${PANEL_ID} * { box-sizing:border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
 
     #${BTN_ID}{
-      position:fixed; z-index:9999999;
-      width:42px; height:42px;
+      position:fixed; z-index:2147483647;
+      width:44px; height:44px;
       display:flex; align-items:center; justify-content:center;
       border-radius:14px;
       background:rgba(10,10,14,.88);
       border:1px solid rgba(255,255,255,.14);
       box-shadow:0 8px 22px rgba(0,0,0,.45);
-      font-size:24px; cursor:pointer;
+      font-size:26px;
       user-select:none; -webkit-user-select:none;
+      touch-action:none;
     }
 
     #${PANEL_ID}{
-      position:fixed; z-index:9999998;
+      position:fixed; z-index:2147483646;
       width:360px; max-width:94vw;
-      height:520px; max-height:80vh;
+      height:540px; max-height:82vh;
       border-radius:16px;
       background:rgba(12,12,18,.92);
       border:1px solid rgba(255,255,255,.12);
@@ -139,100 +115,78 @@
       overflow:hidden;
       display:none;
       backdrop-filter: blur(10px);
+      touch-action:none;
     }
 
-    #${PANEL_ID} .h7ds-head{
+    #${PANEL_ID} .h-head{
       height:44px;
       display:flex; align-items:center; justify-content:space-between;
       padding:0 10px;
       background:rgba(255,255,255,.06);
       border-bottom:1px solid rgba(255,255,255,.08);
       color:#fff;
-      font:700 13px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     }
-    #${PANEL_ID} .h7ds-head .left{
-      display:flex; gap:8px; align-items:center;
-    }
-    #${PANEL_ID} .h7ds-pill{
-      font:600 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      padding:6px 8px;
-      border-radius:999px;
-      background:rgba(0,0,0,.25);
-      border:1px solid rgba(255,255,255,.10);
-      color:#fff;
-    }
-    #${PANEL_ID} .h7ds-btn{
+    #${PANEL_ID} .h-title{ font-weight:900; font-size:13px; }
+    #${PANEL_ID} .h-sub{ opacity:.85; font-weight:700; font-size:11px; }
+
+    #${PANEL_ID} .h-btn{
       border:1px solid rgba(255,255,255,.14);
       background:rgba(0,0,0,.20);
       color:#fff;
       border-radius:10px;
       padding:7px 10px;
-      font:700 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-weight:900;
+      font-size:12px;
       cursor:pointer;
+      user-select:none;
     }
-    #${PANEL_ID} .h7ds-btn:active{ transform:scale(.98); }
-    #${PANEL_ID} .h7ds-close{
-      width:34px; height:34px; padding:0;
-      display:flex; align-items:center; justify-content:center;
-      border-radius:10px;
-    }
+    #${PANEL_ID} .h-btn:active{ transform:scale(.98); }
 
-    #${PANEL_ID} .h7ds-tabs{
+    #${PANEL_ID} .h-tabs{
       display:flex;
-      padding:8px 10px;
       gap:8px;
+      padding:8px 10px;
       border-bottom:1px solid rgba(255,255,255,.08);
     }
-    #${PANEL_ID} .h7ds-tab{
+    #${PANEL_ID} .h-tab{
       flex:1;
       text-align:center;
       padding:8px 10px;
       border-radius:12px;
-      font:800 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-weight:900; font-size:12px;
       cursor:pointer;
       border:1px solid rgba(255,255,255,.12);
       background:rgba(255,255,255,.05);
       color:#fff;
       user-select:none;
     }
-    #${PANEL_ID} .h7ds-tab.active{
+    #${PANEL_ID} .h-tab.active{
       background:rgba(0,0,0,.28);
       border-color:rgba(255,255,255,.18);
     }
 
-    #${PANEL_ID} .h7ds-body{
+    #${PANEL_ID} .h-body{
       height:calc(100% - 44px - 48px);
       overflow:auto;
       padding:10px;
       color:#fff;
-      font:600 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-size:12px;
+      font-weight:700;
     }
 
-    #${PANEL_ID} .h7ds-card{
+    #${PANEL_ID} .card{
       border:1px solid rgba(255,255,255,.10);
       background:rgba(0,0,0,.18);
       border-radius:14px;
       padding:10px;
       margin-bottom:10px;
     }
-    #${PANEL_ID} .h7ds-row{
-      display:flex; align-items:center; justify-content:space-between;
-      gap:8px;
-    }
-    #${PANEL_ID} .h7ds-title{
-      font:900 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    }
-    #${PANEL_ID} .h7ds-sub{
-      opacity:.82;
-      font:600 11px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      margin-top:4px;
-      word-break:break-word;
-    }
-    #${PANEL_ID} .h7ds-actions{
-      display:flex; gap:6px; flex-wrap:wrap;
-      margin-top:10px;
-    }
-    #${PANEL_ID} select, #${PANEL_ID} input{
+
+    #${PANEL_ID} .row{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    #${PANEL_ID} .muted{ opacity:.85; font-size:11px; font-weight:700; margin-top:4px; }
+    #${PANEL_ID} .actions{ display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+
+    #${PANEL_ID} select, #${PANEL_ID} input, #${PANEL_ID} textarea{
       width:100%;
       padding:8px 10px;
       border-radius:12px;
@@ -240,23 +194,13 @@
       background:rgba(0,0,0,.22);
       color:#fff;
       outline:none;
-      font:700 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-weight:800;
+      font-size:12px;
     }
-    #${PANEL_ID} .h7ds-mini{
-      padding:7px 9px;
-      border-radius:10px;
-      font:800 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    }
-
-    #${PANEL_ID} .h7ds-drop{
-      margin-top:10px;
-      border-top:1px dashed rgba(255,255,255,.14);
-      padding-top:10px;
-      display:none;
-    }
+    #${PANEL_ID} textarea{ min-height:84px; resize:vertical; }
 
     #${TOAST_ID}{
-      position:fixed; z-index:99999999;
+      position:fixed; z-index:2147483647;
       left:50%; transform:translateX(-50%);
       bottom:14px;
       padding:10px 12px;
@@ -264,23 +208,58 @@
       background:rgba(0,0,0,.78);
       border:1px solid rgba(255,255,255,.14);
       color:#fff;
-      font:800 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-weight:900;
+      font-size:12px;
       display:none;
       max-width:92vw;
       text-align:center;
     }
   `);
 
-  // default positions (saved)
-  const savedPos = LS.get("h7ds_pos", { btnLeft: null, btnTop: null, panelLeft: null, panelTop: null });
-  const btn = el("div", { id: BTN_ID }, ["💼"]);
-  const panel = el("div", { id: PANEL_ID });
+  const btn = document.createElement("div");
+  btn.id = BTN_ID;
+  btn.textContent = "💼";
 
-  // Set initial positions
-  function setInitial() {
-    if (savedPos.btnLeft !== null && savedPos.btnTop !== null) {
-      btn.style.left = savedPos.btnLeft + "px";
-      btn.style.top = savedPos.btnTop + "px";
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+
+  const toast = document.createElement("div");
+  toast.id = TOAST_ID;
+
+  document.body.appendChild(btn);
+  document.body.appendChild(panel);
+  document.body.appendChild(toast);
+
+  function toastMsg(msg) {
+    toast.textContent = msg;
+    toast.style.display = "block";
+    clearTimeout(toastMsg._t);
+    toastMsg._t = setTimeout(() => (toast.style.display = "none"), 1600);
+  }
+
+  // =========================
+  // STATE
+  // =========================
+  const pos = S.get("h7ds_pos_v2", {
+    btnLeft: null, btnTop: null,
+    panelLeft: null, panelTop: null
+  });
+
+  const st = {
+    tab: "apps",
+    apps: [],
+    last: null,
+    selectedApplicantId: "",
+    applicantKey: "",
+    workstatsJson: "",
+    adminToken: S.get("h7ds_admin_token", ADMIN_TOKEN_DEFAULT) || "",
+    timer: null,
+  };
+
+  function applyInitialPositions() {
+    if (pos.btnLeft != null && pos.btnTop != null) {
+      btn.style.left = pos.btnLeft + "px";
+      btn.style.top = pos.btnTop + "px";
       btn.style.right = "auto";
       btn.style.bottom = "auto";
     } else {
@@ -288,9 +267,9 @@
       btn.style.bottom = "120px";
     }
 
-    if (savedPos.panelLeft !== null && savedPos.panelTop !== null) {
-      panel.style.left = savedPos.panelLeft + "px";
-      panel.style.top = savedPos.panelTop + "px";
+    if (pos.panelLeft != null && pos.panelTop != null) {
+      panel.style.left = pos.panelLeft + "px";
+      panel.style.top = pos.panelTop + "px";
       panel.style.right = "auto";
       panel.style.bottom = "auto";
     } else {
@@ -298,329 +277,297 @@
       panel.style.bottom = "170px";
     }
   }
+  applyInitialPositions();
 
-  const toast = el("div", { id: TOAST_ID }, []);
-  document.body.appendChild(btn);
-  document.body.appendChild(panel);
-  document.body.appendChild(toast);
-  setInitial();
-
-  function showToast(msg) {
-    toast.textContent = msg;
-    toast.style.display = "block";
-    clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => (toast.style.display = "none"), 1800);
+  function withAdmin(url) {
+    const tok = (st.adminToken || "").trim();
+    if (!tok) return url; // if server ADMIN_TOKEN blank, endpoints work without it
+    return url.includes("?")
+      ? `${url}&admin=${encodeURIComponent(tok)}`
+      : `${url}?admin=${encodeURIComponent(tok)}`;
   }
 
   // =========================
-  // PANEL CONTENT
+  // RENDER
   // =========================
-  const state = {
-    tab: "apps",
-    lastFetch: null,
-    apps: [],
-    companies: LS.get("h7ds_companies", null) || DEFAULT_COMPANIES,
-    trains: LS.get("h7ds_trains", {}), // { companyId: [ {buyer, trains, note, ts} ] }
-    timer: null,
-  };
+  function render() {
+    panel.innerHTML = `
+      <div class="h-head">
+        <div>
+          <div class="h-title">7DS Hiring Scan</div>
+          <div class="h-sub">Last: <span id="h-last">${st.last || "—"}</span></div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="h-btn" id="h-refresh">↻</button>
+          <button class="h-btn" id="h-close">✕</button>
+        </div>
+      </div>
 
-  function saveCompanies() {
-    LS.set("h7ds_companies", state.companies);
-  }
-  function saveTrains() {
-    LS.set("h7ds_trains", state.trains);
-  }
+      <div class="h-tabs">
+        <div class="h-tab ${st.tab === "apps" ? "active" : ""}" id="tab-apps">Applications</div>
+        <div class="h-tab ${st.tab === "work" ? "active" : ""}" id="tab-work">Workstats</div>
+        <div class="h-tab ${st.tab === "settings" ? "active" : ""}" id="tab-settings">Settings</div>
+      </div>
 
-  function headerView() {
-    const left = el("div", { class: "left" }, [
-      el("div", { class: "h7ds-title" }, ["7DS Hiring Hub"]),
-      el("div", { class: "h7ds-pill", id: "h7ds-last" }, ["—"]),
-    ]);
+      <div class="h-body" id="h-body"></div>
+    `;
 
-    const right = el("div", { class: "right" }, [
-      el("button", { class: "h7ds-btn h7ds-mini", onclick: () => refreshNow() }, ["↻ Refresh"]),
-      el("button", { class: "h7ds-btn h7ds-close", onclick: () => toggle(false) }, ["✕"]),
-    ]);
+    qs("#h-close", panel).onclick = () => toggle(false);
+    qs("#h-refresh", panel).onclick = () => refreshNow(true);
 
-    return el("div", { class: "h7ds-head" }, [left, right]);
-  }
+    qs("#tab-apps", panel).onclick = () => { st.tab = "apps"; render(); };
+    qs("#tab-work", panel).onclick = () => { st.tab = "work"; render(); };
+    qs("#tab-settings", panel).onclick = () => { st.tab = "settings"; render(); };
 
-  function tabsView() {
-    const tApps = el("div", {
-      class: "h7ds-tab" + (state.tab === "apps" ? " active" : ""),
-      onclick: () => {
-        state.tab = "apps";
-        render();
-      },
-    }, ["Applications"]);
-
-    const tCo = el("div", {
-      class: "h7ds-tab" + (state.tab === "companies" ? " active" : ""),
-      onclick: () => {
-        state.tab = "companies";
-        render();
-      },
-    }, ["Companies"]);
-
-    return el("div", { class: "h7ds-tabs" }, [tApps, tCo]);
+    const body = qs("#h-body", panel);
+    if (st.tab === "apps") body.appendChild(viewApps());
+    if (st.tab === "work") body.appendChild(viewWorkstats());
+    if (st.tab === "settings") body.appendChild(viewSettings());
   }
 
-  function appsView() {
-    const body = el("div", { class: "h7ds-body" }, []);
+  function viewApps() {
+    const wrap = document.createElement("div");
 
-    // warning if admin empty
-    if (!ADMIN_TOKEN) {
-      body.appendChild(el("div", { class: "h7ds-card" }, [
-        el("div", { class: "h7ds-title" }, ["Admin token not set"]),
-        el("div", { class: "h7ds-sub" }, [
-          "If your server ADMIN_TOKEN is enabled, add it in the script (ADMIN_TOKEN). If your server has ADMIN_TOKEN blank, you're fine.",
-        ]),
-      ]));
+    // If no admin token is set AND your server requires it, you’ll get unauthorized.
+    // We show that in the UI via error toast; this card helps remind.
+    wrap.innerHTML = `
+      <div class="card">
+        <div class="row">
+          <div>
+            <div style="font-weight:900;">Connected to: ${BASE_URL}</div>
+            <div class="muted">Pulls: <code>/api/applications</code> & updates status via <code>/api/applications/status</code></div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    if (!st.apps || st.apps.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "card";
+      empty.innerHTML = `
+        <div style="font-weight:900;">No applications yet</div>
+        <div class="muted">If you EXPECT rows: check your Render logs + confirm Torn events are being detected.</div>
+      `;
+      wrap.appendChild(empty);
+      return wrap;
     }
 
-    if (!state.apps || state.apps.length === 0) {
-      body.appendChild(el("div", { class: "h7ds-card" }, [
-        el("div", { class: "h7ds-title" }, ["No applications yet"]),
-        el("div", { class: "h7ds-sub" }, ["Waiting for Torn events… (polling your Render service)"]),
-      ]));
-      return body;
-    }
-
-    for (const row of state.apps) {
-      const applicantId = row.applicant_id || "";
+    for (const row of st.apps) {
+      const applicantId = (row.applicant_id || "").trim();
       const raw = row.raw_text || "";
       const status = row.status || "new";
       const created = row.created_at || "";
 
-      const openProfile = el("button", {
-        class: "h7ds-btn h7ds-mini",
-        onclick: () => {
-          if (!applicantId) return showToast("No applicant id found in event");
-          window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}`, "_blank");
-        },
-      }, ["Open"]);
+      const card = document.createElement("div");
+      card.className = "card";
 
-      const statusSel = el("select", {});
+      const top = document.createElement("div");
+      top.className = "row";
+      top.innerHTML = `
+        <div style="min-width:0;">
+          <div style="font-weight:900;">
+            ${applicantId ? `Applicant [${applicantId}]` : "Applicant [unknown]"}
+          </div>
+          <div class="muted">${created ? `Created: ${created}` : ""}</div>
+        </div>
+        <button class="h-btn" data-open="${applicantId}">Open</button>
+      `;
+
+      const rawDiv = document.createElement("div");
+      rawDiv.className = "muted";
+      rawDiv.style.marginTop = "8px";
+      rawDiv.textContent = raw;
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      const sel = document.createElement("select");
       ["new", "seen", "interview", "hired", "rejected"].forEach((s) => {
         const o = document.createElement("option");
         o.value = s;
         o.textContent = s.toUpperCase();
         if (s === status) o.selected = true;
-        statusSel.appendChild(o);
+        sel.appendChild(o);
       });
 
-      statusSel.addEventListener("change", async () => {
+      sel.onchange = async () => {
         try {
-          const url = withAdmin(`${BASE_URL}/api/applications/status`);
-          const res = await reqJSON(url, "POST", { id: row.id, status: statusSel.value });
-          if (!res || res.ok !== true) throw new Error("bad response");
-          showToast("Status updated");
-          row.status = statusSel.value;
-        } catch {
-          showToast("Failed to update status");
+          const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications/status`), "POST", {
+            id: row.id,
+            status: sel.value,
+          });
+          if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+          row.status = sel.value;
+          toastMsg("Status updated");
+        } catch (e) {
+          toastMsg("Failed to update (admin token?)");
         }
+      };
+
+      const wsBtn = document.createElement("button");
+      wsBtn.className = "h-btn";
+      wsBtn.textContent = "Workstats";
+      wsBtn.onclick = () => {
+        if (!applicantId) return toastMsg("No applicant id found");
+        st.selectedApplicantId = applicantId;
+        st.tab = "work";
+        render();
+        toastMsg("Paste their API key");
+      };
+
+      actions.appendChild(sel);
+      actions.appendChild(wsBtn);
+
+      card.appendChild(top);
+      card.appendChild(rawDiv);
+      card.appendChild(actions);
+
+      card.querySelector("[data-open]")?.addEventListener("click", () => {
+        if (!applicantId) return toastMsg("No applicant id found");
+        window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}`, "_blank");
       });
 
-      const card = el("div", { class: "h7ds-card" }, [
-        el("div", { class: "h7ds-row" }, [
-          el("div", {}, [
-            el("div", { class: "h7ds-title" }, [
-              applicantId ? `Applicant [${applicantId}]` : "Applicant [unknown]",
-            ]),
-            el("div", { class: "h7ds-sub" }, [created ? `Created: ${created}` : ""]),
-          ]),
-          openProfile,
-        ]),
-        el("div", { class: "h7ds-sub" }, [raw]),
-        el("div", { class: "h7ds-actions" }, [
-          el("div", { style: "flex:1;min-width:160px;" }, [statusSel]),
-        ]),
-      ]);
-
-      body.appendChild(card);
+      wrap.appendChild(card);
     }
 
-    return body;
+    return wrap;
   }
 
-  function companiesView() {
-    const body = el("div", { class: "h7ds-body" }, []);
+  function viewWorkstats() {
+    const wrap = document.createElement("div");
 
-    // Add company UI
-    const addWrap = el("div", { class: "h7ds-card" }, [
-      el("div", { class: "h7ds-title" }, ["Companies (local)"]),
-      el("div", { class: "h7ds-sub" }, ["These boxes are for your tracking (stored on your device)."]),
-      el("div", { style: "margin-top:10px;display:flex;gap:8px;" }, [
-        el("input", { id: "h7ds-newco", placeholder: "New company name..." }),
-        el("button", {
-          class: "h7ds-btn",
-          onclick: () => {
-            const inp = document.getElementById("h7ds-newco");
-            const name = (inp.value || "").trim();
-            if (!name) return showToast("Enter a company name");
-            const id = "c" + Math.random().toString(16).slice(2, 10);
-            state.companies.unshift({ id, name });
-            inp.value = "";
-            saveCompanies();
-            render();
-            showToast("Company added");
-          },
-        }, ["Add"]),
-      ]),
-    ]);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div style="font-weight:900;">Fetch Applicant Workstats</div>
+      <div class="muted">Uses your server: <code>/api/applicant?id=ID&key=APIKEY</code> (admin protected if your ADMIN_TOKEN is set)</div>
+      <div style="margin-top:10px;display:grid;gap:8px;">
+        <input id="ws-id" placeholder="Applicant ID (XID)" />
+        <input id="ws-key" placeholder="Applicant API Key (they must give you one)" />
+        <button class="h-btn" id="ws-fetch">Fetch Workstats</button>
+      </div>
+      <div class="muted" style="margin-top:10px;">Tip: Tap “Workstats” on an application to autofill the ID.</div>
+    `;
+    wrap.appendChild(card);
 
-    body.appendChild(addWrap);
+    const out = document.createElement("div");
+    out.className = "card";
+    out.innerHTML = `
+      <div style="font-weight:900;">Result</div>
+      <textarea id="ws-out" readonly></textarea>
+    `;
+    wrap.appendChild(out);
 
-    // Company cards
-    for (const co of state.companies) {
-      const cid = co.id;
+    const idInp = qs("#ws-id", wrap);
+    const keyInp = qs("#ws-key", wrap);
+    const outTa = qs("#ws-out", wrap);
 
-      if (!state.trains[cid]) state.trains[cid] = [];
+    idInp.value = st.selectedApplicantId || "";
+    keyInp.value = st.applicantKey || "";
+    outTa.value = st.workstatsJson || "";
 
-      const dropId = `h7ds-drop-${cid}`;
-      const drop = el("div", { class: "h7ds-drop", id: dropId });
+    qs("#ws-fetch", wrap).onclick = async () => {
+      const uid = (idInp.value || "").trim();
+      const key = (keyInp.value || "").trim();
+      if (!uid || !key) return toastMsg("Missing id or key");
 
-      const toggleBtn = el("button", {
-        class: "h7ds-btn h7ds-mini",
-        onclick: () => {
-          const d = document.getElementById(dropId);
-          d.style.display = d.style.display === "block" ? "none" : "block";
-        },
-      }, ["▼ Tracker"]);
-
-      const delBtn = el("button", {
-        class: "h7ds-btn h7ds-mini",
-        onclick: () => {
-          state.companies = state.companies.filter((x) => x.id !== cid);
-          delete state.trains[cid];
-          saveCompanies();
-          saveTrains();
-          render();
-          showToast("Company removed");
-        },
-      }, ["Delete"]);
-
-      // tracker inputs
-      const buyer = el("input", { placeholder: "Buyer (name or ID)" });
-      const trains = el("input", { placeholder: "Amount of trains", type: "number", min: "0" });
-      const note = el("input", { placeholder: "Notes (optional)" });
-
-      const addTrain = el("button", {
-        class: "h7ds-btn",
-        onclick: () => {
-          const b = (buyer.value || "").trim();
-          const t = (trains.value || "").trim();
-          const n = (note.value || "").trim();
-          if (!b || !t) return showToast("Need buyer + trains");
-          state.trains[cid].unshift({ buyer: b, trains: Number(t), note: n, ts: nowTS() });
-          buyer.value = "";
-          trains.value = "";
-          note.value = "";
-          saveTrains();
-          render();
-          showToast("Added");
-        },
-      }, ["Add Entry"]);
-
-      // list
-      const listWrap = el("div", { style: "margin-top:10px;" });
-      const entries = state.trains[cid] || [];
-      if (entries.length === 0) {
-        listWrap.appendChild(el("div", { class: "h7ds-sub" }, ["No train entries yet."]));
-      } else {
-        for (let i = 0; i < Math.min(entries.length, 20); i++) {
-          const e = entries[i];
-          const rm = el("button", {
-            class: "h7ds-btn h7ds-mini",
-            onclick: () => {
-              state.trains[cid].splice(i, 1);
-              saveTrains();
-              render();
-              showToast("Removed");
-            },
-          }, ["✕"]);
-
-          listWrap.appendChild(el("div", { class: "h7ds-card", style: "margin:8px 0 0 0;padding:8px;border-radius:12px;" }, [
-            el("div", { class: "h7ds-row" }, [
-              el("div", {}, [
-                el("div", { class: "h7ds-title" }, [`${e.buyer} — ${e.trains} trains`]),
-                el("div", { class: "h7ds-sub" }, [`${e.ts}${e.note ? " • " + e.note : ""}`]),
-              ]),
-              rm,
-            ]),
-          ]));
-        }
+      st.selectedApplicantId = uid;
+      st.applicantKey = key;
+      S.set("h7ds_last_applicant_key", key); // optional convenience
+      try {
+        const url = withAdmin(`${BASE_URL}/api/applicant?id=${encodeURIComponent(uid)}&key=${encodeURIComponent(key)}`);
+        const res = await reqJSON(url, "GET");
+        if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+        const pretty = JSON.stringify(res.workstats || {}, null, 2);
+        st.workstatsJson = pretty;
+        outTa.value = pretty;
+        toastMsg("Workstats loaded");
+      } catch (e) {
+        outTa.value = "";
+        st.workstatsJson = "";
+        toastMsg("Failed (admin token? bad key?)");
       }
+    };
 
-      drop.appendChild(el("div", { class: "h7ds-sub" }, ["Train Tracker (local)"]));
-      drop.appendChild(el("div", { style: "display:grid;gap:8px;margin-top:8px;" }, [buyer, trains, note, addTrain]));
-      drop.appendChild(listWrap);
-
-      const card = el("div", { class: "h7ds-card" }, [
-        el("div", { class: "h7ds-row" }, [
-          el("div", {}, [
-            el("div", { class: "h7ds-title" }, [co.name]),
-            el("div", { class: "h7ds-sub" }, [`Entries: ${(state.trains[cid] || []).length}`]),
-          ]),
-          el("div", { style: "display:flex;gap:6px;" }, [toggleBtn, delBtn]),
-        ]),
-        drop,
-      ]);
-
-      body.appendChild(card);
-    }
-
-    return body;
+    return wrap;
   }
 
-  function render() {
-    panel.innerHTML = "";
-    panel.appendChild(headerView());
-    panel.appendChild(tabsView());
+  function viewSettings() {
+    const wrap = document.createElement("div");
 
-    const body = state.tab === "apps" ? appsView() : companiesView();
-    panel.appendChild(body);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div style="font-weight:900;">Settings</div>
+      <div class="muted">If your server has ADMIN_TOKEN set, you must put the same token here.</div>
+      <div style="margin-top:10px;display:grid;gap:8px;">
+        <input id="adm" placeholder="Admin token (optional)" />
+        <button class="h-btn" id="save">Save</button>
+        <button class="h-btn" id="test">Test Connection</button>
+      </div>
+      <div class="muted" style="margin-top:10px;">
+        Test calls: <code>/api/applications</code>. If unauthorized, your ADMIN_TOKEN doesn’t match.
+      </div>
+    `;
+    wrap.appendChild(card);
 
-    const last = panel.querySelector("#h7ds-last");
-    if (last) last.textContent = state.lastFetch ? `Last: ${state.lastFetch}` : "Last: —";
+    const adm = qs("#adm", wrap);
+    adm.value = st.adminToken || "";
+
+    qs("#save", wrap).onclick = () => {
+      st.adminToken = (adm.value || "").trim();
+      S.set("h7ds_admin_token", st.adminToken);
+      toastMsg("Saved");
+    };
+
+    qs("#test", wrap).onclick = async () => {
+      try {
+        const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
+        if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+        toastMsg(`OK (${(res.rows || []).length} rows)`);
+        st.apps = res.rows || [];
+        st.last = nowNice();
+        st.tab = "apps";
+        render();
+      } catch (e) {
+        toastMsg("Test failed (service down or token wrong)");
+      }
+    };
+
+    return wrap;
   }
 
   // =========================
-  // DATA FETCH
+  // DATA
   // =========================
-  async function refreshNow() {
+  async function refreshNow(showToastOnFail) {
     try {
-      const url = withAdmin(`${BASE_URL}/api/applications`);
-      const res = await reqJSON(url, "GET");
-      if (!res || res.ok !== true) {
-        const err = (res && res.error) ? res.error : "bad response";
-        showToast(`Fetch failed: ${err}`);
-        return;
-      }
-      state.apps = res.rows || [];
-      state.lastFetch = nowTS();
-      render();
+      const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
+      if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+      st.apps = res.rows || [];
+      st.last = nowNice();
+      const lastEl = qs("#h-last", panel);
+      if (lastEl) lastEl.textContent = st.last;
+      if (st.tab === "apps") render();
     } catch (e) {
-      showToast("Fetch failed (service offline?)");
+      if (showToastOnFail) toastMsg("Fetch failed (token/service?)");
     }
   }
 
   function startPolling() {
     stopPolling();
-    refreshNow();
-    state.timer = setInterval(() => {
-      // only poll when panel is open (keeps it light)
-      if (panel.style.display === "block") refreshNow();
+    refreshNow(false);
+    st.timer = setInterval(() => {
+      if (panel.style.display === "block") refreshNow(false);
     }, POLL_MS);
   }
-
   function stopPolling() {
-    if (state.timer) clearInterval(state.timer);
-    state.timer = null;
+    if (st.timer) clearInterval(st.timer);
+    st.timer = null;
   }
 
   // =========================
-  // OPEN / CLOSE
+  // OPEN/CLOSE (CLICK MUST WORK)
   // =========================
   function toggle(open) {
     const isOpen = panel.style.display === "block";
@@ -630,85 +577,56 @@
     else stopPolling();
   }
 
-  btn.addEventListener("click", () => toggle());
+  render();
 
   // =========================
-  // DRAGGING (💼 + PANEL)
+  // DRAGGING (POINTER EVENTS) - FIXES "NOT OPENING"
+  // We only toggle if it was a TAP (not a drag).
   // =========================
-  function makeDraggable(node, saveKeyBtnOrPanel) {
-    let dragging = false;
-    let startX = 0, startY = 0, origX = 0, origY = 0;
+  function makeDraggableTap(node, which) {
+    let down = false;
     let moved = false;
+    let sx = 0, sy = 0, ox = 0, oy = 0;
 
-    function down(e) {
-      const t = e.touches ? e.touches[0] : e;
-      dragging = true;
+    node.addEventListener("pointerdown", (e) => {
+      // only left click / touch
+      down = true;
       moved = false;
-      startX = t.clientX;
-      startY = t.clientY;
+
+      sx = e.clientX;
+      sy = e.clientY;
 
       const r = node.getBoundingClientRect();
-      origX = r.left;
-      origY = r.top;
+      ox = r.left;
+      oy = r.top;
 
-      // switch to left/top anchoring for smooth drag
+      node.setPointerCapture?.(e.pointerId);
+
+      // lock to left/top for dragging
       node.style.right = "auto";
       node.style.bottom = "auto";
-      node.style.left = origX + "px";
-      node.style.top = origY + "px";
+      node.style.left = ox + "px";
+      node.style.top = oy + "px";
+    });
 
-      e.preventDefault?.();
-    }
+    node.addEventListener("pointermove", (e) => {
+      if (!down) return;
+      const dx = e.clientX - sx;
+      const dy = e.clientY - sy;
 
-    function move(e) {
-      if (!dragging) return;
-      const t = e.touches ? e.touches[0] : e;
-      const dx = t.clientX - startX;
-      const dy = t.clientY - startY;
       if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
 
-      const x = Math.max(6, Math.min(window.innerWidth - node.offsetWidth - 6, origX + dx));
-      const y = Math.max(6, Math.min(window.innerHeight - node.offsetHeight - 6, origY + dy));
+      const x = clamp(ox + dx, 6, window.innerWidth - node.offsetWidth - 6);
+      const y = clamp(oy + dy, 6, window.innerHeight - node.offsetHeight - 6);
 
       node.style.left = x + "px";
       node.style.top = y + "px";
-    }
+    });
 
-    function up() {
-      if (!dragging) return;
-      dragging = false;
+    node.addEventListener("pointerup", () => {
+      if (!down) return;
+      down = false;
 
       const r = node.getBoundingClientRect();
-      if (saveKeyBtnOrPanel === "btn") {
-        savedPos.btnLeft = Math.round(r.left);
-        savedPos.btnTop = Math.round(r.top);
-      } else {
-        savedPos.panelLeft = Math.round(r.left);
-        savedPos.panelTop = Math.round(r.top);
-      }
-      LS.set("h7ds_pos", savedPos);
-
-      // If it was a drag, avoid accidental click toggles
-      if (moved && node === btn) {
-        // do nothing; click will still fire sometimes on mobile, but moved threshold helps a lot
-      }
-    }
-
-    node.addEventListener("mousedown", down);
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-
-    node.addEventListener("touchstart", down, { passive: false });
-    window.addEventListener("touchmove", move, { passive: false });
-    window.addEventListener("touchend", up);
-  }
-
-  makeDraggable(btn, "btn");
-  makeDraggable(panel, "panel");
-
-  // Initial render (closed)
-  render();
-
-  // little boot note
-  showToast("💼 Hiring Hub loaded");
-})();
+      if (which === "btn") {
+        pos.btnLeft = Math.round(r
