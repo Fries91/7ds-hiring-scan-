@@ -555,4 +555,142 @@
 
       card.querySelector("[data-open]")?.addEventListener("click", () => {
         if (!applicantId) return toastMsg("No applicant id");
-        window.open(`https://www.torn.com/profiles.ph
+        window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}`, "_blank");
+      });
+
+      wrap.appendChild(card);
+    }
+
+    return wrap;
+  }
+
+  // ---------------- data loaders ----------------
+  async function loadCompanies() {
+    const res = await reqJSON(withAdmin(`${BASE_URL}/api/companies`), "GET");
+    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+    state.companiesUpdated = res.updated_at || null;
+    state.companies = res.rows || [];
+  }
+
+  async function loadTrainsForSelected() {
+    state.trains = [];
+    if (!state.selectedCompanyId) return;
+    const res = await reqJSON(withAdmin(`${BASE_URL}/api/trains?company_id=${encodeURIComponent(state.selectedCompanyId)}`), "GET");
+    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+    state.trains = res.rows || [];
+  }
+
+  async function loadApps() {
+    const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
+    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+    state.apps = res.rows || [];
+  }
+
+  async function refreshNow(showFailToast) {
+    try {
+      if (state.tab === "companies") {
+        await loadCompanies();
+        // keep trains synced to selected company
+        if (!state.selectedCompanyId) state.selectedCompanyId = S.get("h7ds_sel_company", "") || "";
+        if (state.selectedCompanyId) await loadTrainsForSelected();
+      } else if (state.tab === "apps") {
+        await loadApps();
+      }
+      state.last = nowNice();
+      const lastEl = qs("#h-last", panel);
+      if (lastEl) lastEl.textContent = state.last;
+      render();
+    } catch {
+      if (showFailToast) toastMsg("Fetch failed (token/service?)");
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    refreshNow(false);
+    state.timer = setInterval(() => {
+      if (panel.style.display === "block") refreshNow(false);
+    }, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (state.timer) clearInterval(state.timer);
+    state.timer = null;
+  }
+
+  // ---------------- open/close + drag/tap ----------------
+  function toggle(open) {
+    const isOpen = panel.style.display === "block";
+    const next = open ?? !isOpen;
+    panel.style.display = next ? "block" : "none";
+    if (next) startPolling();
+    else stopPolling();
+  }
+
+  function makeDraggableTap(node, which) {
+    let down = false, moved = false;
+    let sx = 0, sy = 0, ox = 0, oy = 0;
+
+    node.addEventListener("pointerdown", (e) => {
+      down = true; moved = false;
+      sx = e.clientX; sy = e.clientY;
+      const r = node.getBoundingClientRect();
+      ox = r.left; oy = r.top;
+
+      node.setPointerCapture?.(e.pointerId);
+      node.style.right = "auto";
+      node.style.bottom = "auto";
+      node.style.left = ox + "px";
+      node.style.top = oy + "px";
+    });
+
+    node.addEventListener("pointermove", (e) => {
+      if (!down) return;
+      const dx = e.clientX - sx;
+      const dy = e.clientY - sy;
+      if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
+
+      const x = clamp(ox + dx, 6, window.innerWidth - node.offsetWidth - 6);
+      const y = clamp(oy + dy, 6, window.innerHeight - node.offsetHeight - 6);
+      node.style.left = x + "px";
+      node.style.top = y + "px";
+    });
+
+    node.addEventListener("pointerup", () => {
+      if (!down) return;
+      down = false;
+
+      const r = node.getBoundingClientRect();
+      if (which === "btn") {
+        savedPos.btnLeft = Math.round(r.left);
+        savedPos.btnTop = Math.round(r.top);
+      } else {
+        savedPos.panelLeft = Math.round(r.left);
+        savedPos.panelTop = Math.round(r.top);
+      }
+      S.set("h7ds_hiring_pos_v3", savedPos);
+
+      if (which === "btn" && !moved) toggle();
+    });
+
+    node.addEventListener("pointercancel", () => { down = false; });
+  }
+
+  // basic html escaping
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+  function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
+
+  // ---------------- boot ----------------
+  render();
+  makeDraggableTap(btn, "btn");
+  makeDraggableTap(panel, "panel");
+
+  // load initial selections
+  state.selectedCompanyId = S.get("h7ds_sel_company", "") || "";
+
+  toastMsg("💼 Hiring Hub loaded");
+})();
