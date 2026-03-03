@@ -22,7 +22,8 @@ DB_PATH = (os.getenv("DB_PATH") or "hiring.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS") or "45")
 COMPANY_POLL_SECONDS = int(os.getenv("COMPANY_POLL_SECONDS") or "90")
 
-API_BASE = "https://api.torn.com"
+API_V1_BASE = "https://api.torn.com"
+API_V2_BASE = "https://api.torn.com/v2"
 
 # ------------------------
 # helpers
@@ -116,7 +117,7 @@ def poll_events_loop():
             last = int(get_setting("last_event_id", "0"))
 
             r = session.get(
-                f"{API_BASE}/user/",
+                f"{API_V1_BASE}/user/",
                 params={"selections": "events", "key": TORN_API_KEY},
                 timeout=20,
             )
@@ -172,9 +173,6 @@ _company_state = {
 }
 
 def _parse_employees(payload: dict):
-    """
-    Torn company endpoint schema can vary; we parse defensively.
-    """
     company = payload.get("company", payload) if isinstance(payload, dict) else {}
     name = company.get("name") or company.get("company_name") or company.get("company") or None
 
@@ -182,7 +180,6 @@ def _parse_employees(payload: dict):
     employees = []
 
     if isinstance(employees_obj, dict):
-        # often keyed by user id
         for k, v in employees_obj.items():
             if not isinstance(v, dict):
                 continue
@@ -207,16 +204,11 @@ def _parse_employees(payload: dict):
                 "status": v.get("status") or "",
             })
 
-    # stable sort
     employees.sort(key=lambda x: (x.get("position") or "", x.get("name") or ""))
     return name, employees
 
 def fetch_company(company_id: str, session: requests.Session):
-    """
-    Uses Torn API company endpoint. We request employees selection.
-    """
-    # Torn API: /company/{id}?selections=employees&key=...
-    url = f"{API_BASE}/company/{company_id}"
+    url = f"{API_V1_BASE}/company/{company_id}"
     r = session.get(url, params={"selections": "employees", "key": TORN_API_KEY}, timeout=20)
     r.raise_for_status()
     return r.json()
@@ -241,7 +233,6 @@ def poll_companies_loop():
                         "employees": employees,
                     })
                 except Exception as e:
-                    # don't kill the whole poll
                     print(f"[poll_companies_loop] company {cid} ERROR:", repr(e), flush=True)
                     rows.append({
                         "company_id": str(cid),
@@ -258,6 +249,142 @@ def poll_companies_loop():
             print("[poll_companies_loop] ERROR:", repr(e), flush=True)
 
         time.sleep(COMPANY_POLL_SECONDS)
+
+# ------------------------
+# HOF SEARCH (workstats)
+# ------------------------
+
+# Very lightweight cache to avoid hammering Torn API
+_hof_cache_lock = threading.Lock()
+_hof_cache = {
+    "key": None,
+    "ts": 0.0,
+    "data": None
+}
+
+def _hof_fetch_page(session: requests.Session, offset: int, limit: int):
+    # Torn API v2 hall of fame endpoint
+    # https://api.torn.com/v2/torn/hof?key=XXX&limit=100&offset=0&cat=workstats
+    url = f"{API_V2_BASE}/torn/hof"
+    r = session.get(url, params={
+        "key": TORN_API_KEY,
+        "cat": "workstats",
+        "limit": limit,
+        "offset": offset,
+    }, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def _hof_extract_entries(payload: dict):
+    """
+    Tries multiple possible schemas, returns list of dict entries.
+    We expect each entry to have:
+      - user_id / id
+      - name
+      - value (workstats)
+      - rank
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    # common candidates
+    for k in ("hof", "hall_of_fame", "rankings", "entries", "data"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            return v
+
+    # sometimes nested
+    if isinstance(payload.get("hall_of_fame"), dict):
+        for k in ("entries", "rankings", "hof"):
+            v = payload["hall_of_fame"].get(k)
+            if isinstance(v, list):
+                return v
+
+    return []
+
+def search_hof_workstats(min_val: int, max_val: int, limit_results: int = 100):
+    """
+    Searches HoF workstats for values between [min_val, max_val].
+    To keep this safe + fast:
+      - scans a bounded number of pages
+      - stops once it collects enough results
+    """
+    if min_val > max_val:
+        min_val, max_val = max_val, min_val
+
+    session = requests.Session()
+
+    found = []
+    scanned_pages = 0
+
+    # You can tweak these to balance speed vs coverage
+    page_limit = 100           # results per page from HoF
+    max_pages = 30             # hard cap API calls (safety)
+    offsets = [i * page_limit for i in range(max_pages)]
+
+    for off in offsets:
+        scanned_pages += 1
+        try:
+            payload = _hof_fetch_page(session, off, page_limit)
+        except Exception as e:
+            print("[hof] fetch error:", repr(e), flush=True)
+            continue
+
+        entries = _hof_extract_entries(payload)
+
+        if not entries:
+            # no entries means end or schema changed; stop to avoid spamming
+            break
+
+        for e in entries:
+            # normalize keys
+            uid = str(e.get("user_id") or e.get("id") or e.get("userid") or "")
+            name = e.get("name") or e.get("username") or ""
+            rank = e.get("rank") or e.get("position") or e.get("place") or None
+
+            # workstats value may be called "value" or "score"
+            raw_val = e.get("value")
+            if raw_val is None:
+                raw_val = e.get("score")
+            if raw_val is None:
+                raw_val = e.get("workstats")
+
+            try:
+                val = int(raw_val)
+            except Exception:
+                continue
+
+            if min_val <= val <= max_val:
+                found.append({
+                    "id": uid,
+                    "name": name,
+                    "rank": rank,
+                    "value": val,
+                })
+
+            if len(found) >= limit_results:
+                return found, scanned_pages
+
+        # OPTIONAL early break if we're clearly beyond the range:
+        # If HoF is sorted descending, once values drop below min_val, later pages will be even smaller.
+        try:
+            # find smallest value on page
+            vals = []
+            for e in entries:
+                raw_val = e.get("value") if e.get("value") is not None else e.get("score")
+                if raw_val is None:
+                    raw_val = e.get("workstats")
+                try:
+                    vals.append(int(raw_val))
+                except Exception:
+                    pass
+            if vals and min(vals) < min_val and max(vals) < min_val:
+                # whole page below min => stop
+                break
+        except Exception:
+            pass
+
+    return found, scanned_pages
 
 # ------------------------
 # safe boot
@@ -287,7 +414,7 @@ def boot_once():
 def index():
     return (
         "7DS Hiring Scan is running.\n"
-        "Use /health, /api/applications, /api/companies, /api/trains\n",
+        "Use /health, /api/applications, /api/companies, /api/trains, /api/search_workstats\n",
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
@@ -419,3 +546,53 @@ def trains_add():
     con.commit()
     con.close()
     return {"ok": True}
+
+# -------- Search HoF workstats --------
+
+@app.get("/api/search_workstats")
+def api_search_workstats():
+    guard = require_admin()
+    if guard:
+        return guard
+
+    if not TORN_API_KEY:
+        return {"ok": False, "error": "TORN_API_KEY not set on server"}, 400
+
+    try:
+        min_val = int((request.args.get("min") or "").strip())
+        max_val = int((request.args.get("max") or "").strip())
+    except Exception:
+        return {"ok": False, "error": "min/max must be integers"}, 400
+
+    try:
+        limit_results = int((request.args.get("limit") or "100").strip())
+        limit_results = max(1, min(limit_results, 300))
+    except Exception:
+        limit_results = 100
+
+    # cache for 60s per exact query to avoid spam
+    cache_key = f"{min_val}:{max_val}:{limit_results}"
+    now = time.time()
+
+    with _hof_cache_lock:
+        if _hof_cache["key"] == cache_key and (now - _hof_cache["ts"]) < 60 and _hof_cache["data"] is not None:
+            return {"ok": True, "cached": True, **_hof_cache["data"]}
+
+    rows, pages = search_hof_workstats(min_val, max_val, limit_results=limit_results)
+
+    data = {
+        "cached": False,
+        "min": min_val,
+        "max": max_val,
+        "scanned_pages": pages,
+        "count": len(rows),
+        "rows": rows,
+        "updated_at": utc(),
+    }
+
+    with _hof_cache_lock:
+        _hof_cache["key"] = cache_key
+        _hof_cache["ts"] = now
+        _hof_cache["data"] = data
+
+    return {"ok": True, **data}
