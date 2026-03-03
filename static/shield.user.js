@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         7DS Hiring Hub 💼 (MATCHES APP) [Draggable + Tap Open + Applications + Workstats Viewer]
+// @name         7DS Hiring Hub 💼 (FAILSAFE) [Button + Overlay + Apps]
 // @namespace    7ds-wrath-hiring
-// @version      1.2.0
-// @description  💼 Draggable launcher that opens a hiring panel and pulls data from your Render app (/api/applications). Lets you change application status + open profile + fetch applicant workstats via /api/applicant (requires their API key). Built to match your current app.py endpoints and avoid CSP/iframe issues.
+// @version      1.3.0
+// @description  Always shows the 💼 button + overlay on Torn. Fetches applications from your Render app (/api/applications). Includes Settings for ADMIN_TOKEN. Built to avoid CSP/iframe issues.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
+// @run-at       document-end
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -16,42 +17,30 @@
 (function () {
   "use strict";
 
-  // =========================
-  // CONFIG (MATCH YOUR APP)
-  // =========================
-  const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // your Render service
-
-  // If your Render env ADMIN_TOKEN is set (not blank), you MUST set the same value here,
-  // or use the in-panel "Admin Token" box (it saves locally).
-  const ADMIN_TOKEN_DEFAULT = ""; // optional: hardcode it
-
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com";
   const POLL_MS = 15000;
 
-  // =========================
-  // STORAGE HELPERS
-  // =========================
-  const S = {
-    get(key, fallback) {
-      try {
-        const raw = GM_getValue(key);
-        if (raw === undefined || raw === null || raw === "") return fallback;
-        return JSON.parse(raw);
-      } catch {
-        const raw = GM_getValue(key);
-        return raw === undefined || raw === null || raw === "" ? fallback : raw;
-      }
-    },
-    set(key, value) {
-      try {
-        GM_setValue(key, JSON.stringify(value));
-      } catch {
-        GM_setValue(key, String(value));
-      }
-    },
-  };
+  const BTN_ID = "h7ds-briefcase";
+  const PANEL_ID = "h7ds-panel";
+  const TOAST_ID = "h7ds-toast";
 
-  function qs(sel, root = document) { return root.querySelector(sel); }
-  function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+  // --------- helpers ----------
+  const S = {
+    get(k, fb) {
+      try {
+        const v = GM_getValue(k);
+        if (v === undefined || v === null || v === "") return fb;
+        return JSON.parse(v);
+      } catch {
+        const v = GM_getValue(k);
+        return (v === undefined || v === null || v === "") ? fb : v;
+      }
+    },
+    set(k, v) {
+      try { GM_setValue(k, JSON.stringify(v)); }
+      catch { GM_setValue(k, String(v)); }
+    }
+  };
 
   function reqJSON(url, method = "GET", body = null) {
     return new Promise((resolve, reject) => {
@@ -62,11 +51,8 @@
         data: body ? JSON.stringify(body) : null,
         timeout: 25000,
         onload: (r) => {
-          try {
-            resolve(JSON.parse(r.responseText || "{}"));
-          } catch {
-            reject(new Error("Bad JSON"));
-          }
+          try { resolve(JSON.parse(r.responseText || "{}")); }
+          catch { reject(new Error("Bad JSON")); }
         },
         onerror: () => reject(new Error("Network error")),
         ontimeout: () => reject(new Error("Timeout")),
@@ -79,15 +65,31 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  // =========================
-  // UI SETUP
-  // =========================
-  const BTN_ID = "h7ds-briefcase";
-  const PANEL_ID = "h7ds-hub";
-  const TOAST_ID = "h7ds-toast";
+  function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+  function qs(sel, root = document) { return root.querySelector(sel); }
 
-  if (document.getElementById(BTN_ID)) return;
+  function toastMsg(msg) {
+    toast.textContent = msg;
+    toast.style.display = "block";
+    clearTimeout(toastMsg._t);
+    toastMsg._t = setTimeout(() => (toast.style.display = "none"), 1700);
+  }
 
+  function withAdmin(url) {
+    const tok = (state.adminToken || "").trim();
+    if (!tok) return url;
+    return url.includes("?")
+      ? `${url}&admin=${encodeURIComponent(tok)}`
+      : `${url}?admin=${encodeURIComponent(tok)}`;
+  }
+
+  // --------- hard failsafe: remove stale elements ----------
+  // If an old broken version left invisible elements behind, wipe them.
+  document.getElementById(BTN_ID)?.remove();
+  document.getElementById(PANEL_ID)?.remove();
+  document.getElementById(TOAST_ID)?.remove();
+
+  // --------- styles ----------
   GM_addStyle(`
     #${BTN_ID}, #${PANEL_ID}, #${TOAST_ID}, #${PANEL_ID} * { box-sizing:border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
 
@@ -96,12 +98,13 @@
       width:44px; height:44px;
       display:flex; align-items:center; justify-content:center;
       border-radius:14px;
-      background:rgba(10,10,14,.88);
+      background:rgba(10,10,14,.90);
       border:1px solid rgba(255,255,255,.14);
       box-shadow:0 8px 22px rgba(0,0,0,.45);
       font-size:26px;
       user-select:none; -webkit-user-select:none;
       touch-action:none;
+      left:auto; top:auto;
     }
 
     #${PANEL_ID}{
@@ -116,6 +119,7 @@
       display:none;
       backdrop-filter: blur(10px);
       touch-action:none;
+      left:auto; top:auto;
     }
 
     #${PANEL_ID} .h-head{
@@ -143,14 +147,12 @@
     #${PANEL_ID} .h-btn:active{ transform:scale(.98); }
 
     #${PANEL_ID} .h-tabs{
-      display:flex;
-      gap:8px;
+      display:flex; gap:8px;
       padding:8px 10px;
       border-bottom:1px solid rgba(255,255,255,.08);
     }
     #${PANEL_ID} .h-tab{
-      flex:1;
-      text-align:center;
+      flex:1; text-align:center;
       padding:8px 10px;
       border-radius:12px;
       font-weight:900; font-size:12px;
@@ -181,7 +183,6 @@
       padding:10px;
       margin-bottom:10px;
     }
-
     #${PANEL_ID} .row{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
     #${PANEL_ID} .muted{ opacity:.85; font-size:11px; font-weight:700; margin-top:4px; }
     #${PANEL_ID} .actions{ display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
@@ -197,7 +198,7 @@
       font-weight:800;
       font-size:12px;
     }
-    #${PANEL_ID} textarea{ min-height:84px; resize:vertical; }
+    #${PANEL_ID} textarea{ min-height:92px; resize:vertical; }
 
     #${TOAST_ID}{
       position:fixed; z-index:2147483647;
@@ -216,6 +217,7 @@
     }
   `);
 
+  // --------- create UI ----------
   const btn = document.createElement("div");
   btn.id = BTN_ID;
   btn.textContent = "💼";
@@ -230,36 +232,22 @@
   document.body.appendChild(panel);
   document.body.appendChild(toast);
 
-  function toastMsg(msg) {
-    toast.textContent = msg;
-    toast.style.display = "block";
-    clearTimeout(toastMsg._t);
-    toastMsg._t = setTimeout(() => (toast.style.display = "none"), 1600);
-  }
+  // --------- state ----------
+  const savedPos = S.get("h7ds_hiring_pos", { btnLeft: null, btnTop: null, panelLeft: null, panelTop: null });
 
-  // =========================
-  // STATE
-  // =========================
-  const pos = S.get("h7ds_pos_v2", {
-    btnLeft: null, btnTop: null,
-    panelLeft: null, panelTop: null
-  });
-
-  const st = {
+  const state = {
     tab: "apps",
     apps: [],
     last: null,
-    selectedApplicantId: "",
-    applicantKey: "",
-    workstatsJson: "",
-    adminToken: S.get("h7ds_admin_token", ADMIN_TOKEN_DEFAULT) || "",
+    adminToken: S.get("h7ds_hiring_admin", "") || "",
     timer: null,
   };
 
-  function applyInitialPositions() {
-    if (pos.btnLeft != null && pos.btnTop != null) {
-      btn.style.left = pos.btnLeft + "px";
-      btn.style.top = pos.btnTop + "px";
+  // default positions if none saved
+  function setInitialPositions() {
+    if (savedPos.btnLeft != null && savedPos.btnTop != null) {
+      btn.style.left = savedPos.btnLeft + "px";
+      btn.style.top = savedPos.btnTop + "px";
       btn.style.right = "auto";
       btn.style.bottom = "auto";
     } else {
@@ -267,9 +255,9 @@
       btn.style.bottom = "120px";
     }
 
-    if (pos.panelLeft != null && pos.panelTop != null) {
-      panel.style.left = pos.panelLeft + "px";
-      panel.style.top = pos.panelTop + "px";
+    if (savedPos.panelLeft != null && savedPos.panelTop != null) {
+      panel.style.left = savedPos.panelLeft + "px";
+      panel.style.top = savedPos.panelTop + "px";
       panel.style.right = "auto";
       panel.style.bottom = "auto";
     } else {
@@ -277,25 +265,15 @@
       panel.style.bottom = "170px";
     }
   }
-  applyInitialPositions();
+  setInitialPositions();
 
-  function withAdmin(url) {
-    const tok = (st.adminToken || "").trim();
-    if (!tok) return url; // if server ADMIN_TOKEN blank, endpoints work without it
-    return url.includes("?")
-      ? `${url}&admin=${encodeURIComponent(tok)}`
-      : `${url}?admin=${encodeURIComponent(tok)}`;
-  }
-
-  // =========================
-  // RENDER
-  // =========================
+  // --------- render ----------
   function render() {
     panel.innerHTML = `
       <div class="h-head">
         <div>
-          <div class="h-title">7DS Hiring Scan</div>
-          <div class="h-sub">Last: <span id="h-last">${st.last || "—"}</span></div>
+          <div class="h-title">7DS Hiring Hub</div>
+          <div class="h-sub">Last: <span id="h-last">${state.last || "—"}</span></div>
         </div>
         <div style="display:flex;gap:6px;">
           <button class="h-btn" id="h-refresh">↻</button>
@@ -304,9 +282,8 @@
       </div>
 
       <div class="h-tabs">
-        <div class="h-tab ${st.tab === "apps" ? "active" : ""}" id="tab-apps">Applications</div>
-        <div class="h-tab ${st.tab === "work" ? "active" : ""}" id="tab-work">Workstats</div>
-        <div class="h-tab ${st.tab === "settings" ? "active" : ""}" id="tab-settings">Settings</div>
+        <div class="h-tab ${state.tab === "apps" ? "active" : ""}" id="tab-apps">Applications</div>
+        <div class="h-tab ${state.tab === "settings" ? "active" : ""}" id="tab-settings">Settings</div>
       </div>
 
       <div class="h-body" id="h-body"></div>
@@ -315,71 +292,92 @@
     qs("#h-close", panel).onclick = () => toggle(false);
     qs("#h-refresh", panel).onclick = () => refreshNow(true);
 
-    qs("#tab-apps", panel).onclick = () => { st.tab = "apps"; render(); };
-    qs("#tab-work", panel).onclick = () => { st.tab = "work"; render(); };
-    qs("#tab-settings", panel).onclick = () => { st.tab = "settings"; render(); };
+    qs("#tab-apps", panel).onclick = () => { state.tab = "apps"; render(); };
+    qs("#tab-settings", panel).onclick = () => { state.tab = "settings"; render(); };
 
     const body = qs("#h-body", panel);
-    if (st.tab === "apps") body.appendChild(viewApps());
-    if (st.tab === "work") body.appendChild(viewWorkstats());
-    if (st.tab === "settings") body.appendChild(viewSettings());
+    body.appendChild(state.tab === "apps" ? viewApps() : viewSettings());
+  }
+
+  function viewSettings() {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `
+      <div class="card">
+        <div style="font-weight:900;">Connection</div>
+        <div class="muted">Server: ${BASE_URL}</div>
+        <div class="muted">If your Render env <code>ADMIN_TOKEN</code> is set, paste the same token here.</div>
+        <div style="margin-top:10px;display:grid;gap:8px;">
+          <input id="adm" placeholder="Admin token (optional)" />
+          <button class="h-btn" id="save">Save</button>
+          <button class="h-btn" id="test">Test /api/applications</button>
+        </div>
+      </div>
+    `;
+
+    const adm = qs("#adm", wrap);
+    adm.value = state.adminToken || "";
+
+    qs("#save", wrap).onclick = () => {
+      state.adminToken = (adm.value || "").trim();
+      S.set("h7ds_hiring_admin", state.adminToken);
+      toastMsg("Saved");
+    };
+
+    qs("#test", wrap).onclick = async () => {
+      try {
+        const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
+        if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
+        toastMsg(`OK (${(res.rows || []).length} rows)`);
+        state.apps = res.rows || [];
+        state.last = nowNice();
+        state.tab = "apps";
+        render();
+      } catch {
+        toastMsg("Test failed (token wrong or service down)");
+      }
+    };
+
+    return wrap;
   }
 
   function viewApps() {
     const wrap = document.createElement("div");
 
-    // If no admin token is set AND your server requires it, you’ll get unauthorized.
-    // We show that in the UI via error toast; this card helps remind.
-    wrap.innerHTML = `
-      <div class="card">
-        <div class="row">
-          <div>
-            <div style="font-weight:900;">Connected to: ${BASE_URL}</div>
-            <div class="muted">Pulls: <code>/api/applications</code> & updates status via <code>/api/applications/status</code></div>
-          </div>
-        </div>
-      </div>
-    `;
-
-    if (!st.apps || st.apps.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "card";
-      empty.innerHTML = `
+    if (!state.apps || state.apps.length === 0) {
+      const c = document.createElement("div");
+      c.className = "card";
+      c.innerHTML = `
         <div style="font-weight:900;">No applications yet</div>
-        <div class="muted">If you EXPECT rows: check your Render logs + confirm Torn events are being detected.</div>
+        <div class="muted">If you expect rows: check Render logs + Torn events are being detected.</div>
       `;
-      wrap.appendChild(empty);
+      wrap.appendChild(c);
       return wrap;
     }
 
-    for (const row of st.apps) {
+    for (const row of state.apps) {
       const applicantId = (row.applicant_id || "").trim();
       const raw = row.raw_text || "";
-      const status = row.status || "new";
       const created = row.created_at || "";
+      const status = row.status || "new";
 
       const card = document.createElement("div");
       card.className = "card";
 
-      const top = document.createElement("div");
-      top.className = "row";
-      top.innerHTML = `
-        <div style="min-width:0;">
-          <div style="font-weight:900;">
-            ${applicantId ? `Applicant [${applicantId}]` : "Applicant [unknown]"}
+      card.innerHTML = `
+        <div class="row">
+          <div style="min-width:0;">
+            <div style="font-weight:900;">${applicantId ? `Applicant [${applicantId}]` : "Applicant [unknown]"}</div>
+            <div class="muted">${created ? `Created: ${created}` : ""}</div>
           </div>
-          <div class="muted">${created ? `Created: ${created}` : ""}</div>
+          <button class="h-btn" data-open="${applicantId}">Open</button>
         </div>
-        <button class="h-btn" data-open="${applicantId}">Open</button>
+        <div class="muted" style="margin-top:8px;word-break:break-word;"></div>
+        <div class="actions"></div>
       `;
 
-      const rawDiv = document.createElement("div");
-      rawDiv.className = "muted";
-      rawDiv.style.marginTop = "8px";
-      rawDiv.textContent = raw;
+      card.querySelector(".muted").textContent = raw;
 
-      const actions = document.createElement("div");
-      actions.className = "actions";
+      const actions = card.querySelector(".actions");
 
       const sel = document.createElement("select");
       ["new", "seen", "interview", "hired", "rejected"].forEach((s) => {
@@ -396,34 +394,31 @@
             id: row.id,
             status: sel.value,
           });
-          if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-          row.status = sel.value;
+          if (!res || res.ok !== true) throw new Error("bad response");
           toastMsg("Status updated");
-        } catch (e) {
-          toastMsg("Failed to update (admin token?)");
+        } catch {
+          toastMsg("Update failed (admin token?)");
         }
       };
 
-      const wsBtn = document.createElement("button");
-      wsBtn.className = "h-btn";
-      wsBtn.textContent = "Workstats";
-      wsBtn.onclick = () => {
-        if (!applicantId) return toastMsg("No applicant id found");
-        st.selectedApplicantId = applicantId;
-        st.tab = "work";
-        render();
-        toastMsg("Paste their API key");
+      const ws = document.createElement("button");
+      ws.className = "h-btn";
+      ws.textContent = "Copy ID";
+      ws.onclick = async () => {
+        if (!applicantId) return toastMsg("No applicant id");
+        try {
+          await navigator.clipboard.writeText(applicantId);
+          toastMsg("Copied");
+        } catch {
+          toastMsg("Copy blocked");
+        }
       };
 
       actions.appendChild(sel);
-      actions.appendChild(wsBtn);
-
-      card.appendChild(top);
-      card.appendChild(rawDiv);
-      card.appendChild(actions);
+      actions.appendChild(ws);
 
       card.querySelector("[data-open]")?.addEventListener("click", () => {
-        if (!applicantId) return toastMsg("No applicant id found");
+        if (!applicantId) return toastMsg("No applicant id");
         window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}`, "_blank");
       });
 
@@ -433,142 +428,32 @@
     return wrap;
   }
 
-  function viewWorkstats() {
-    const wrap = document.createElement("div");
-
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div style="font-weight:900;">Fetch Applicant Workstats</div>
-      <div class="muted">Uses your server: <code>/api/applicant?id=ID&key=APIKEY</code> (admin protected if your ADMIN_TOKEN is set)</div>
-      <div style="margin-top:10px;display:grid;gap:8px;">
-        <input id="ws-id" placeholder="Applicant ID (XID)" />
-        <input id="ws-key" placeholder="Applicant API Key (they must give you one)" />
-        <button class="h-btn" id="ws-fetch">Fetch Workstats</button>
-      </div>
-      <div class="muted" style="margin-top:10px;">Tip: Tap “Workstats” on an application to autofill the ID.</div>
-    `;
-    wrap.appendChild(card);
-
-    const out = document.createElement("div");
-    out.className = "card";
-    out.innerHTML = `
-      <div style="font-weight:900;">Result</div>
-      <textarea id="ws-out" readonly></textarea>
-    `;
-    wrap.appendChild(out);
-
-    const idInp = qs("#ws-id", wrap);
-    const keyInp = qs("#ws-key", wrap);
-    const outTa = qs("#ws-out", wrap);
-
-    idInp.value = st.selectedApplicantId || "";
-    keyInp.value = st.applicantKey || "";
-    outTa.value = st.workstatsJson || "";
-
-    qs("#ws-fetch", wrap).onclick = async () => {
-      const uid = (idInp.value || "").trim();
-      const key = (keyInp.value || "").trim();
-      if (!uid || !key) return toastMsg("Missing id or key");
-
-      st.selectedApplicantId = uid;
-      st.applicantKey = key;
-      S.set("h7ds_last_applicant_key", key); // optional convenience
-      try {
-        const url = withAdmin(`${BASE_URL}/api/applicant?id=${encodeURIComponent(uid)}&key=${encodeURIComponent(key)}`);
-        const res = await reqJSON(url, "GET");
-        if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-        const pretty = JSON.stringify(res.workstats || {}, null, 2);
-        st.workstatsJson = pretty;
-        outTa.value = pretty;
-        toastMsg("Workstats loaded");
-      } catch (e) {
-        outTa.value = "";
-        st.workstatsJson = "";
-        toastMsg("Failed (admin token? bad key?)");
-      }
-    };
-
-    return wrap;
-  }
-
-  function viewSettings() {
-    const wrap = document.createElement("div");
-
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div style="font-weight:900;">Settings</div>
-      <div class="muted">If your server has ADMIN_TOKEN set, you must put the same token here.</div>
-      <div style="margin-top:10px;display:grid;gap:8px;">
-        <input id="adm" placeholder="Admin token (optional)" />
-        <button class="h-btn" id="save">Save</button>
-        <button class="h-btn" id="test">Test Connection</button>
-      </div>
-      <div class="muted" style="margin-top:10px;">
-        Test calls: <code>/api/applications</code>. If unauthorized, your ADMIN_TOKEN doesn’t match.
-      </div>
-    `;
-    wrap.appendChild(card);
-
-    const adm = qs("#adm", wrap);
-    adm.value = st.adminToken || "";
-
-    qs("#save", wrap).onclick = () => {
-      st.adminToken = (adm.value || "").trim();
-      S.set("h7ds_admin_token", st.adminToken);
-      toastMsg("Saved");
-    };
-
-    qs("#test", wrap).onclick = async () => {
-      try {
-        const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
-        if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-        toastMsg(`OK (${(res.rows || []).length} rows)`);
-        st.apps = res.rows || [];
-        st.last = nowNice();
-        st.tab = "apps";
-        render();
-      } catch (e) {
-        toastMsg("Test failed (service down or token wrong)");
-      }
-    };
-
-    return wrap;
-  }
-
-  // =========================
-  // DATA
-  // =========================
-  async function refreshNow(showToastOnFail) {
+  async function refreshNow(showFailToast) {
     try {
       const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
       if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-      st.apps = res.rows || [];
-      st.last = nowNice();
+      state.apps = res.rows || [];
+      state.last = nowNice();
       const lastEl = qs("#h-last", panel);
-      if (lastEl) lastEl.textContent = st.last;
-      if (st.tab === "apps") render();
-    } catch (e) {
-      if (showToastOnFail) toastMsg("Fetch failed (token/service?)");
+      if (lastEl) lastEl.textContent = state.last;
+      if (state.tab === "apps") render();
+    } catch {
+      if (showFailToast) toastMsg("Fetch failed (token/service?)");
     }
   }
 
   function startPolling() {
     stopPolling();
     refreshNow(false);
-    st.timer = setInterval(() => {
+    state.timer = setInterval(() => {
       if (panel.style.display === "block") refreshNow(false);
     }, POLL_MS);
   }
   function stopPolling() {
-    if (st.timer) clearInterval(st.timer);
-    st.timer = null;
+    if (state.timer) clearInterval(state.timer);
+    state.timer = null;
   }
 
-  // =========================
-  // OPEN/CLOSE (CLICK MUST WORK)
-  // =========================
   function toggle(open) {
     const isOpen = panel.style.display === "block";
     const next = open ?? !isOpen;
@@ -577,32 +462,19 @@
     else stopPolling();
   }
 
-  render();
-
-  // =========================
-  // DRAGGING (POINTER EVENTS) - FIXES "NOT OPENING"
-  // We only toggle if it was a TAP (not a drag).
-  // =========================
+  // --------- draggable + TAP to open (this prevents “tap not opening” on mobile) ----------
   function makeDraggableTap(node, which) {
-    let down = false;
-    let moved = false;
+    let down = false, moved = false;
     let sx = 0, sy = 0, ox = 0, oy = 0;
 
     node.addEventListener("pointerdown", (e) => {
-      // only left click / touch
-      down = true;
-      moved = false;
-
-      sx = e.clientX;
-      sy = e.clientY;
-
+      down = true; moved = false;
+      sx = e.clientX; sy = e.clientY;
       const r = node.getBoundingClientRect();
-      ox = r.left;
-      oy = r.top;
+      ox = r.left; oy = r.top;
 
       node.setPointerCapture?.(e.pointerId);
 
-      // lock to left/top for dragging
       node.style.right = "auto";
       node.style.bottom = "auto";
       node.style.left = ox + "px";
@@ -613,12 +485,10 @@
       if (!down) return;
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
-
       if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
 
       const x = clamp(ox + dx, 6, window.innerWidth - node.offsetWidth - 6);
       const y = clamp(oy + dy, 6, window.innerHeight - node.offsetHeight - 6);
-
       node.style.left = x + "px";
       node.style.top = y + "px";
     });
@@ -629,4 +499,24 @@
 
       const r = node.getBoundingClientRect();
       if (which === "btn") {
-        pos.btnLeft = Math.round(r
+        savedPos.btnLeft = Math.round(r.left);
+        savedPos.btnTop = Math.round(r.top);
+      } else {
+        savedPos.panelLeft = Math.round(r.left);
+        savedPos.panelTop = Math.round(r.top);
+      }
+      S.set("h7ds_hiring_pos", savedPos);
+
+      if (which === "btn" && !moved) toggle();
+    });
+
+    node.addEventListener("pointercancel", () => { down = false; });
+  }
+
+  makeDraggableTap(btn, "btn");
+  makeDraggableTap(panel, "panel");
+
+  // --------- boot ----------
+  render();
+  toastMsg("💼 Hiring Hub loaded");
+})();
