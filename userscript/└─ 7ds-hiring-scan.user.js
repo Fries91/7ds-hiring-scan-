@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS*: Hiring Scan 💼 (Wrath Theme + TOTAL Scan + Employment Integrated)
-// @namespace    7ds-wrath-hiring-scan
-// @version      1.4.0
-// @description  Draggable 💼 icon overlay like war-bot. Tap 💼 to open/close. HoF TOTAL scan by range with employment integrated (none/company/city/unknown) via opt-in DB join.
+// @name         7DS*: Hiring Scan 💼 (Wrath Theme + Draggable + Search + Submit)
+// @namespace    7ds-hiring-scan
+// @version      1.1.0
+// @description  💼 Hiring overlay: recruiter search + player opt-in submit (manual or verified via player's key). Draggable badge, tap to open/close.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -10,310 +10,428 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      sevends-hiring-scan.onrender.com
+// @connect      api.torn.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  const BASE_URL = "https://sevends-hiring-scan.onrender.com";
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // change if needed
 
-  const POS_KEY  = "hiring_scan_briefcase_pos_v1";
-  const OPEN_KEY = "hiring_scan_open_v5";
-  const TOK_KEY  = "hiring_scan_admin_token_v5";
-  const CFG_KEY  = "hiring_scan_cfg_v5";
+  // Recruiter-only token (keep private). Players do NOT need this.
+  const ADMIN_TOKEN = ""; // set this for recruiter searches
 
-  function gmGet(k, d){ try { return GM_getValue(k, d); } catch { return d; } }
-  function gmSet(k, v){ try { GM_setValue(k, v); } catch {} }
+  const POS_KEY = "hiringScanPosV1";
+  const OPEN_KEY = "hiringScanOpenV1";
+  const TAB_KEY = "hiringScanTabV1";
 
-  function httpJson(method, url, body, headers = {}) {
+  const DEFAULT_POS = { top: 160, right: 12 };
+  const state = {
+    open: !!GM_getValue(OPEN_KEY, false),
+    tab: GM_getValue(TAB_KEY, "recruiter"),
+    pos: GM_getValue(POS_KEY, null) || DEFAULT_POS,
+  };
+
+  function httpJson(method, url, bodyObj) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method,
         url,
-        data: body ? JSON.stringify(body) : null,
-        headers: { "Content-Type": "application/json", ...headers },
-        onload: (res) => {
-          try { resolve(JSON.parse(res.responseText || "{}")); }
+        headers: { "Accept": "application/json", "Content-Type": "application/json" },
+        data: bodyObj ? JSON.stringify(bodyObj) : undefined,
+        onload: (r) => {
+          try { resolve(JSON.parse(r.responseText || "{}")); }
           catch (e) { reject(e); }
         },
         onerror: reject,
+        ontimeout: reject,
+        timeout: 15000,
       });
     });
   }
 
-  function copyToClipboard(text) {
-    try { navigator.clipboard.writeText(text); }
-    catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-    }
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+    }[c]));
   }
 
   GM_addStyle(`
-    /* 💼 ICON */
-    #wrath-hiring-icon{
-      position:fixed; z-index:999999;
-      width:54px; height:54px;
-      border-radius:18px;
-      background: radial-gradient(circle at 30% 20%, rgba(255,255,255,.14), rgba(255,255,255,0) 42%),
-                  linear-gradient(180deg, #1b2436, #0f1420);
-      border:1px solid rgba(255,255,255,.12);
-      box-shadow:0 12px 34px rgba(0,0,0,.55);
+    #hs-badge, #hs-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif; }
+    #hs-badge {
+      position: fixed; z-index: 999999;
+      width: 46px; height: 46px; border-radius: 16px;
       display:flex; align-items:center; justify-content:center;
-      user-select:none; cursor:grab;
-      right:12px; top:160px;
+      background: radial-gradient(circle at 30% 30%, rgba(255,215,0,0.35), rgba(255,215,0,0.10));
+      border: 1px solid rgba(255,215,0,0.35);
+      box-shadow: 0 10px 24px rgba(0,0,0,0.45);
+      user-select:none; -webkit-user-select:none; touch-action:none;
     }
-    #wrath-hiring-icon:active{ cursor:grabbing; }
-    #wrath-hiring-icon span{ font-size:24px; filter: drop-shadow(0 2px 6px rgba(0,0,0,.65)); }
-
-    /* PANEL */
-    #wrath-hiring-panel{
-      position:fixed; z-index:999999;
-      right:14px; top:86px;
-      width:min(600px, calc(100vw - 28px));
-      max-height:min(80vh, 780px);
-      overflow:hidden;
-      border-radius:18px;
-      background: rgba(12,16,24,.92);
-      backdrop-filter: blur(10px);
-      border:1px solid rgba(255,255,255,.10);
-      box-shadow:0 18px 50px rgba(0,0,0,.60);
-      color:#e8eefc;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    #hs-badge span { font-size: 22px; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.6)); }
+    #hs-panel {
+      position: fixed; z-index: 999998;
+      width: 344px; max-width: calc(100vw - 18px);
+      border-radius: 16px; padding: 12px; color: #e9eef5;
+      background: linear-gradient(180deg, rgba(25,35,50,0.92), rgba(12,16,24,0.92));
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 14px 30px rgba(0,0,0,0.55);
+      backdrop-filter: blur(6px);
     }
-    #wrath-hiring-panel header{
-      padding:12px; display:flex; align-items:center; gap:10px;
-      border-bottom:1px solid rgba(255,255,255,.08);
+    #hs-title { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom: 8px; }
+    #hs-title b { font-size: 14px; letter-spacing: 0.3px; }
+    #hs-mini { font-size: 12px; opacity: 0.8; }
+    #hs-tabs { display:flex; gap:8px; margin: 8px 0 10px; }
+    .hs-tab {
+      flex:1; text-align:center; padding:8px 10px; border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.20);
+      color:#e9eef5; font-weight: 800; font-size: 12px;
     }
-    #wrath-hiring-panel header .title{ font-weight:900; letter-spacing:.2px; }
-    #wrath-hiring-panel header .pill{
-      margin-left:auto; font-size:12px;
-      padding:4px 10px; border-radius:999px;
-      background: rgba(255,255,255,.08);
-      border: 1px solid rgba(255,255,255,.10);
-      font-weight:700;
+    .hs-tab.on {
+      border: 1px solid rgba(255,215,0,0.35);
+      background: rgba(255,215,0,0.12);
+      color: #ffe7a6;
     }
-    #wrath-hiring-panel .body{
-      padding:12px; overflow:auto;
-      max-height: calc(min(80vh, 780px) - 54px);
+    #hs-grid { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    #hs-panel label { display:block; font-size: 11px; opacity: 0.85; margin: 8px 0 4px; }
+    #hs-panel input, #hs-panel select, #hs-panel textarea {
+      width: 100%; box-sizing: border-box;
+      padding: 9px 10px; border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.25);
+      color: #e9eef5; outline: none; font-size: 13px;
     }
-    .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
-    .ctl{
-      flex:1 1 auto;
-      background: rgba(255,255,255,.06);
-      border: 1px solid rgba(255,255,255,.10);
-      border-radius: 12px;
-      padding: 8px 10px;
-      color: #e8eefc;
-      outline:none;
+    #hs-panel textarea { min-height: 54px; resize: vertical; }
+    #hs-actions { display:flex; gap:8px; margin-top: 10px; }
+    #hs-actions button {
+      flex:1; padding: 10px 10px; border-radius: 12px;
+      border: 1px solid rgba(255,215,0,0.35);
+      background: rgba(255,215,0,0.12);
+      color: #ffe7a6; font-weight: 900; font-size: 13px;
     }
-    .btn{
-      background: linear-gradient(180deg,#2a3a5e,#17243e);
-      border: 1px solid rgba(255,255,255,.12);
-      border-radius: 12px;
-      padding: 8px 10px;
-      color:#e8eefc;
-      cursor:pointer;
-      font-weight:900;
-      white-space:nowrap;
+    #hs-actions button.secondary {
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.18);
+      color:#e9eef5;
+      font-weight: 800;
     }
-    .btn:active{ transform: translateY(1px); }
-    .muted{ opacity:.78; font-size:12px; }
-    .sectionTitle{ font-weight:900; margin:12px 0 8px; opacity:.95; }
+    #hs-actions button:active { transform: translateY(1px); }
+    #hs-results { margin-top: 10px; max-height: 46vh; overflow:auto; }
+    .hs-row {
+      display:flex; justify-content:space-between; gap:8px;
+      padding: 8px 10px; border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(0,0,0,0.22);
+      margin-bottom: 8px;
+    }
+    .hs-left { display:flex; flex-direction:column; gap:2px; min-width: 0; }
+    .hs-name a { color:#d9e7ff; text-decoration:none; font-weight: 900; font-size: 13px; }
+    .hs-sub { font-size: 11px; opacity: 0.8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width: 210px; }
+    .hs-right { text-align:right; font-size: 11px; opacity: 0.95; }
+    .hs-pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid rgba(255,255,255,0.12); margin-top:4px; }
+    .hs-msg { font-size: 12px; opacity: 0.85; line-height: 1.35; }
+    .hs-warn { font-size: 11px; opacity: 0.75; line-height: 1.35; margin-top: 8px; }
   `);
 
-  // ---------- 💼 ICON ----------
-  const icon = document.createElement("div");
-  icon.id = "wrath-hiring-icon";
-  icon.title = "Hiring Scan (drag / tap)";
-  icon.innerHTML = `<span>💼</span>`;
-  document.body.appendChild(icon);
+  const badge = document.createElement("div");
+  badge.id = "hs-badge";
+  badge.style.top = (state.pos.top ?? DEFAULT_POS.top) + "px";
+  badge.style.right = (state.pos.right ?? DEFAULT_POS.right) + "px";
+  badge.innerHTML = `<span>💼</span>`;
 
-  // ---------- PANEL ----------
   const panel = document.createElement("div");
-  panel.id = "wrath-hiring-panel";
-  panel.style.display = gmGet(OPEN_KEY, false) ? "block" : "none";
-  panel.innerHTML = `
-    <header>
-      <div class="title">💼 Hiring Scan</div>
-      <div class="pill" id="hs-pill">idle</div>
-    </header>
-    <div class="body">
+  panel.id = "hs-panel";
+  panel.style.display = state.open ? "block" : "none";
 
-      <div class="row">
-        <input class="ctl" id="hs-token" placeholder="ADMIN_TOKEN (stored locally)" />
-        <button class="btn" id="hs-save">Save</button>
-      </div>
-
-      <div class="row">
-        <button class="btn" id="hs-copy">Copy recruit message</button>
-        <button class="btn" id="hs-apply">Open apply page</button>
-      </div>
-
-      <div class="sectionTitle">TOTAL Scan (employment integrated)</div>
-
-      <div class="row">
-        <input class="ctl" id="hs-min" inputmode="numeric" placeholder="Min TOTAL workstats" />
-        <input class="ctl" id="hs-max" inputmode="numeric" placeholder="Max TOTAL workstats" />
-      </div>
-
-      <div class="row">
-        <input class="ctl" id="hs-limit" inputmode="numeric" placeholder="Limit (1-200)" />
-        <select class="ctl" id="hs-emp">
-          <option value="all">Employment: All</option>
-          <option value="none">No company</option>
-          <option value="company">In a company</option>
-          <option value="city">City job</option>
-          <option value="unknown">Unknown (not opted-in)</option>
-        </select>
-        <button class="btn" id="hs-scan">Scan</button>
-      </div>
-
-      <div class="row">
-        <select class="ctl" id="hs-dd">
-          <option value="">No results yet…</option>
-        </select>
-      </div>
-
-      <div class="muted">
-        Employment shows only for opted-in players; everyone else is <b>unknown</b>.
-      </div>
-    </div>
-  `;
-  document.body.appendChild(panel);
-
-  const $ = (sel) => panel.querySelector(sel);
-  const setStatus = (t) => { $("#hs-pill").textContent = t; };
-
-  // restore token
-  $("#hs-token").value = gmGet(TOK_KEY, "");
-
-  // restore last scan inputs
-  const cfg = gmGet(CFG_KEY, { min:"", max:"", limit:"50", emp:"all" });
-  $("#hs-min").value = cfg.min || "";
-  $("#hs-max").value = cfg.max || "";
-  $("#hs-limit").value = cfg.limit || "50";
-  $("#hs-emp").value = cfg.emp || "all";
-
-  $("#hs-save").onclick = () => {
-    gmSet(TOK_KEY, ($("#hs-token").value || "").trim());
-    setStatus("saved");
-    setTimeout(() => setStatus("idle"), 700);
-  };
-
-  $("#hs-copy").onclick = async () => {
-    const token = (gmGet(TOK_KEY, "") || "").trim();
-    if (!token) { setStatus("token?"); return; }
-    try {
-      const data = await httpJson("GET", `${BASE_URL}/api/applicants`, null, { "X-ADMIN-TOKEN": token });
-      const msg = (data && data.message) ? data.message : "looking to hire if you can reply with working stats or an limited API key";
-      copyToClipboard(msg);
-    } catch {
-      copyToClipboard("looking to hire if you can reply with working stats or an limited API key");
-    }
-    setStatus("copied");
-    setTimeout(() => setStatus("idle"), 900);
-  };
-
-  $("#hs-apply").onclick = () => window.open(`${BASE_URL}/apply`, "_blank", "noopener,noreferrer");
-
-  $("#hs-scan").onclick = async () => {
-    const token = (gmGet(TOK_KEY, "") || "").trim();
-    const min = ($("#hs-min").value || "").trim();
-    const max = ($("#hs-max").value || "").trim();
-    let limit = ($("#hs-limit").value || "50").trim();
-    const emp = ($("#hs-emp").value || "all").trim();
-
-    if (!token) { setStatus("token?"); return; }
-    if (!min || !max) { setStatus("min/max?"); return; }
-    if (!limit) limit = "50";
-
-    gmSet(CFG_KEY, { min, max, limit, emp });
-
-    setStatus("loading");
-    try {
-      const qs = new URLSearchParams({ min, max, limit, emp });
-      const data = await httpJson("GET", `${BASE_URL}/state?${qs.toString()}`, null, { "X-ADMIN-TOKEN": token });
-      if (!data.ok) throw new Error(data.error || "failed");
-
-      const rows = data.rows || [];
-      const dd = $("#hs-dd");
-      dd.innerHTML = "";
-
-      if (!rows.length) {
-        dd.innerHTML = `<option value="">No matches</option>`;
-        setStatus("0");
-        return;
-      }
-
-      for (const r of rows) {
-        const empLabel = String(r.employment || "unknown").toUpperCase();
-        const comp = r.company_name ? ` | ${r.company_name}` : "";
-        const jt = r.job_title ? ` (${r.job_title})` : "";
-        const label = `${r.name} [${r.user_id}] — ${Number(r.value).toLocaleString()} | ${empLabel}${comp}${jt}`;
-        const opt = document.createElement("option");
-        opt.value = String(r.user_id);
-        opt.textContent = label;
-        dd.appendChild(opt);
-      }
-
-      dd.onchange = () => {
-        const xid = dd.value;
-        if (xid) window.open(`https://www.torn.com/profiles.php?XID=${xid}`, "_blank", "noopener,noreferrer");
-      };
-
-      setStatus(String(rows.length));
-    } catch {
-      $("#hs-dd").innerHTML = `<option value="">Error (token / logs)</option>`;
-      setStatus("error");
-    }
-  };
-
-  // ---------- Drag + Tap-to-open/close ----------
-  let pos = gmGet(POS_KEY, { right: 12, top: 160 });
-  function applyPos(){ icon.style.right = `${pos.right}px`; icon.style.top = `${pos.top}px`; }
-  applyPos();
-
-  let drag = null;
-  icon.addEventListener("pointerdown", (e) => {
-    icon.setPointerCapture(e.pointerId);
-    drag = { x: e.clientX, y: e.clientY, sr: pos.right, st: pos.top };
-    icon.dataset.dragging = "0";
-  });
-
-  icon.addEventListener("pointermove", (e) => {
-    if (!drag) return;
-    const dx = e.clientX - drag.x;
-    const dy = e.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > 4) icon.dataset.dragging = "1";
-    pos.right = Math.max(6, drag.sr - dx);
-    pos.top   = Math.max(60, drag.st + dy);
-    applyPos();
-  });
-
-  icon.addEventListener("pointerup", () => {
-    if (!drag) return;
-    gmSet(POS_KEY, pos);
-    drag = null;
-    setTimeout(() => (icon.dataset.dragging = "0"), 0);
-  });
-
-  function togglePanel() {
-    const open = panel.style.display !== "none";
-    panel.style.display = open ? "none" : "block";
-    gmSet(OPEN_KEY, !open);
+  function placePanel() {
+    const top = parseInt(badge.style.top, 10) || 160;
+    panel.style.top = Math.max(10, top - 10) + "px";
+    panel.style.right = "64px";
   }
 
-  // tap 💼 opens AND closes
-  icon.addEventListener("click", () => {
-    if (icon.dataset.dragging === "1") return;
-    togglePanel();
+  panel.innerHTML = `
+    <div id="hs-title">
+      <b>7DS Hiring Scan</b>
+      <div id="hs-mini">tap 💼 to close</div>
+    </div>
+
+    <div id="hs-tabs">
+      <button class="hs-tab" id="tab-recruiter">Recruiter</button>
+      <button class="hs-tab" id="tab-submit">Submit</button>
+    </div>
+
+    <div id="view-recruiter">
+      <div id="hs-grid">
+        <div>
+          <label>Job status</label>
+          <select id="hs-job">
+            <option value="any">Any</option>
+            <option value="none">Unemployed (none)</option>
+            <option value="company">Company</option>
+            <option value="city">City job</option>
+          </select>
+        </div>
+        <div>
+          <label>Sort</label>
+          <select id="hs-sort">
+            <option value="total">Total</option>
+            <option value="man">MAN</option>
+            <option value="intel">INT</option>
+            <option value="endu">END</option>
+            <option value="updated">Updated</option>
+          </select>
+        </div>
+
+        <div><label>MAN min</label><input id="hs-min-man" inputmode="numeric" placeholder="0"></div>
+        <div><label>MAN max</label><input id="hs-max-man" inputmode="numeric" placeholder="999999999"></div>
+
+        <div><label>INT min</label><input id="hs-min-int" inputmode="numeric" placeholder="0"></div>
+        <div><label>INT max</label><input id="hs-max-int" inputmode="numeric" placeholder="999999999"></div>
+
+        <div><label>END min</label><input id="hs-min-end" inputmode="numeric" placeholder="0"></div>
+        <div><label>END max</label><input id="hs-max-end" inputmode="numeric" placeholder="999999999"></div>
+
+        <div><label>Total min</label><input id="hs-min-total" inputmode="numeric" placeholder="0"></div>
+        <div><label>Total max</label><input id="hs-max-total" inputmode="numeric" placeholder="999999999"></div>
+      </div>
+
+      <div id="hs-actions">
+        <button id="hs-search">Search</button>
+        <button class="secondary" id="hs-clear">Clear</button>
+      </div>
+
+      <div id="hs-results"></div>
+    </div>
+
+    <div id="view-submit" style="display:none;">
+      <div class="hs-msg">
+        Opt-in here so recruiters can find you. You can submit manually, or paste a limited API key to auto-verify.
+      </div>
+
+      <label>Your Torn ID</label>
+      <input id="sub-id" inputmode="numeric" placeholder="123456">
+
+      <label>Your name (optional)</label>
+      <input id="sub-name" placeholder="YourName">
+
+      <label>Job status</label>
+      <select id="sub-job">
+        <option value="unknown">Unknown</option>
+        <option value="none">Unemployed (none)</option>
+        <option value="company">Company</option>
+        <option value="city">City job</option>
+      </select>
+
+      <label>Company/City job name (optional)</label>
+      <input id="sub-jobname" placeholder="e.g. 10* AN or Grocer">
+
+      <div id="hs-grid" style="margin-top:6px;">
+        <div><label>MAN</label><input id="sub-man" inputmode="numeric" placeholder="0"></div>
+        <div><label>INT</label><input id="sub-int" inputmode="numeric" placeholder="0"></div>
+        <div><label>END</label><input id="sub-end" inputmode="numeric" placeholder="0"></div>
+        <div><label>Total (optional)</label><input id="sub-total" inputmode="numeric" placeholder="auto"></div>
+      </div>
+
+      <label>Note (optional)</label>
+      <textarea id="sub-note" placeholder="What job you want, availability, etc"></textarea>
+
+      <div id="hs-actions">
+        <button id="btn-submit-manual">Submit (manual)</button>
+        <button class="secondary" id="btn-submit-key">Submit (verify with key)</button>
+      </div>
+
+      <label style="margin-top:10px;">Limited API key (optional)</label>
+      <input id="sub-key" placeholder="Paste key here (used once to verify; not stored)">
+
+      <div class="hs-warn">
+        Tip: Only use a key you’re okay sharing for verification. The server stores your stats & job status, not the key.
+      </div>
+
+      <div id="sub-status" class="hs-msg" style="margin-top:10px;"></div>
+    </div>
+  `;
+
+  document.body.appendChild(panel);
+  document.body.appendChild(badge);
+  placePanel();
+
+  function setOpen(v) {
+    state.open = v;
+    GM_setValue(OPEN_KEY, !!v);
+    panel.style.display = v ? "block" : "none";
+    if (v) placePanel();
+  }
+
+  badge.addEventListener("click", () => setOpen(!state.open));
+
+  // drag logic
+  let dragging = false, startY = 0, startTop = 0;
+  function onDown(clientY) {
+    dragging = true;
+    startY = clientY;
+    startTop = parseInt(badge.style.top, 10) || DEFAULT_POS.top;
+  }
+  function onMove(clientY) {
+    if (!dragging) return;
+    const dy = clientY - startY;
+    const nextTop = Math.min(window.innerHeight - 60, Math.max(10, startTop + dy));
+    badge.style.top = nextTop + "px";
+    placePanel();
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    const top = parseInt(badge.style.top, 10) || DEFAULT_POS.top;
+    const right = parseInt(badge.style.right, 10) || DEFAULT_POS.right;
+    GM_setValue(POS_KEY, { top, right });
+  }
+  badge.addEventListener("mousedown", (e) => onDown(e.clientY));
+  window.addEventListener("mousemove", (e) => onMove(e.clientY));
+  window.addEventListener("mouseup", onUp);
+  badge.addEventListener("touchstart", (e) => onDown(e.touches[0].clientY), { passive: true });
+  window.addEventListener("touchmove", (e) => onMove(e.touches[0].clientY), { passive: true });
+  window.addEventListener("touchend", onUp);
+
+  const $ = (id) => panel.querySelector(id);
+
+  function setTab(tab) {
+    state.tab = tab;
+    GM_setValue(TAB_KEY, tab);
+    $("#view-recruiter").style.display = (tab === "recruiter") ? "block" : "none";
+    $("#view-submit").style.display = (tab === "submit") ? "block" : "none";
+    $("#tab-recruiter").classList.toggle("on", tab === "recruiter");
+    $("#tab-submit").classList.toggle("on", tab === "submit");
+  }
+
+  $("#tab-recruiter").addEventListener("click", () => setTab("recruiter"));
+  $("#tab-submit").addEventListener("click", () => setTab("submit"));
+  setTab(state.tab);
+
+  function valNumSel(sel, fallback = "") {
+    const v = ($(sel).value || "").trim();
+    return v === "" ? fallback : v.replace(/[^0-9]/g, "");
+  }
+
+  function setResults(html) { $("#hs-results").innerHTML = html; }
+  function setStatus(msg) { $("#sub-status").innerHTML = msg; }
+
+  async function runSearch() {
+    if (!ADMIN_TOKEN) {
+      setResults(`<div class="hs-row"><div class="hs-left"><div class="hs-sub">Recruiter: set ADMIN_TOKEN in the script.</div></div></div>`);
+      return;
+    }
+
+    setResults(`<div class="hs-row"><div class="hs-left"><div class="hs-sub">Searching...</div></div></div>`);
+
+    const params = new URLSearchParams({
+      token: ADMIN_TOKEN,
+      job_type: $("#hs-job").value,
+      sort: $("#hs-sort").value,
+      min_man: valNumSel("#hs-min-man"),
+      max_man: valNumSel("#hs-max-man"),
+      min_int: valNumSel("#hs-min-int"),
+      max_int: valNumSel("#hs-max-int"),
+      min_end: valNumSel("#hs-min-end"),
+      max_end: valNumSel("#hs-max-end"),
+      min_total: valNumSel("#hs-min-total"),
+      max_total: valNumSel("#hs-max-total"),
+    });
+
+    const data = await httpJson("GET", `${BASE_URL}/api/search?${params.toString()}`).catch(() => null);
+
+    if (!data || !data.ok) {
+      setResults(`<div class="hs-row"><div class="hs-left"><div class="hs-sub">Error (bad token / service down).</div></div></div>`);
+      return;
+    }
+    if (!data.rows || !data.rows.length) {
+      setResults(`<div class="hs-row"><div class="hs-left"><div class="hs-sub">No matches.</div></div></div>`);
+      return;
+    }
+
+    const html = data.rows.map(r => {
+      const jobLabel =
+        r.job_type === "none" ? "Unemployed" :
+        r.job_type === "company" ? "Company" :
+        r.job_type === "city" ? "City job" : "Unknown";
+      const jobName = r.job_name ? ` • ${esc(r.job_name)}` : "";
+      const verify = r.verified ? `<span class="hs-pill">verified</span>` : `<span class="hs-pill">opt-in</span>`;
+      return `
+        <div class="hs-row">
+          <div class="hs-left">
+            <div class="hs-name"><a target="_blank" href="https://www.torn.com/profiles.php?XID=${r.id}">${esc(r.name || ("ID " + r.id))}</a></div>
+            <div class="hs-sub">${jobLabel}${jobName}</div>
+            <div class="hs-sub">${esc(r.note || "")}</div>
+          </div>
+          <div class="hs-right">
+            <div>MAN ${Number(r.man).toLocaleString()}</div>
+            <div>INT ${Number(r.intel).toLocaleString()}</div>
+            <div>END ${Number(r.endu).toLocaleString()}</div>
+            <div><b>Total ${Number(r.total).toLocaleString()}</b></div>
+            ${verify}
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    setResults(html);
+  }
+
+  $("#hs-search").addEventListener("click", runSearch);
+  $("#hs-clear").addEventListener("click", () => {
+    ["#hs-min-man","#hs-max-man","#hs-min-int","#hs-max-int","#hs-min-end","#hs-max-end","#hs-min-total","#hs-max-total"].forEach(s => $(s).value = "");
+    $("#hs-job").value = "any";
+    $("#hs-sort").value = "total";
+    setResults("");
   });
+
+  async function submitManual() {
+    const torn_id = valNumSel("#sub-id");
+    if (!torn_id) { setStatus("⚠️ Enter your Torn ID."); return; }
+
+    const man = valNumSel("#sub-man","0");
+    const intel = valNumSel("#sub-int","0");
+    const endu = valNumSel("#sub-end","0");
+    const total = valNumSel("#sub-total","");
+
+    const payload = {
+      torn_id: Number(torn_id),
+      name: ($("#sub-name").value || "").trim(),
+      job_type: $("#sub-job").value,
+      job_name: ($("#sub-jobname").value || "").trim(),
+      man: Number(man || 0),
+      intel: Number(intel || 0),
+      endu: Number(endu || 0),
+      total: total ? Number(total) : undefined,
+      note: ($("#sub-note").value || "").trim(),
+    };
+
+    setStatus("Submitting...");
+    const res = await httpJson("POST", `${BASE_URL}/api/submit`, payload).catch(() => null);
+    if (!res || !res.ok) { setStatus("❌ Submit failed."); return; }
+    setStatus("✅ Submitted (manual).");
+  }
+
+  async function submitKeyVerified() {
+    const key = ($("#sub-key").value || "").trim();
+    if (!key) { setStatus("⚠️ Paste your limited API key first."); return; }
+
+    setStatus("Verifying with Torn API...");
+    const res = await httpJson("POST", `${BASE_URL}/api/submit_key`, {
+      key,
+      note: ($("#sub-note").value || "").trim(),
+    }).catch(() => null);
+
+    if (!res || !res.ok) {
+      setStatus("❌ Verify failed (invalid key / API error).");
+      return;
+    }
+
+    // Clear key box after use
+    $("#sub-key").value = "";
+    setStatus(`✅ Verified & submitted: ${esc(res.name)} • ${esc(res.job_type)} • Total ${Number(res.total).toLocaleString()}`);
+  }
+
+  $("#btn-submit-manual").addEventListener("click", submitManual);
+  $("#btn-submit-key").addEventListener("click", submitKeyVerified);
 
 })();
