@@ -1,14 +1,15 @@
 import os
 import time
 import sqlite3
+import asyncio
 from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify, Response
+import aiohttp
 
 APP_NAME = "7DS Hiring Scan"
 DB_PATH = os.getenv("DB_PATH", "hiring.db")
-
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()   # YOU (recruiter) token
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()  # e.g. https://sevends-hiring-scan.onrender.com
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
 
 app = Flask(__name__)
 
@@ -29,7 +30,7 @@ def init_db():
       total INTEGER NOT NULL DEFAULT 0,
       job_type TEXT NOT NULL DEFAULT 'unknown',   -- none|company|city|unknown
       job_name TEXT,
-      verified INTEGER NOT NULL DEFAULT 0,        -- 0/1 (if you later verify via key)
+      verified INTEGER NOT NULL DEFAULT 0,        -- 0/1
       note TEXT,
       updated_at TEXT
     )
@@ -42,7 +43,7 @@ def init_db():
     con.commit()
     con.close()
 
-def upsert_candidate(payload: dict):
+def upsert_candidate(payload: dict, verified: int = 0):
     now = datetime.now(timezone.utc).isoformat()
     torn_id = int(payload["torn_id"])
     name = (payload.get("name") or "").strip()
@@ -56,14 +57,13 @@ def upsert_candidate(payload: dict):
     if job_type not in ("none", "company", "city", "unknown"):
         job_type = "unknown"
     job_name = (payload.get("job_name") or "").strip() or None
-
     note = (payload.get("note") or "").strip() or None
 
     con = _con()
     cur = con.cursor()
     cur.execute("""
     INSERT INTO candidates (torn_id, name, man, intel, endu, total, job_type, job_name, verified, note, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT verified FROM candidates WHERE torn_id=?), 0), ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(torn_id) DO UPDATE SET
       name=excluded.name,
       man=excluded.man,
@@ -72,34 +72,30 @@ def upsert_candidate(payload: dict):
       total=excluded.total,
       job_type=excluded.job_type,
       job_name=excluded.job_name,
+      verified=excluded.verified,
       note=excluded.note,
       updated_at=excluded.updated_at
-    """, (torn_id, name, man, intel, endu, total, job_type, job_name, torn_id, note, now))
+    """, (torn_id, name, man, intel, endu, total, job_type, job_name, int(verified), note, now))
     con.commit()
     con.close()
 
 def query_candidates(filters: dict):
-    # filters: min/max per stat, job_type, sort
     min_man = int(filters.get("min_man") or 0)
     max_man = int(filters.get("max_man") or 2_000_000_000)
-
     min_int = int(filters.get("min_int") or 0)
     max_int = int(filters.get("max_int") or 2_000_000_000)
-
     min_end = int(filters.get("min_end") or 0)
     max_end = int(filters.get("max_end") or 2_000_000_000)
-
     min_total = int(filters.get("min_total") or 0)
     max_total = int(filters.get("max_total") or 2_000_000_000)
 
-    job_type = (filters.get("job_type") or "any").strip().lower()  # any|none|company|city
+    job_type = (filters.get("job_type") or "any").strip().lower()
     if job_type not in ("any", "none", "company", "city"):
         job_type = "any"
 
-    sort = (filters.get("sort") or "total").strip().lower()  # man|intel|endu|total|updated
+    sort = (filters.get("sort") or "total").strip().lower()
     if sort not in ("man", "intel", "endu", "total", "updated"):
         sort = "total"
-
     order_col = {"man": "man", "intel": "intel", "endu": "endu", "total": "total", "updated": "updated_at"}[sort]
 
     sql = """
@@ -141,73 +137,68 @@ def query_candidates(filters: dict):
         })
     return out
 
-# ---------------- UI (simple embedded panel) ----------------
+# ---------------- Torn verify (player key) ----------------
+async def torn_user(key: str):
+    url = f"https://api.torn.com/user/?selections=basic,job,workstats&key={key}"
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.get(url) as r:
+            return await r.json()
+
+def parse_job_type(job_obj):
+    # Torn job object varies by situation; we handle common patterns
+    # If can't determine, return unknown.
+    if not isinstance(job_obj, dict):
+        return ("unknown", None)
+
+    # City job often has "job" / "position" but no company_id
+    # Company job often has company-related fields
+    # Unemployed sometimes has empty dict
+    company_id = job_obj.get("company_id") or job_obj.get("company", {}).get("id")
+    company_name = job_obj.get("company_name") or job_obj.get("company", {}).get("name")
+
+    # Some payloads include city job name in "job" or "name"
+    city_job_name = job_obj.get("job") or job_obj.get("name") or job_obj.get("position")
+
+    if company_id or company_name:
+        return ("company", company_name)
+
+    # If it has something that looks like a city job name/position, treat as city
+    if city_job_name:
+        return ("city", str(city_job_name))
+
+    # If it's an empty object => none
+    if len(job_obj.keys()) == 0:
+        return ("none", None)
+
+    return ("unknown", None)
+
+# ---------------- UI (simple iframe-safe page) ----------------
 def html_page():
-    # keep this CSP/iframe-safe for Torn
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+    return f"""<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>{APP_NAME}</title>
 <style>
-  body {{
-    margin:0; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif;
-    background: #0b0f14; color:#e9eef5;
-  }}
-  .wrap {{ padding:12px; }}
-  .card {{
-    border:1px solid rgba(255,255,255,0.10);
-    background: linear-gradient(180deg, rgba(25,35,50,0.9), rgba(12,16,24,0.9));
-    border-radius:14px;
-    padding:12px;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.35);
-  }}
-  h1 {{ font-size:16px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }}
-  .badge {{
-    display:inline-flex; align-items:center; justify-content:center;
-    width:28px; height:28px; border-radius:10px;
-    background: radial-gradient(circle at 30% 30%, rgba(255,215,0,0.35), rgba(255,215,0,0.10));
-    border:1px solid rgba(255,215,0,0.35);
-  }}
-  .row {{ display:flex; gap:8px; flex-wrap:wrap; }}
-  .row > div {{ flex:1 1 130px; min-width:130px; }}
-  label {{ font-size:12px; opacity:0.85; display:block; margin:8px 0 4px; }}
-  input, select {{
-    width:100%; border-radius:10px; padding:10px;
-    border:1px solid rgba(255,255,255,0.12);
-    background: rgba(0,0,0,0.25); color:#e9eef5;
-    outline:none;
-  }}
-  button {{
-    margin-top:10px;
-    width:100%; padding:10px 12px; border-radius:12px;
-    border:1px solid rgba(255,215,0,0.35);
-    background: rgba(255,215,0,0.12);
-    color:#ffe7a6; font-weight:700;
-  }}
-  .hint {{ font-size:12px; opacity:0.75; margin-top:8px; line-height:1.35; }}
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1><span class="badge">💼</span> {APP_NAME}</h1>
-      <div class="hint">
-        Players opt-in by submitting their work stats + current job status. Recruiters search/sort from the overlay.
-      </div>
-      <hr style="border:none;border-top:1px solid rgba(255,255,255,0.10);margin:10px 0;">
-      <div class="hint"><b>Submission endpoint:</b> <code>/api/submit</code></div>
-      <div class="hint"><b>Recruiter search:</b> <code>/api/search</code> (requires ADMIN_TOKEN)</div>
-    </div>
-  </div>
-</body>
-</html>"""
+body {{ margin:0; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; background:#0b0f14; color:#e9eef5; }}
+.wrap {{ padding:12px; }}
+.card {{ border:1px solid rgba(255,255,255,0.10); background:linear-gradient(180deg, rgba(25,35,50,0.9), rgba(12,16,24,0.9));
+border-radius:14px; padding:12px; box-shadow:0 10px 25px rgba(0,0,0,0.35); }}
+h1 {{ font-size:16px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }}
+.badge {{ width:28px; height:28px; border-radius:10px; display:inline-flex; align-items:center; justify-content:center;
+background:radial-gradient(circle at 30% 30%, rgba(255,215,0,0.35), rgba(255,215,0,0.10));
+border:1px solid rgba(255,215,0,0.35); }}
+.hint {{ font-size:12px; opacity:0.8; line-height:1.35; }}
+code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
+</style></head><body>
+<div class="wrap"><div class="card">
+<h1><span class="badge">💼</span> {APP_NAME}</h1>
+<div class="hint">Opt-in hiring list + recruiter search. Use /api/submit (manual) or /api/submit_key (verified via player's key).</div>
+<div class="hint" style="margin-top:8px;"><b>Recruiter search:</b> <code>/api/search?token=ADMIN_TOKEN&job_type=none&min_total=100000&sort=total</code></div>
+</div></div></body></html>"""
 
 # ---------------- Routes ----------------
 @app.after_request
 def add_headers(resp):
-    # iframe-safe
     resp.headers["X-Frame-Options"] = "ALLOWALL"
     resp.headers["Content-Security-Policy"] = "frame-ancestors *"
     return resp
@@ -222,18 +213,60 @@ def health():
 
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
-    # Player opt-in. NO token required.
     data = request.get_json(silent=True) or {}
     if not str(data.get("torn_id") or "").isdigit():
         return jsonify({"ok": False, "error": "torn_id required"}), 400
+    upsert_candidate(data, verified=0)
+    return jsonify({"ok": True, "verified": False})
 
-    # minimum fields accepted; totals computed if missing
-    upsert_candidate(data)
-    return jsonify({"ok": True})
+@app.route("/api/submit_key", methods=["POST"])
+def api_submit_key():
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    note = (data.get("note") or "").strip()
+
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
+
+    try:
+        raw = asyncio.run(torn_user(key))
+    except Exception:
+        return jsonify({"ok": False, "error": "torn api request failed"}), 502
+
+    if not isinstance(raw, dict) or raw.get("error"):
+        return jsonify({"ok": False, "error": "invalid key or api error", "details": raw.get("error")}), 400
+
+    torn_id = raw.get("player_id") or raw.get("user_id") or raw.get("ID") or raw.get("id")
+    name = raw.get("name") or ""
+    work = raw.get("workstats") or {}
+    job = raw.get("job") or {}
+
+    if not torn_id:
+        return jsonify({"ok": False, "error": "could not read torn_id from api"}), 400
+
+    man = int(work.get("manual_labor") or 0)
+    intel = int(work.get("intelligence") or 0)
+    endu = int(work.get("endurance") or 0)
+    total = man + intel + endu
+
+    job_type, job_name = parse_job_type(job)
+
+    upsert_candidate({
+        "torn_id": int(torn_id),
+        "name": name,
+        "man": man,
+        "intel": intel,
+        "endu": endu,
+        "total": total,
+        "job_type": job_type,
+        "job_name": job_name or "",
+        "note": note
+    }, verified=1)
+
+    return jsonify({"ok": True, "verified": True, "torn_id": int(torn_id), "name": name, "job_type": job_type, "total": total})
 
 @app.route("/api/search", methods=["GET"])
 def api_search():
-    # Recruiter search (protected)
     token = (request.args.get("token") or "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
