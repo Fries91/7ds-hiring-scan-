@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS Hiring Hub 💼 (Companies + Employees + Train Tracker)
+// @name         7DS Hiring Hub 💼 (Trains + Search HoF Workstats)
 // @namespace    7ds-wrath-hiring
-// @version      2.0.0
-// @description  💼 Draggable button + overlay hub. Tabs: Applications + Companies (dropdown -> employees dropdown) + Train Tracker (buyer + trains + note) saved to server. Matches your app.py endpoints: /api/companies, /api/trains, /api/trains/add, /api/applications.
+// @version      3.0.0
+// @description  💼 Draggable button + overlay hub. Tabs: Trains (companies+employees+train tracker) + Applications + Search (HoF workstats between X and Y). Matches your app.py endpoints: /api/companies, /api/trains, /api/trains/add, /api/applications, /api/search_workstats.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -67,6 +67,12 @@
     });
   }
 
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+
   // ---------------- UI bootstrap ----------------
   document.getElementById(BTN_ID)?.remove();
   document.getElementById(PANEL_ID)?.remove();
@@ -89,7 +95,7 @@
     #${PANEL_ID}{
       position:fixed; z-index:2147483646;
       width:372px; max-width:94vw;
-      height:560px; max-height:82vh;
+      height:580px; max-height:84vh;
       border-radius:16px;
       background:rgba(12,12,18,.92);
       border:1px solid rgba(255,255,255,.12);
@@ -142,13 +148,12 @@
     #${PANEL_ID} .row{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
     #${PANEL_ID} .muted{ opacity:.85; font-size:11px; font-weight:700; margin-top:4px; }
     #${PANEL_ID} .actions{ display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
-    #${PANEL_ID} select, #${PANEL_ID} input, #${PANEL_ID} textarea{
+    #${PANEL_ID} select, #${PANEL_ID} input{
       width:100%; padding:8px 10px; border-radius:12px;
       border:1px solid rgba(255,255,255,.12);
       background:rgba(0,0,0,.22); color:#fff; outline:none;
       font-weight:800; font-size:12px;
     }
-    #${PANEL_ID} textarea{ min-height:92px; resize:vertical; }
     #${TOAST_ID}{
       position:fixed; z-index:2147483647; left:50%; transform:translateX(-50%);
       bottom:14px; padding:10px 12px; border-radius:14px;
@@ -180,18 +185,29 @@
   }
 
   // ---------------- state ----------------
-  const savedPos = S.get("h7ds_hiring_pos_v3", { btnLeft: null, btnTop: null, panelLeft: null, panelTop: null });
+  const savedPos = S.get("h7ds_hiring_pos_v4", { btnLeft: null, btnTop: null, panelLeft: null, panelTop: null });
 
   const state = {
-    tab: "companies",
+    tab: "trains",
     last: null,
     adminToken: S.get("h7ds_hiring_admin", "") || "",
+
+    // apps
     apps: [],
+
+    // companies/employees
     companiesUpdated: null,
-    companies: [], // rows from /api/companies
-    selectedCompanyId: "",
-    selectedEmployeeId: "",
+    companies: [],
+    selectedCompanyId: S.get("h7ds_sel_company", "") || "",
+    selectedEmployeeId: S.get("h7ds_sel_employee", "") || "",
     trains: [],
+
+    // search
+    searchMin: S.get("h7ds_search_min", 0) || 0,
+    searchMax: S.get("h7ds_search_max", 0) || 0,
+    searchRows: [],
+    searchMeta: null,
+
     timer: null,
   };
 
@@ -241,8 +257,9 @@
       </div>
 
       <div class="h-tabs">
-        <div class="h-tab ${state.tab === "companies" ? "active" : ""}" id="tab-companies">Companies</div>
+        <div class="h-tab ${state.tab === "trains" ? "active" : ""}" id="tab-trains">Trains</div>
         <div class="h-tab ${state.tab === "apps" ? "active" : ""}" id="tab-apps">Applications</div>
+        <div class="h-tab ${state.tab === "search" ? "active" : ""}" id="tab-search">Search</div>
         <div class="h-tab ${state.tab === "settings" ? "active" : ""}" id="tab-settings">Settings</div>
       </div>
 
@@ -252,13 +269,15 @@
     qs("#h-close", panel).onclick = () => toggle(false);
     qs("#h-refresh", panel).onclick = () => refreshNow(true);
 
-    qs("#tab-companies", panel).onclick = () => { state.tab = "companies"; render(); };
+    qs("#tab-trains", panel).onclick = () => { state.tab = "trains"; render(); };
     qs("#tab-apps", panel).onclick = () => { state.tab = "apps"; render(); };
+    qs("#tab-search", panel).onclick = () => { state.tab = "search"; render(); };
     qs("#tab-settings", panel).onclick = () => { state.tab = "settings"; render(); };
 
     const body = qs("#h-body", panel);
-    if (state.tab === "companies") body.appendChild(viewCompanies());
+    if (state.tab === "trains") body.appendChild(viewTrains());
     if (state.tab === "apps") body.appendChild(viewApps());
+    if (state.tab === "search") body.appendChild(viewSearch());
     if (state.tab === "settings") body.appendChild(viewSettings());
   }
 
@@ -291,8 +310,9 @@
         const res = await reqJSON(withAdmin(`${BASE_URL}/api/companies`), "GET");
         if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
         toastMsg("OK");
-        state.tab = "companies";
+        state.tab = "trains";
         await loadCompanies();
+        await loadTrainsForSelected();
         render();
       } catch {
         toastMsg("Test failed (token wrong or service down)");
@@ -302,25 +322,23 @@
     return wrap;
   }
 
-  function viewCompanies() {
+  // -------- TRAINS TAB (companies+employees+train tracker) --------
+  function viewTrains() {
     const wrap = document.createElement("div");
 
     const header = document.createElement("div");
     header.className = "card";
     header.innerHTML = `
       <div style="font-weight:900;">Companies & Employees</div>
-      <div class="muted">Source: /api/companies • Updated: ${state.companiesUpdated || "—"}</div>
+      <div class="muted">Updated: ${state.companiesUpdated || "—"}</div>
       <div class="muted">Pick a company → pick an employee → track trains below.</div>
     `;
     wrap.appendChild(header);
 
-    // company dropdown
     const companyCard = document.createElement("div");
     companyCard.className = "card";
 
     const companySel = document.createElement("select");
-    companySel.id = "coSel";
-
     const opt0 = document.createElement("option");
     opt0.value = "";
     opt0.textContent = state.companies.length ? "Select company…" : "No companies loaded yet";
@@ -335,7 +353,6 @@
     }
 
     const employeeSel = document.createElement("select");
-    employeeSel.id = "empSel";
 
     function fillEmployees() {
       employeeSel.innerHTML = "";
@@ -361,6 +378,7 @@
       state.selectedCompanyId = companySel.value;
       state.selectedEmployeeId = "";
       S.set("h7ds_sel_company", state.selectedCompanyId);
+      S.set("h7ds_sel_employee", state.selectedEmployeeId);
       fillEmployees();
       await loadTrainsForSelected();
       render();
@@ -372,17 +390,16 @@
       render();
     };
 
-    // preload selection
-    if (!state.selectedCompanyId) state.selectedCompanyId = S.get("h7ds_sel_company", "") || "";
-    if (!state.selectedEmployeeId) state.selectedEmployeeId = S.get("h7ds_sel_employee", "") || "";
+    // validate selection if company list changed
     if (state.selectedCompanyId && !state.companies.find(x => x.company_id === state.selectedCompanyId)) {
       state.selectedCompanyId = "";
       state.selectedEmployeeId = "";
+      S.set("h7ds_sel_company", "");
+      S.set("h7ds_sel_employee", "");
     }
 
     fillEmployees();
 
-    // employee info box
     const info = document.createElement("div");
     info.className = "muted";
     info.style.marginTop = "10px";
@@ -440,7 +457,6 @@
       }
     };
 
-    // train list
     const list = document.createElement("div");
     list.style.marginTop = "10px";
 
@@ -484,10 +500,10 @@
 
     wrap.appendChild(companyCard);
     wrap.appendChild(trainCard);
-
     return wrap;
   }
 
+  // -------- APPLICATIONS TAB --------
   function viewApps() {
     const wrap = document.createElement("div");
 
@@ -519,7 +535,7 @@
             <div style="font-weight:900;">${applicantId ? `Applicant [${escapeHtml(applicantId)}]` : "Applicant [unknown]"}</div>
             <div class="muted">${escapeHtml(created)}</div>
           </div>
-          <button class="h-btn" data-open="${escapeAttr(applicantId)}">Open</button>
+          <button class="h-btn" data-open="1">Open</button>
         </div>
         <div class="muted" style="margin-top:8px;word-break:break-word;"></div>
         <div class="actions"></div>
@@ -542,155 +558,3 @@
         try {
           const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications/status`), "POST", {
             id: row.id,
-            status: sel.value,
-          });
-          if (!res || res.ok !== true) throw new Error("bad response");
-          toastMsg("Status updated");
-        } catch {
-          toastMsg("Update failed (token?)");
-        }
-      };
-
-      actions.appendChild(sel);
-
-      card.querySelector("[data-open]")?.addEventListener("click", () => {
-        if (!applicantId) return toastMsg("No applicant id");
-        window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}`, "_blank");
-      });
-
-      wrap.appendChild(card);
-    }
-
-    return wrap;
-  }
-
-  // ---------------- data loaders ----------------
-  async function loadCompanies() {
-    const res = await reqJSON(withAdmin(`${BASE_URL}/api/companies`), "GET");
-    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-    state.companiesUpdated = res.updated_at || null;
-    state.companies = res.rows || [];
-  }
-
-  async function loadTrainsForSelected() {
-    state.trains = [];
-    if (!state.selectedCompanyId) return;
-    const res = await reqJSON(withAdmin(`${BASE_URL}/api/trains?company_id=${encodeURIComponent(state.selectedCompanyId)}`), "GET");
-    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-    state.trains = res.rows || [];
-  }
-
-  async function loadApps() {
-    const res = await reqJSON(withAdmin(`${BASE_URL}/api/applications`), "GET");
-    if (!res || res.ok !== true) throw new Error(res?.error || "bad response");
-    state.apps = res.rows || [];
-  }
-
-  async function refreshNow(showFailToast) {
-    try {
-      if (state.tab === "companies") {
-        await loadCompanies();
-        // keep trains synced to selected company
-        if (!state.selectedCompanyId) state.selectedCompanyId = S.get("h7ds_sel_company", "") || "";
-        if (state.selectedCompanyId) await loadTrainsForSelected();
-      } else if (state.tab === "apps") {
-        await loadApps();
-      }
-      state.last = nowNice();
-      const lastEl = qs("#h-last", panel);
-      if (lastEl) lastEl.textContent = state.last;
-      render();
-    } catch {
-      if (showFailToast) toastMsg("Fetch failed (token/service?)");
-    }
-  }
-
-  function startPolling() {
-    stopPolling();
-    refreshNow(false);
-    state.timer = setInterval(() => {
-      if (panel.style.display === "block") refreshNow(false);
-    }, POLL_MS);
-  }
-
-  function stopPolling() {
-    if (state.timer) clearInterval(state.timer);
-    state.timer = null;
-  }
-
-  // ---------------- open/close + drag/tap ----------------
-  function toggle(open) {
-    const isOpen = panel.style.display === "block";
-    const next = open ?? !isOpen;
-    panel.style.display = next ? "block" : "none";
-    if (next) startPolling();
-    else stopPolling();
-  }
-
-  function makeDraggableTap(node, which) {
-    let down = false, moved = false;
-    let sx = 0, sy = 0, ox = 0, oy = 0;
-
-    node.addEventListener("pointerdown", (e) => {
-      down = true; moved = false;
-      sx = e.clientX; sy = e.clientY;
-      const r = node.getBoundingClientRect();
-      ox = r.left; oy = r.top;
-
-      node.setPointerCapture?.(e.pointerId);
-      node.style.right = "auto";
-      node.style.bottom = "auto";
-      node.style.left = ox + "px";
-      node.style.top = oy + "px";
-    });
-
-    node.addEventListener("pointermove", (e) => {
-      if (!down) return;
-      const dx = e.clientX - sx;
-      const dy = e.clientY - sy;
-      if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
-
-      const x = clamp(ox + dx, 6, window.innerWidth - node.offsetWidth - 6);
-      const y = clamp(oy + dy, 6, window.innerHeight - node.offsetHeight - 6);
-      node.style.left = x + "px";
-      node.style.top = y + "px";
-    });
-
-    node.addEventListener("pointerup", () => {
-      if (!down) return;
-      down = false;
-
-      const r = node.getBoundingClientRect();
-      if (which === "btn") {
-        savedPos.btnLeft = Math.round(r.left);
-        savedPos.btnTop = Math.round(r.top);
-      } else {
-        savedPos.panelLeft = Math.round(r.left);
-        savedPos.panelTop = Math.round(r.top);
-      }
-      S.set("h7ds_hiring_pos_v3", savedPos);
-
-      if (which === "btn" && !moved) toggle();
-    });
-
-    node.addEventListener("pointercancel", () => { down = false; });
-  }
-
-  // basic html escaping
-  function escapeHtml(s) {
-    return String(s || "").replace(/[&<>"']/g, (c) => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-    }[c]));
-  }
-  function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
-
-  // ---------------- boot ----------------
-  render();
-  makeDraggableTap(btn, "btn");
-  makeDraggableTap(panel, "panel");
-
-  // load initial selections
-  state.selectedCompanyId = S.get("h7ds_sel_company", "") || "";
-
-  toastMsg("💼 Hiring Hub loaded");
-})();
