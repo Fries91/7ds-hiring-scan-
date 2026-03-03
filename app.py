@@ -9,14 +9,15 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ===== ENV =====
-TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()   # YOUR key for HoF scanning
-ADMIN_TOKEN  = (os.getenv("ADMIN_TOKEN") or "").strip()    # protects admin endpoints
+TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()   # your key for HoF TOTAL scan
+ADMIN_TOKEN  = (os.getenv("ADMIN_TOKEN") or "").strip()    # admin-only endpoints
 DB_PATH      = os.getenv("DB_PATH", "hiring_scan.db")
 
-# ===== CONSTANTS =====
-HOF_URL = "https://api.torn.com/v2/torn/hof"
-USER_URL = "https://api.torn.com/v2/user"  # key-owner fetch (personalstats)
+# ===== API ENDPOINTS =====
+HOF_URL  = "https://api.torn.com/v2/torn/hof"
+USER_URL = "https://api.torn.com/v2/user"
 
+# ===== CACHE =====
 CACHE_TTL = 90
 _page_cache = {}  # (offset, limit) -> (ts, rows)
 
@@ -39,7 +40,11 @@ def init_db():
         intelligence INTEGER NOT NULL,
         endurance INTEGER NOT NULL,
         total INTEGER NOT NULL,
-        source TEXT NOT NULL, -- 'manual' or 'apikey'
+        source TEXT NOT NULL,              -- 'manual' or 'apikey'
+        employment TEXT NOT NULL,          -- 'none'|'company'|'city'|'unknown'
+        company_id INTEGER,                -- nullable
+        company_name TEXT,                 -- nullable
+        job_title TEXT,                    -- nullable
         updated_at TEXT NOT NULL
     )
     """)
@@ -71,11 +76,11 @@ def home():
 <!doctype html>
 <meta charset="utf-8"/>
 <title>7DS Hiring Scan</title>
-<body style="font-family:system-ui;background:#0b0f16;color:#e8eefc;padding:16px">
+<body style="font-family:system-ui;background:#0b0f16;color:#e8eefc;padding:16px;max-width:900px">
   <h2>7DS Hiring Scan ✅ Running</h2>
-  <p><b>Public:</b> <code>/apply</code> (candidates submit stats or limited key)</p>
-  <p><b>Admin JSON:</b> <code>/state?min=100000&max=200000&limit=50</code> (HoF scan, token required)</p>
-  <p><b>Admin Applicants:</b> <code>/api/applicants</code> (token required)</p>
+  <p><b>Public:</b> <code>/apply</code> (stats + employment via manual or limited key)</p>
+  <p><b>Admin HoF scan:</b> <code>/state?min=100000&max=200000&limit=50</code> (token required)</p>
+  <p><b>Admin applicants:</b> <code>/api/applicants?employment=company|city|none|unknown</code> (token required)</p>
   <p><b>Recruit message:</b> {RECRUIT_MESSAGE}</p>
 </body>
 """)
@@ -87,16 +92,21 @@ def health():
 # ===== PUBLIC APPLY PAGE =====
 @app.get("/apply")
 def apply_page():
-    # simple public form – posts to /api/apply
     return iframe_safe_html(f"""
 <!doctype html>
 <meta charset="utf-8"/>
 <title>Apply - 7DS Hiring</title>
-<body style="font-family:system-ui;background:#0b0f16;color:#e8eefc;padding:16px;max-width:680px">
+<body style="font-family:system-ui;background:#0b0f16;color:#e8eefc;padding:16px;max-width:720px">
   <h2>Apply for Company</h2>
-  <p>Option A: enter your MAN / INT / END.</p>
-  <p>Option B: paste a <b>limited/custom API key</b> that allows <b>user → personalstats</b> so we can fetch your work stats once.</p>
-  <p style="opacity:.8">You can revoke your key anytime in Torn settings.</p>
+
+  <p style="opacity:.85;line-height:1.35">
+    Option A: Enter your MAN / INT / END and pick employment.<br>
+    Option B: Paste a <b>limited/custom API key</b> (recommended) so we can fetch your work stats + job status automatically.
+  </p>
+
+  <div style="opacity:.75;margin:10px 0 14px">
+    We do <b>not</b> store your API key. We only store your stats + job/company status.
+  </div>
 
   <form id="f" style="display:grid;gap:10px">
     <input name="name" placeholder="Your Torn name" required
@@ -112,6 +122,18 @@ def apply_page():
       <input name="endurance" placeholder="Endurance (optional)"
         style="padding:10px;border-radius:10px;border:1px solid #2a3550;background:#121a29;color:#e8eefc"/>
     </div>
+
+    <select name="employment" style="padding:10px;border-radius:10px;border:1px solid #2a3550;background:#121a29;color:#e8eefc">
+      <option value="">Employment (only needed if no API key)</option>
+      <option value="none">No company</option>
+      <option value="company">In a company</option>
+      <option value="city">City job</option>
+    </select>
+
+    <input name="company_name" placeholder="Company name (optional if no key)"
+      style="padding:10px;border-radius:10px;border:1px solid #2a3550;background:#121a29;color:#e8eefc"/>
+    <input name="job_title" placeholder="Job title / position (optional if no key)"
+      style="padding:10px;border-radius:10px;border:1px solid #2a3550;background:#121a29;color:#e8eefc"/>
 
     <input name="api_key" placeholder="Limited/Custom API key (optional)"
       style="padding:10px;border-radius:10px;border:1px solid #2a3550;background:#121a29;color:#e8eefc"/>
@@ -150,8 +172,8 @@ def apply_page():
 def api_apply():
     """
     Public. Accept either:
-    - manual manuallabor/intelligence/endurance
-    - or api_key to fetch personalstats for key-owner
+    - manual work stats + optional employment fields
+    - OR api_key, we fetch stats + job/employment from the key-owner selections
     """
     data = request.get_json(force=True, silent=True) or {}
 
@@ -166,13 +188,21 @@ def api_apply():
     except Exception:
         return jsonify({"ok": False, "error": "Invalid Torn ID"}), 400
 
-    # Option B: API key fetch
+    company_id = None
+    company_name = None
+    job_title = None
+    employment = "unknown"
+
+    # Option B: API key fetch (recommended)
     if api_key:
         try:
-            stats = fetch_workstats_from_key(api_key)
+            stats, jobinfo = fetch_stats_and_job_from_key(api_key)
             manuallabor = int(stats["manuallabor"])
             intelligence = int(stats["intelligence"])
             endurance = int(stats["endurance"])
+
+            employment, company_id, company_name, job_title = normalize_employment(jobinfo)
+
             source = "apikey"
         except Exception as e:
             return jsonify({"ok": False, "error": f"API key failed: {str(e)}"}), 400
@@ -182,17 +212,27 @@ def api_apply():
             manuallabor = int(str(data.get("manuallabor") or "").replace(",", "").strip())
             intelligence = int(str(data.get("intelligence") or "").replace(",", "").strip())
             endurance = int(str(data.get("endurance") or "").replace(",", "").strip())
-            source = "manual"
         except Exception:
             return jsonify({"ok": False, "error": "Enter MAN/INT/END or provide an API key"}), 400
+
+        emp = str(data.get("employment") or "").strip().lower()
+        if emp in {"none", "company", "city"}:
+            employment = emp
+        else:
+            employment = "unknown"
+
+        company_name = (str(data.get("company_name") or "").strip() or None)
+        job_title = (str(data.get("job_title") or "").strip() or None)
+
+        source = "manual"
 
     total = manuallabor + intelligence + endurance
 
     con = _con()
     cur = con.cursor()
     cur.execute("""
-      INSERT INTO applicants (torn_id,name,manuallabor,intelligence,endurance,total,source,updated_at)
-      VALUES (?,?,?,?,?,?,?,?)
+      INSERT INTO applicants (torn_id,name,manuallabor,intelligence,endurance,total,source,employment,company_id,company_name,job_title,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(torn_id) DO UPDATE SET
         name=excluded.name,
         manuallabor=excluded.manuallabor,
@@ -200,55 +240,137 @@ def api_apply():
         endurance=excluded.endurance,
         total=excluded.total,
         source=excluded.source,
+        employment=excluded.employment,
+        company_id=excluded.company_id,
+        company_name=excluded.company_name,
+        job_title=excluded.job_title,
         updated_at=excluded.updated_at
-    """, (torn_id, name, manuallabor, intelligence, endurance, total, source, now_iso()))
+    """, (torn_id, name, manuallabor, intelligence, endurance, total, source, employment, company_id, company_name, job_title, now_iso()))
     con.commit()
     con.close()
 
-    return jsonify({"ok": True, "torn_id": torn_id, "total": total, "source": source})
+    return jsonify({"ok": True, "torn_id": torn_id, "total": total, "source": source, "employment": employment})
 
-def fetch_workstats_from_key(api_key: str):
+def fetch_stats_and_job_from_key(api_key: str):
     """
-    Fetch key-owner personalstats and extract work stats.
-    According to TornAPI docs, personalstats includes manuallabor/intelligence/endurance fields. :contentReference[oaicite:2]{index=2}
+    Fetch key-owner personalstats + job in one call if possible.
+    We do NOT store the key; we only store derived stats.
     """
     params = {
         "key": api_key,
-        "selections": "personalstats"
+        "selections": "personalstats,job"
     }
     r = requests.get(USER_URL, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    # common shape: { "personalstats": { ... } }
     ps = data.get("personalstats") or {}
-    # field names in docs: manuallabor, intelligence, endurance :contentReference[oaicite:3]{index=3}
-    needed = ["manuallabor", "intelligence", "endurance"]
-    for k in needed:
-        if k not in ps:
-            raise RuntimeError("personalstats missing required fields (check key selections)")
-    return ps
+    job = data.get("job") or {}
 
-# ===== ADMIN: APPLICANTS LIST =====
+    for k in ("manuallabor", "intelligence", "endurance"):
+        if k not in ps:
+            raise RuntimeError("personalstats missing required fields (check custom key selections)")
+
+    return ps, job
+
+def normalize_employment(job: dict):
+    """
+    Tries to classify as:
+      - company (player-owned company)
+      - city (city job)
+      - none (no job)
+      - unknown (can't detect)
+    Field names can differ; we handle common patterns.
+    """
+    if not isinstance(job, dict) or not job:
+        return "unknown", None, None, None
+
+    # common-ish keys people see
+    company_id = job.get("company_id") or job.get("companyid") or job.get("companyID") or job.get("company") or None
+    company_name = job.get("company_name") or job.get("companyname") or job.get("name") or None
+    job_title = job.get("position") or job.get("title") or job.get("job") or None
+    job_type = (job.get("type") or job.get("job_type") or "").strip().lower()
+
+    # normalize company_id if it's numeric
+    try:
+        if company_id is not None and company_id != "":
+            company_id = int(company_id)
+        else:
+            company_id = None
+    except Exception:
+        company_id = None
+
+    # detect "no job"
+    # if company_id is None and job_type hints no job
+    if company_id is None and ("none" in job_type or "unemployed" in job_type):
+        return "none", None, company_name, job_title
+
+    # detect city job
+    if "city" in job_type:
+        return "city", None, company_name, job_title
+
+    # if company_id exists and is positive => company job
+    if company_id is not None and company_id > 0:
+        return "company", company_id, company_name, job_title
+
+    # fallback: if company_name contains "city"
+    if isinstance(company_name, str) and "city" in company_name.lower():
+        return "city", None, company_name, job_title
+
+    # still unknown
+    return "unknown", company_id, company_name, job_title
+
+# ===== ADMIN: APPLICANTS LIST + DELETE =====
 @app.get("/api/applicants")
 def api_applicants():
     if not require_admin(request):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     sort = (request.args.get("sort") or "total").strip().lower()
-    if sort not in {"manuallabor", "intelligence", "endurance", "total", "updated_at"}:
+    if sort not in {"manuallabor","intelligence","endurance","total","updated_at"}:
         sort = "total"
+
+    employment = (request.args.get("employment") or "").strip().lower()
+    where = ""
+    params = []
+    if employment in {"none","company","city","unknown"}:
+        where = "WHERE employment = ?"
+        params.append(employment)
 
     con = _con()
     rows = [dict(r) for r in con.execute(
-        f"SELECT torn_id,name,manuallabor,intelligence,endurance,total,source,updated_at "
-        f"FROM applicants ORDER BY {sort} DESC LIMIT 500"
+        f"""
+        SELECT torn_id,name,manuallabor,intelligence,endurance,total,source,
+               employment,company_id,company_name,job_title,updated_at
+        FROM applicants
+        {where}
+        ORDER BY {sort} DESC
+        LIMIT 500
+        """,
+        params
     ).fetchall()]
     con.close()
 
     return jsonify({"ok": True, "rows": rows, "message": RECRUIT_MESSAGE})
 
-# ===== ADMIN: HOF TOTAL SCAN (WAR-BOT STYLE /state) =====
+@app.post("/api/applicants/delete")
+def api_applicants_delete():
+    if not require_admin(request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        torn_id = int(data.get("torn_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid torn_id"}), 400
+
+    con = _con()
+    con.execute("DELETE FROM applicants WHERE torn_id=?", (torn_id,))
+    con.commit()
+    con.close()
+    return jsonify({"ok": True})
+
+# ===== ADMIN: HoF TOTAL SCAN (WAR-BOT STYLE /state) =====
 def fetch_hof_page(offset: int, limit: int):
     key = (offset, limit)
     now = time.time()
