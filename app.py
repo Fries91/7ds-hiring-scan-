@@ -1,291 +1,329 @@
 import os
-import time
-import sqlite3
-import asyncio
-from datetime import datetime, timezone
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request, Response
 
-from flask import Flask, request, jsonify, Response
-import aiohttp
+from torn_api import (
+    get_company, get_user_workstats, normalize_workstats, TornAPIError
+)
 
-APP_NAME = "7DS Hiring Scan"
-DB_PATH = os.getenv("DB_PATH", "hiring.db")
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
-
+load_dotenv()
 app = Flask(__name__)
 
-# ---------------- DB ----------------
-def _con():
-    return sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
+COMPANY_IDS = [c.strip() for c in (os.getenv("COMPANY_IDS") or "").split(",") if c.strip()]
 
-def init_db():
-    con = _con()
-    cur = con.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS candidates (
-      torn_id INTEGER PRIMARY KEY,
-      name TEXT,
-      man INTEGER NOT NULL DEFAULT 0,
-      intel INTEGER NOT NULL DEFAULT 0,
-      endu INTEGER NOT NULL DEFAULT 0,
-      total INTEGER NOT NULL DEFAULT 0,
-      job_type TEXT NOT NULL DEFAULT 'unknown',   -- none|company|city|unknown
-      job_name TEXT,
-      verified INTEGER NOT NULL DEFAULT 0,        -- 0/1
-      note TEXT,
-      updated_at TEXT
-    )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_total ON candidates(total)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_man ON candidates(man)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_intel ON candidates(intel)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_endu ON candidates(endu)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidates_job_type ON candidates(job_type)")
-    con.commit()
-    con.close()
+def require_admin():
+    if not ADMIN_TOKEN:
+        return None
+    got = (request.headers.get("X-Admin-Token") or request.args.get("admin") or "").strip()
+    if got != ADMIN_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
 
-def upsert_candidate(payload: dict, verified: int = 0):
-    now = datetime.now(timezone.utc).isoformat()
-    torn_id = int(payload["torn_id"])
-    name = (payload.get("name") or "").strip()
-
-    man = int(payload.get("man") or 0)
-    intel = int(payload.get("intel") or 0)
-    endu = int(payload.get("endu") or 0)
-    total = int(payload.get("total") or (man + intel + endu))
-
-    job_type = (payload.get("job_type") or "unknown").strip().lower()
-    if job_type not in ("none", "company", "city", "unknown"):
-        job_type = "unknown"
-    job_name = (payload.get("job_name") or "").strip() or None
-    note = (payload.get("note") or "").strip() or None
-
-    con = _con()
-    cur = con.cursor()
-    cur.execute("""
-    INSERT INTO candidates (torn_id, name, man, intel, endu, total, job_type, job_name, verified, note, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(torn_id) DO UPDATE SET
-      name=excluded.name,
-      man=excluded.man,
-      intel=excluded.intel,
-      endu=excluded.endu,
-      total=excluded.total,
-      job_type=excluded.job_type,
-      job_name=excluded.job_name,
-      verified=excluded.verified,
-      note=excluded.note,
-      updated_at=excluded.updated_at
-    """, (torn_id, name, man, intel, endu, total, job_type, job_name, int(verified), note, now))
-    con.commit()
-    con.close()
-
-def query_candidates(filters: dict):
-    min_man = int(filters.get("min_man") or 0)
-    max_man = int(filters.get("max_man") or 2_000_000_000)
-    min_int = int(filters.get("min_int") or 0)
-    max_int = int(filters.get("max_int") or 2_000_000_000)
-    min_end = int(filters.get("min_end") or 0)
-    max_end = int(filters.get("max_end") or 2_000_000_000)
-    min_total = int(filters.get("min_total") or 0)
-    max_total = int(filters.get("max_total") or 2_000_000_000)
-
-    job_type = (filters.get("job_type") or "any").strip().lower()
-    if job_type not in ("any", "none", "company", "city"):
-        job_type = "any"
-
-    sort = (filters.get("sort") or "total").strip().lower()
-    if sort not in ("man", "intel", "endu", "total", "updated"):
-        sort = "total"
-    order_col = {"man": "man", "intel": "intel", "endu": "endu", "total": "total", "updated": "updated_at"}[sort]
-
-    sql = """
-      SELECT torn_id, name, man, intel, endu, total, job_type, job_name, verified, note, updated_at
-      FROM candidates
-      WHERE man BETWEEN ? AND ?
-        AND intel BETWEEN ? AND ?
-        AND endu BETWEEN ? AND ?
-        AND total BETWEEN ? AND ?
-    """
-    params = [min_man, max_man, min_int, max_int, min_end, max_end, min_total, max_total]
-
-    if job_type != "any":
-        sql += " AND job_type = ?"
-        params.append(job_type)
-
-    sql += f" ORDER BY {order_col} DESC, updated_at DESC LIMIT 250"
-
-    con = _con()
-    cur = con.cursor()
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    con.close()
-
-    out = []
-    for r in rows:
-        out.append({
-            "id": r[0],
-            "name": r[1],
-            "man": r[2],
-            "intel": r[3],
-            "endu": r[4],
-            "total": r[5],
-            "job_type": r[6],
-            "job_name": r[7],
-            "verified": bool(r[8]),
-            "note": r[9],
-            "updated_at": r[10],
-        })
-    return out
-
-# ---------------- Torn verify (player key) ----------------
-async def torn_user(key: str):
-    url = f"https://api.torn.com/user/?selections=basic,job,workstats&key={key}"
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.get(url) as r:
-            return await r.json()
-
-def parse_job_type(job_obj):
-    # Torn job object varies by situation; we handle common patterns
-    # If can't determine, return unknown.
-    if not isinstance(job_obj, dict):
-        return ("unknown", None)
-
-    # City job often has "job" / "position" but no company_id
-    # Company job often has company-related fields
-    # Unemployed sometimes has empty dict
-    company_id = job_obj.get("company_id") or job_obj.get("company", {}).get("id")
-    company_name = job_obj.get("company_name") or job_obj.get("company", {}).get("name")
-
-    # Some payloads include city job name in "job" or "name"
-    city_job_name = job_obj.get("job") or job_obj.get("name") or job_obj.get("position")
-
-    if company_id or company_name:
-        return ("company", company_name)
-
-    # If it has something that looks like a city job name/position, treat as city
-    if city_job_name:
-        return ("city", str(city_job_name))
-
-    # If it's an empty object => none
-    if len(job_obj.keys()) == 0:
-        return ("none", None)
-
-    return ("unknown", None)
-
-# ---------------- UI (simple iframe-safe page) ----------------
-def html_page():
-    return f"""<!doctype html><html><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{APP_NAME}</title>
-<style>
-body {{ margin:0; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; background:#0b0f14; color:#e9eef5; }}
-.wrap {{ padding:12px; }}
-.card {{ border:1px solid rgba(255,255,255,0.10); background:linear-gradient(180deg, rgba(25,35,50,0.9), rgba(12,16,24,0.9));
-border-radius:14px; padding:12px; box-shadow:0 10px 25px rgba(0,0,0,0.35); }}
-h1 {{ font-size:16px; margin:0 0 8px; display:flex; align-items:center; gap:8px; }}
-.badge {{ width:28px; height:28px; border-radius:10px; display:inline-flex; align-items:center; justify-content:center;
-background:radial-gradient(circle at 30% 30%, rgba(255,215,0,0.35), rgba(255,215,0,0.10));
-border:1px solid rgba(255,215,0,0.35); }}
-.hint {{ font-size:12px; opacity:0.8; line-height:1.35; }}
-code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }}
-</style></head><body>
-<div class="wrap"><div class="card">
-<h1><span class="badge">💼</span> {APP_NAME}</h1>
-<div class="hint">Opt-in hiring list + recruiter search. Use /api/submit (manual) or /api/submit_key (verified via player's key).</div>
-<div class="hint" style="margin-top:8px;"><b>Recruiter search:</b> <code>/api/search?token=ADMIN_TOKEN&job_type=none&min_total=100000&sort=total</code></div>
-</div></div></body></html>"""
-
-# ---------------- Routes ----------------
-@app.after_request
-def add_headers(resp):
-    resp.headers["X-Frame-Options"] = "ALLOWALL"
-    resp.headers["Content-Security-Policy"] = "frame-ancestors *"
-    return resp
-
-@app.route("/")
-def index():
-    return Response(html_page(), mimetype="text/html")
-
-@app.route("/health")
+@app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": APP_NAME, "ts": int(time.time())})
+    return {"ok": True}
 
-@app.route("/api/submit", methods=["POST"])
-def api_submit():
-    data = request.get_json(silent=True) or {}
-    if not str(data.get("torn_id") or "").isdigit():
-        return jsonify({"ok": False, "error": "torn_id required"}), 400
-    upsert_candidate(data, verified=0)
-    return jsonify({"ok": True, "verified": False})
+@app.get("/")
+def home():
+    # Simple single-page panel (no templates needed)
+    return Response(f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>7DS Hiring Scan</title>
+  <style>
+    body {{ font-family: system-ui, Arial; background:#0b0f14; color:#e8eef7; margin:0; }}
+    .wrap {{ max-width: 1100px; margin: 18px auto; padding: 0 14px; }}
+    .card {{ background:#101826; border:1px solid rgba(255,255,255,.08); border-radius: 14px; padding: 14px; margin-bottom: 14px; }}
+    h2 {{ margin: 0 0 10px 0; font-size: 16px; }}
+    input, select, button {{ border-radius: 10px; border:1px solid rgba(255,255,255,.14); background:#0c1320; color:#e8eef7; padding:10px; }}
+    button {{ cursor:pointer; }}
+    .row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+    .row > * {{ flex: 1 1 220px; }}
+    table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ padding:8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }}
+    .muted {{ opacity:.75; font-size: 12px; }}
+    .pill {{ display:inline-block; padding:3px 8px; border-radius:999px; background:rgba(255,255,255,.08); }}
+    .bad {{ background: rgba(255,60,60,.18); }}
+    .good {{ background: rgba(50,255,140,.14); }}
+    .warn {{ background: rgba(255,200,70,.14); }}
+  </style>
+</head>
+<body>
+<div class="wrap">
 
-@app.route("/api/submit_key", methods=["POST"])
-def api_submit_key():
-    data = request.get_json(silent=True) or {}
-    key = (data.get("key") or "").strip()
-    note = (data.get("note") or "").strip()
+  <div class="card">
+    <h2>Applicant scan (MAN / INT / END)</h2>
+    <div class="row">
+      <input id="applicantId" placeholder="Applicant Torn ID (e.g. 123456)"/>
+      <input id="applicantKey" placeholder="Applicant opt-in API key (optional)"/>
+      <button onclick="scanApplicant()">Scan Applicant</button>
+    </div>
+    <div class="muted" style="margin-top:8px">
+      If the applicant key is blank, you can still compare by manually typing stats below.
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="mMan" placeholder="Manual (optional manual entry)"/>
+      <input id="mInt" placeholder="Intelligence (optional manual entry)"/>
+      <input id="mEnd" placeholder="Endurance (optional manual entry)"/>
+      <button onclick="useManual()">Use Manual Stats</button>
+    </div>
+    <div id="applicantOut" style="margin-top:12px"></div>
+  </div>
 
-    if not key:
-        return jsonify({"ok": False, "error": "key required"}), 400
+  <div class="card">
+    <h2>Your companies → employees + compare</h2>
+    <div class="row">
+      <select id="companySel"></select>
+      <button onclick="loadCompany()">Load Company</button>
+    </div>
+    <div id="companyOut" style="margin-top:12px"></div>
+  </div>
+
+</div>
+
+<script>
+  let applicantStats = null;
+  let companies = [];
+
+  async function api(path) {{
+    const admin = localStorage.getItem("ADMIN_TOKEN") || "";
+    const url = path + (path.includes("?") ? "&" : "?") + "admin=" + encodeURIComponent(admin);
+    const res = await fetch(url);
+    return await res.json();
+  }}
+
+  async function init() {{
+    const list = await api("/api/companies");
+    companies = list.companies || [];
+    const sel = document.getElementById("companySel");
+    sel.innerHTML = companies.map(c => `<option value="${{c.id}}">${{c.name}} (#${{c.id}})</option>`).join("");
+  }}
+
+  function pillClass(delta) {{
+    if (delta === null) return "pill";
+    if (delta >= 0) return "pill good";
+    if (delta > -5000) return "pill warn";
+    return "pill bad";
+  }}
+
+  function renderApplicant() {{
+    const out = document.getElementById("applicantOut");
+    if (!applicantStats) {{
+      out.innerHTML = `<div class="muted">No applicant loaded yet.</div>`;
+      return;
+    }}
+    out.innerHTML = `
+      <div class="row">
+        <div><span class="pill">MAN: ${applicantStats.man ?? "?"}</span></div>
+        <div><span class="pill">INT: ${applicantStats.int ?? "?"}</span></div>
+        <div><span class="pill">END: ${applicantStats.end ?? "?"}</span></div>
+        <div><span class="pill">TOTAL: ${applicantStats.total ?? "?"}</span></div>
+      </div>
+    `;
+  }}
+
+  async function scanApplicant() {{
+    const id = document.getElementById("applicantId").value.trim();
+    const key = document.getElementById("applicantKey").value.trim();
+    if (!id) return;
+    const data = await api(`/api/applicant?id=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}`);
+    if (!data.ok) {{
+      applicantStats = null;
+      document.getElementById("applicantOut").innerHTML = `<div class="pill bad">Error: ${data.error}</div>`;
+      return;
+    }}
+    applicantStats = data.workstats;
+    renderApplicant();
+  }}
+
+  function useManual() {{
+    const man = parseInt(document.getElementById("mMan").value || "");
+    const inte = parseInt(document.getElementById("mInt").value || "");
+    const end = parseInt(document.getElementById("mEnd").value || "");
+    const ws = {{
+      man: Number.isFinite(man) ? man : null,
+      int: Number.isFinite(inte) ? inte : null,
+      end: Number.isFinite(end) ? end : null,
+      total: (Number.isFinite(man) && Number.isFinite(inte) && Number.isFinite(end)) ? (man+inte+end) : null
+    }};
+    applicantStats = ws;
+    renderApplicant();
+  }}
+
+  async function loadCompany() {{
+    const cid = document.getElementById("companySel").value;
+    const data = await api(`/api/company?id=${encodeURIComponent(cid)}`);
+    const out = document.getElementById("companyOut");
+    if (!data.ok) {{
+      out.innerHTML = `<div class="pill bad">Error: ${data.error}</div>`;
+      return;
+    }}
+
+    const rows = data.employees || [];
+    const app = applicantStats;
+
+    const header = `<div class="muted">Company: <b>${data.company.name}</b> (#${data.company.id})</div>`;
+    let table = `
+      <table>
+        <thead>
+          <tr>
+            <th>Employee</th>
+            <th>Position</th>
+            <th>MAN</th>
+            <th>INT</th>
+            <th>END</th>
+            <th>TOTAL</th>
+            <th>Δ TOTAL vs Applicant</th>
+          </tr>
+        </thead>
+        <tbody>
+    `;
+
+    for (const e of rows) {{
+      const dTotal = (app && app.total != null && e.workstats.total != null) ? (e.workstats.total - app.total) : null;
+      table += `
+        <tr>
+          <td>${e.name} <span class="muted">(#${e.id})</span></td>
+          <td>${e.position || "-"}</td>
+          <td>${e.workstats.man ?? "?"}</td>
+          <td>${e.workstats.int ?? "?"}</td>
+          <td>${e.workstats.end ?? "?"}</td>
+          <td>${e.workstats.total ?? "?"}</td>
+          <td><span class="${pillClass(dTotal)}">${dTotal === null ? "—" : (dTotal>=0? "+"+dTotal : dTotal)}</span></td>
+        </tr>
+      `;
+    }}
+
+    table += `</tbody></table>`;
+
+    const note = app ? "" : `<div class="muted" style="margin-top:8px">Load an applicant (or manual stats) to see the comparison column.</div>`;
+    out.innerHTML = header + table + note;
+  }}
+
+  // First run: ask for admin token if your server is locked
+  (function boot() {{
+    const needsToken = {("true" if ADMIN_TOKEN else "false")};
+    if (needsToken) {{
+      const existing = localStorage.getItem("ADMIN_TOKEN");
+      if (!existing) {{
+        const t = prompt("Enter ADMIN_TOKEN (only you) to use this panel:");
+        if (t) localStorage.setItem("ADMIN_TOKEN", t.trim());
+      }}
+    }}
+    init();
+  }})();
+</script>
+
+</body>
+</html>
+""", mimetype="text/html")
+
+@app.get("/api/companies")
+def api_companies():
+    guard = require_admin()
+    if guard: return guard
+
+    # If COMPANY_IDS provided, use that. Otherwise attempt a minimal list from your key (best-effort).
+    comps = []
+    for cid in COMPANY_IDS:
+        try:
+            data = get_company(cid, TORN_API_KEY)
+            prof = data.get("company") or data.get("profile") or {}
+            name = prof.get("name") or data.get("name") or f"Company {cid}"
+            comps.append({"id": cid, "name": name})
+        except Exception:
+            comps.append({"id": cid, "name": f"Company {cid}"})
+    return {"ok": True, "companies": comps}
+
+@app.get("/api/company")
+def api_company():
+    guard = require_admin()
+    if guard: return guard
+    if not TORN_API_KEY:
+        return {"ok": False, "error": "Server missing TORN_API_KEY"}, 500
+
+    cid = (request.args.get("id") or "").strip()
+    if not cid:
+        return {"ok": False, "error": "Missing company id"}, 400
 
     try:
-        raw = asyncio.run(torn_user(key))
-    except Exception:
-        return jsonify({"ok": False, "error": "torn api request failed"}), 502
+        data = get_company(cid, TORN_API_KEY)
+        # Try to extract company profile/name
+        prof = data.get("company") or data.get("profile") or {}
+        cname = prof.get("name") or data.get("name") or f"Company {cid}"
 
-    if not isinstance(raw, dict) or raw.get("error"):
-        return jsonify({"ok": False, "error": "invalid key or api error", "details": raw.get("error")}), 400
+        # Employees shape varies; normalize to list
+        employees_obj = data.get("employees") or data.get("company_employees") or {}
+        employees = []
+        if isinstance(employees_obj, dict):
+            for emp_id, emp in employees_obj.items():
+                # Emp may contain name/position/workstats or similar
+                name = emp.get("name") if isinstance(emp, dict) else str(emp)
+                position = emp.get("position") if isinstance(emp, dict) else None
 
-    torn_id = raw.get("player_id") or raw.get("user_id") or raw.get("ID") or raw.get("id")
-    name = raw.get("name") or ""
-    work = raw.get("workstats") or {}
-    job = raw.get("job") or {}
+                # Some company responses include work stats; if not, we can’t magically get them.
+                # We’ll try common fields; otherwise return unknown.
+                ws_guess = {
+                    "manual_labor": (emp.get("manual_labor") if isinstance(emp, dict) else None),
+                    "intelligence": (emp.get("intelligence") if isinstance(emp, dict) else None),
+                    "endurance": (emp.get("endurance") if isinstance(emp, dict) else None),
+                }
+                # If the company endpoint doesn’t provide ws fields, leave as nulls.
+                man = ws_guess["manual_labor"]
+                inte = ws_guess["intelligence"]
+                end = ws_guess["endurance"]
+                total = None
+                try:
+                    if man is not None and inte is not None and end is not None:
+                        total = int(man) + int(inte) + int(end)
+                except Exception:
+                    total = None
 
-    if not torn_id:
-        return jsonify({"ok": False, "error": "could not read torn_id from api"}), 400
+                employees.append({
+                    "id": str(emp_id),
+                    "name": name or f"#{emp_id}",
+                    "position": position,
+                    "workstats": {
+                        "man": int(man) if man is not None else None,
+                        "int": int(inte) if inte is not None else None,
+                        "end": int(end) if end is not None else None,
+                        "total": total
+                    }
+                })
 
-    man = int(work.get("manual_labor") or 0)
-    intel = int(work.get("intelligence") or 0)
-    endu = int(work.get("endurance") or 0)
-    total = man + intel + endu
+        return {
+            "ok": True,
+            "company": {"id": cid, "name": cname},
+            "employees": employees
+        }
+    except TornAPIError as e:
+        return {"ok": False, "error": f"Torn API error: {e}"}, 400
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 
-    job_type, job_name = parse_job_type(job)
+@app.get("/api/applicant")
+def api_applicant():
+    guard = require_admin()
+    if guard: return guard
 
-    upsert_candidate({
-        "torn_id": int(torn_id),
-        "name": name,
-        "man": man,
-        "intel": intel,
-        "endu": endu,
-        "total": total,
-        "job_type": job_type,
-        "job_name": job_name or "",
-        "note": note
-    }, verified=1)
+    uid = (request.args.get("id") or "").strip()
+    key = (request.args.get("key") or "").strip()
 
-    return jsonify({"ok": True, "verified": True, "torn_id": int(torn_id), "name": name, "job_type": job_type, "total": total})
+    if not uid:
+        return {"ok": False, "error": "Missing applicant id"}, 400
+    if not key:
+        return {"ok": False, "error": "No applicant key provided. Use manual entry instead."}, 400
 
-@app.route("/api/search", methods=["GET"])
-def api_search():
-    token = (request.args.get("token") or "").strip()
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    filters = {
-        "min_man": request.args.get("min_man"),
-        "max_man": request.args.get("max_man"),
-        "min_int": request.args.get("min_int"),
-        "max_int": request.args.get("max_int"),
-        "min_end": request.args.get("min_end"),
-        "max_end": request.args.get("max_end"),
-        "min_total": request.args.get("min_total"),
-        "max_total": request.args.get("max_total"),
-        "job_type": request.args.get("job_type"),
-        "sort": request.args.get("sort"),
-    }
-    rows = query_candidates(filters)
-    return jsonify({"ok": True, "count": len(rows), "rows": rows})
-
-if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    try:
+        data = get_user_workstats(uid, key)
+        ws = normalize_workstats(data)
+        return {"ok": True, "workstats": ws}
+    except TornAPIError as e:
+        return {"ok": False, "error": f"Torn API error: {e}"}, 400
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
