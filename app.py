@@ -1,17 +1,81 @@
 import os
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request, Response
+import re
+import time
+import threading
+import sqlite3
+from datetime import datetime, timezone
 
-from torn_api import (
-    get_company, get_user_workstats, normalize_workstats, TornAPIError
-)
+import requests
+from flask import Flask, jsonify, request, Response
+from dotenv import load_dotenv
+
+from torn_api import get_company, get_user_workstats, normalize_workstats, TornAPIError
 
 load_dotenv()
 app = Flask(__name__)
 
-TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()
+TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()  # must include access to user events on your account
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
 COMPANY_IDS = [c.strip() for c in (os.getenv("COMPANY_IDS") or "").split(",") if c.strip()]
+
+DB_PATH = (os.getenv("DB_PATH") or "hiring.db").strip()
+POLL_SECONDS = int(os.getenv("POLL_SECONDS") or "45")
+
+API_BASE = "https://api.torn.com"
+
+_boot_lock = threading.Lock()
+_booted = False
+
+def utcnow_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS settings (
+        k TEXT PRIMARY KEY,
+        v TEXT
+      )
+    """)
+
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS applications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER UNIQUE,
+        company_id TEXT,
+        company_name TEXT,
+        applicant_id TEXT,
+        applicant_name TEXT,
+        raw_text TEXT,
+        status TEXT NOT NULL DEFAULT 'new',  -- new / reviewed / shortlist / declined
+        created_at TEXT NOT NULL
+      )
+    """)
+
+    con.commit()
+    con.close()
+
+def get_setting(key: str, default: str = "") -> str:
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT v FROM settings WHERE k=?", (key,))
+    row = cur.fetchone()
+    con.close()
+    return (row["v"] if row else default) or default
+
+def set_setting(key: str, value: str) -> None:
+    con = db()
+    cur = con.cursor()
+    cur.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+    con.commit()
+    con.close()
 
 def require_admin():
     if not ADMIN_TOKEN:
@@ -21,223 +85,186 @@ def require_admin():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return None
 
+init_db()
+
+# ---------------------------
+# Torn events polling
+# ---------------------------
+
+# Best-effort patterns for application events (Torn wording varies)
+APPLY_HINTS = [
+    "applied", "application", "job", "position", "company"
+]
+
+# Try to pull IDs like [123456] or (123456) or ID: 123456
+ID_PATTERNS = [
+    re.compile(r"\[(\d{3,10})\]"),
+    re.compile(r"\((\d{3,10})\)"),
+    re.compile(r"\bID[:\s]+(\d{3,10})\b", re.IGNORECASE),
+]
+
+# Try to pull a company id if it appears
+COMPANY_ID_PATTERNS = [
+    re.compile(r"\bcompany\s*#\s*(\d{1,10})\b", re.IGNORECASE),
+    re.compile(r"\bCompany\s*\((\d{1,10})\)", re.IGNORECASE),
+]
+
+def torn_get_events() -> dict:
+    # /user/?selections=events&key=...
+    url = f"{API_BASE}/user/"
+    r = requests.get(url, params={"selections": "events", "key": TORN_API_KEY}, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(str(data["error"]))
+    return data.get("events") or {}
+
+def looks_like_application(text: str) -> bool:
+    t = (text or "").lower()
+    # quick filter first
+    if not any(h in t for h in APPLY_HINTS):
+        return False
+    # require at least "appl" + ("company" or "job" or "position")
+    if ("appl" in t) and (("company" in t) or ("job" in t) or ("position" in t)):
+        return True
+    # fallback: "applied for" often appears
+    if "applied for" in t:
+        return True
+    return False
+
+def extract_first_id(text: str) -> str | None:
+    for pat in ID_PATTERNS:
+        m = pat.search(text or "")
+        if m:
+            return m.group(1)
+    return None
+
+def extract_company_id(text: str) -> str | None:
+    for pat in COMPANY_ID_PATTERNS:
+        m = pat.search(text or "")
+        if m:
+            return m.group(1)
+    return None
+
+def insert_application(event_id: int, company_id: str | None, applicant_id: str | None, raw_text: str):
+    # Try to fill company_name from known COMPANY_IDS list (best-effort, can be blank)
+    company_name = None
+    if company_id and company_id in COMPANY_IDS:
+        try:
+            data = get_company(company_id, TORN_API_KEY)
+            prof = data.get("company") or data.get("profile") or {}
+            company_name = prof.get("name") or data.get("name")
+        except Exception:
+            company_name = None
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+      INSERT OR IGNORE INTO applications(event_id, company_id, company_name, applicant_id, applicant_name, raw_text, status, created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    """, (
+        int(event_id),
+        company_id,
+        company_name,
+        applicant_id,
+        None,
+        raw_text,
+        "new",
+        utcnow_iso()
+    ))
+    con.commit()
+    con.close()
+
+def poll_loop():
+    while True:
+        try:
+            if not TORN_API_KEY:
+                time.sleep(10)
+                continue
+
+            last_seen = int(get_setting("last_event_id", "0") or "0")
+            events = torn_get_events()  # dict keyed by id, newest-ish
+            # event ids are keys, can be strings
+            ids = []
+            for k in events.keys():
+                try:
+                    ids.append(int(k))
+                except Exception:
+                    pass
+            ids.sort()  # ascending
+
+            new_ids = [eid for eid in ids if eid > last_seen]
+            for eid in new_ids:
+                ev = events.get(str(eid)) or {}
+                text = (ev.get("event") or ev.get("message") or ev.get("text") or "")
+                if not text:
+                    continue
+                if not looks_like_application(text):
+                    continue
+
+                applicant_id = extract_first_id(text)
+                company_id = extract_company_id(text)
+
+                insert_application(eid, company_id, applicant_id, text)
+
+                # Move last_seen forward as we process
+                set_setting("last_event_id", str(eid))
+
+            # If there were no new ids, still keep last_seen stable
+            if ids:
+                # Don’t jump last_seen forward unless we actually processed new ids
+                if not new_ids and last_seen == 0:
+                    # first boot: set baseline so we don't import years of events
+                    set_setting("last_event_id", str(max(ids)))
+
+        except Exception:
+            # Don’t crash the thread; just wait and retry
+            pass
+
+        time.sleep(POLL_SECONDS)
+
+def boot_once():
+    global _booted
+    if _booted:
+        return
+    with _boot_lock:
+        if _booted:
+            return
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        _booted = True
+
+@app.before_request
+def _boot():
+    boot_once()
+
+# ---------------------------
+# API endpoints used by overlay
+# ---------------------------
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "poll_seconds": POLL_SECONDS}
 
 @app.get("/")
 def home():
-    # Simple single-page panel (no templates needed)
-    return Response("""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>7DS Hiring Scan</title>
-  <style>
-    body {{ font-family: system-ui, Arial; background:#0b0f14; color:#e8eef7; margin:0; }}
-    .wrap {{ max-width: 1100px; margin: 18px auto; padding: 0 14px; }}
-    .card {{ background:#101826; border:1px solid rgba(255,255,255,.08); border-radius: 14px; padding: 14px; margin-bottom: 14px; }}
-    h2 {{ margin: 0 0 10px 0; font-size: 16px; }}
-    input, select, button {{ border-radius: 10px; border:1px solid rgba(255,255,255,.14); background:#0c1320; color:#e8eef7; padding:10px; }}
-    button {{ cursor:pointer; }}
-    .row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
-    .row > * {{ flex: 1 1 220px; }}
-    table {{ width:100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ padding:8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }}
-    .muted {{ opacity:.75; font-size: 12px; }}
-    .pill {{ display:inline-block; padding:3px 8px; border-radius:999px; background:rgba(255,255,255,.08); }}
-    .bad {{ background: rgba(255,60,60,.18); }}
-    .good {{ background: rgba(50,255,140,.14); }}
-    .warn {{ background: rgba(255,200,70,.14); }}
-  </style>
-</head>
-<body>
-<div class="wrap">
-
-  <div class="card">
-    <h2>Applicant scan (MAN / INT / END)</h2>
-    <div class="row">
-      <input id="applicantId" placeholder="Applicant Torn ID (e.g. 123456)"/>
-      <input id="applicantKey" placeholder="Applicant opt-in API key (optional)"/>
-      <button onclick="scanApplicant()">Scan Applicant</button>
-    </div>
-    <div class="muted" style="margin-top:8px">
-      If the applicant key is blank, you can still compare by manually typing stats below.
-    </div>
-    <div class="row" style="margin-top:10px">
-      <input id="mMan" placeholder="Manual (optional manual entry)"/>
-      <input id="mInt" placeholder="Intelligence (optional manual entry)"/>
-      <input id="mEnd" placeholder="Endurance (optional manual entry)"/>
-      <button onclick="useManual()">Use Manual Stats</button>
-    </div>
-    <div id="applicantOut" style="margin-top:12px"></div>
-  </div>
-
-  <div class="card">
-    <h2>Your companies → employees + compare</h2>
-    <div class="row">
-      <select id="companySel"></select>
-      <button onclick="loadCompany()">Load Company</button>
-    </div>
-    <div id="companyOut" style="margin-top:12px"></div>
-  </div>
-
-</div>
-
-<script>
-  let applicantStats = null;
-  let companies = [];
-
-  async function api(path) {{
-    const admin = localStorage.getItem("ADMIN_TOKEN") || "";
-    const url = path + (path.includes("?") ? "&" : "?") + "admin=" + encodeURIComponent(admin);
-    const res = await fetch(url);
-    return await res.json();
-  }}
-
-  async function init() {{
-    const list = await api("/api/companies");
-    companies = list.companies || [];
-    const sel = document.getElementById("companySel");
-    sel.innerHTML = companies.map(c => `<option value="${{c.id}}">${{c.name}} (#${{c.id}})</option>`).join("");
-  }}
-
-  function pillClass(delta) {{
-    if (delta === null) return "pill";
-    if (delta >= 0) return "pill good";
-    if (delta > -5000) return "pill warn";
-    return "pill bad";
-  }}
-
-  function renderApplicant() {{
-    const out = document.getElementById("applicantOut");
-    if (!applicantStats) {{
-      out.innerHTML = `<div class="muted">No applicant loaded yet.</div>`;
-      return;
-    }}
-    out.innerHTML = `
-      <div class="row">
-        <div><span class="pill">MAN: ${applicantStats.man ?? "?"}</span></div>
-        <div><span class="pill">INT: ${applicantStats.int ?? "?"}</span></div>
-        <div><span class="pill">END: ${applicantStats.end ?? "?"}</span></div>
-        <div><span class="pill">TOTAL: ${applicantStats.total ?? "?"}</span></div>
-      </div>
-    `;
-  }}
-
-  async function scanApplicant() {{
-    const id = document.getElementById("applicantId").value.trim();
-    const key = document.getElementById("applicantKey").value.trim();
-    if (!id) return;
-    const data = await api(`/api/applicant?id=${encodeURIComponent(id)}&key=${encodeURIComponent(key)}`);
-    if (!data.ok) {{
-      applicantStats = null;
-      document.getElementById("applicantOut").innerHTML = `<div class="pill bad">Error: ${data.error}</div>`;
-      return;
-    }}
-    applicantStats = data.workstats;
-    renderApplicant();
-  }}
-
-  function useManual() {{
-    const man = parseInt(document.getElementById("mMan").value || "");
-    const inte = parseInt(document.getElementById("mInt").value || "");
-    const end = parseInt(document.getElementById("mEnd").value || "");
-    const ws = {{
-      man: Number.isFinite(man) ? man : null,
-      int: Number.isFinite(inte) ? inte : null,
-      end: Number.isFinite(end) ? end : null,
-      total: (Number.isFinite(man) && Number.isFinite(inte) && Number.isFinite(end)) ? (man+inte+end) : null
-    }};
-    applicantStats = ws;
-    renderApplicant();
-  }}
-
-  async function loadCompany() {{
-    const cid = document.getElementById("companySel").value;
-    const data = await api(`/api/company?id=${encodeURIComponent(cid)}`);
-    const out = document.getElementById("companyOut");
-    if (!data.ok) {{
-      out.innerHTML = `<div class="pill bad">Error: ${data.error}</div>`;
-      return;
-    }}
-
-    const rows = data.employees || [];
-    const app = applicantStats;
-
-    const header = `<div class="muted">Company: <b>${data.company.name}</b> (#${data.company.id})</div>`;
-    let table = `
-      <table>
-        <thead>
-          <tr>
-            <th>Employee</th>
-            <th>Position</th>
-            <th>MAN</th>
-            <th>INT</th>
-            <th>END</th>
-            <th>TOTAL</th>
-            <th>Δ TOTAL vs Applicant</th>
-          </tr>
-        </thead>
-        <tbody>
-    `;
-
-    for (const e of rows) {{
-      const dTotal = (app && app.total != null && e.workstats.total != null) ? (e.workstats.total - app.total) : null;
-      table += `
-        <tr>
-          <td>${e.name} <span class="muted">(#${e.id})</span></td>
-          <td>${e.position || "-"}</td>
-          <td>${e.workstats.man ?? "?"}</td>
-          <td>${e.workstats.int ?? "?"}</td>
-          <td>${e.workstats.end ?? "?"}</td>
-          <td>${e.workstats.total ?? "?"}</td>
-          <td><span class="${pillClass(dTotal)}">${dTotal === null ? "—" : (dTotal>=0? "+"+dTotal : dTotal)}</span></td>
-        </tr>
-      `;
-    }}
-
-    table += `</tbody></table>`;
-
-    const note = app ? "" : `<div class="muted" style="margin-top:8px">Load an applicant (or manual stats) to see the comparison column.</div>`;
-    out.innerHTML = header + table + note;
-  }}
-
-  // First run: ask for admin token if your server is locked
-  (function boot() {{
-    const needsToken = {("true" if ADMIN_TOKEN else "false")};
-    if (needsToken) {{
-      const existing = localStorage.getItem("ADMIN_TOKEN");
-      if (!existing) {{
-        const t = prompt("Enter ADMIN_TOKEN (only you) to use this panel:");
-        if (t) localStorage.setItem("ADMIN_TOKEN", t.trim());
-      }}
-    }}
-    init();
-  }})();
-</script>
-
-</body>
-</html>
-""", mimetype="text/html")
+    return Response("Hiring Scan API running (overlay-only hub).", mimetype="text/plain")
 
 @app.get("/api/companies")
 def api_companies():
     guard = require_admin()
     if guard: return guard
 
-    # If COMPANY_IDS provided, use that. Otherwise attempt a minimal list from your key (best-effort).
     comps = []
     for cid in COMPANY_IDS:
+        name = f"Company {cid}"
         try:
             data = get_company(cid, TORN_API_KEY)
             prof = data.get("company") or data.get("profile") or {}
-            name = prof.get("name") or data.get("name") or f"Company {cid}"
-            comps.append({"id": cid, "name": name})
+            name = prof.get("name") or data.get("name") or name
         except Exception:
-            comps.append({"id": cid, "name": f"Company {cid}"})
+            pass
+        comps.append({"id": cid, "name": name})
     return {"ok": True, "companies": comps}
 
 @app.get("/api/company")
@@ -253,34 +280,24 @@ def api_company():
 
     try:
         data = get_company(cid, TORN_API_KEY)
-        # Try to extract company profile/name
         prof = data.get("company") or data.get("profile") or {}
         cname = prof.get("name") or data.get("name") or f"Company {cid}"
 
-        # Employees shape varies; normalize to list
         employees_obj = data.get("employees") or data.get("company_employees") or {}
         employees = []
         if isinstance(employees_obj, dict):
             for emp_id, emp in employees_obj.items():
-                # Emp may contain name/position/workstats or similar
                 name = emp.get("name") if isinstance(emp, dict) else str(emp)
                 position = emp.get("position") if isinstance(emp, dict) else None
 
-                # Some company responses include work stats; if not, we can’t magically get them.
-                # We’ll try common fields; otherwise return unknown.
-                ws_guess = {
-                    "manual_labor": (emp.get("manual_labor") if isinstance(emp, dict) else None),
-                    "intelligence": (emp.get("intelligence") if isinstance(emp, dict) else None),
-                    "endurance": (emp.get("endurance") if isinstance(emp, dict) else None),
-                }
-                # If the company endpoint doesn’t provide ws fields, leave as nulls.
-                man = ws_guess["manual_labor"]
-                inte = ws_guess["intelligence"]
-                end = ws_guess["endurance"]
+                man = emp.get("manual_labor") if isinstance(emp, dict) else None
+                inte = emp.get("intelligence") if isinstance(emp, dict) else None
+                endu = emp.get("endurance") if isinstance(emp, dict) else None
+
                 total = None
                 try:
-                    if man is not None and inte is not None and end is not None:
-                        total = int(man) + int(inte) + int(end)
+                    if man is not None and inte is not None and endu is not None:
+                        total = int(man) + int(inte) + int(endu)
                 except Exception:
                     total = None
 
@@ -291,16 +308,12 @@ def api_company():
                     "workstats": {
                         "man": int(man) if man is not None else None,
                         "int": int(inte) if inte is not None else None,
-                        "end": int(end) if end is not None else None,
+                        "end": int(endu) if endu is not None else None,
                         "total": total
                     }
                 })
 
-        return {
-            "ok": True,
-            "company": {"id": cid, "name": cname},
-            "employees": employees
-        }
+        return {"ok": True, "company": {"id": cid, "name": cname}, "employees": employees}
     except TornAPIError as e:
         return {"ok": False, "error": f"Torn API error: {e}"}, 400
     except Exception as e:
@@ -327,3 +340,52 @@ def api_applicant():
         return {"ok": False, "error": f"Torn API error: {e}"}, 400
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
+
+# ---- NEW: applications feed for overlay ----
+
+@app.get("/api/applications")
+def api_applications():
+    guard = require_admin()
+    if guard: return guard
+
+    limit = request.args.get("limit", "25")
+    try:
+        limit = max(1, min(100, int(limit)))
+    except Exception:
+        limit = 25
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+      SELECT id, event_id, company_id, company_name, applicant_id, applicant_name, raw_text, status, created_at
+      FROM applications
+      ORDER BY id DESC
+      LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    return {"ok": True, "rows": rows}
+
+@app.post("/api/applications/status")
+def api_applications_status():
+    guard = require_admin()
+    if guard: return guard
+
+    body = request.get_json(force=True, silent=True) or {}
+    app_id = body.get("id")
+    status = (body.get("status") or "").strip().lower()
+
+    if status not in ("new", "reviewed", "shortlist", "declined"):
+        return {"ok": False, "error": "bad status"}, 400
+    try:
+        app_id = int(app_id)
+    except Exception:
+        return {"ok": False, "error": "bad id"}, 400
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("UPDATE applications SET status=? WHERE id=?", (status, app_id))
+    con.commit()
+    con.close()
+    return {"ok": True}
