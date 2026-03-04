@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -70,6 +72,20 @@ def init_db(db_path: str):
     con.close()
 
 
+def _parse_iso(dt: str) -> Optional[datetime]:
+    try:
+        if not dt:
+            return None
+        # allow "Z"
+        dt = dt.replace("Z", "+00:00")
+        d = datetime.fromisoformat(dt)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 # ---------------- USERS ----------------
 def upsert_user(
     db_path: str,
@@ -99,8 +115,7 @@ def upsert_user(
     con.close()
 
 
-def get_user_by_token(db_path: str, token: str, ttl_seconds: int) -> Optional[Dict[str, Any]]:
-    # TTL is enforced by last_seen_at and token_created_at in app.py logic; we do a simple lookup.
+def get_user_by_token(db_path: str, token: str, ttl_seconds: int, now_iso: str) -> Optional[Dict[str, Any]]:
     con = _con(db_path)
     cur = con.cursor()
     cur.execute("SELECT * FROM users WHERE token=?", (token,))
@@ -108,8 +123,24 @@ def get_user_by_token(db_path: str, token: str, ttl_seconds: int) -> Optional[Di
     if not row:
         con.close()
         return None
-    # update last_seen_at opportunistically
-    cur.execute("UPDATE users SET last_seen_at=last_seen_at WHERE user_id=?", (row["user_id"],))
+
+    now = _parse_iso(now_iso) or datetime.now(timezone.utc)
+    created = _parse_iso(row["token_created_at"] or "") or _parse_iso(row["last_seen_at"] or "")
+    if not created:
+        # if missing timestamps, treat as invalid
+        con.close()
+        return None
+
+    age = (now - created).total_seconds()
+    if age > ttl_seconds:
+        # expire token
+        cur.execute("UPDATE users SET token='' WHERE user_id=?", (row["user_id"],))
+        con.commit()
+        con.close()
+        return None
+
+    # touch last_seen_at
+    cur.execute("UPDATE users SET last_seen_at=? WHERE user_id=?", (now_iso, row["user_id"]))
     con.commit()
     con.close()
     return dict(row)
@@ -241,15 +272,19 @@ def cache_get(db_path: str, k: str, ttl_seconds: int) -> Optional[Dict[str, Any]
     cur = con.cursor()
     cur.execute("SELECT v, created_at FROM cache WHERE k=?", (k,))
     row = cur.fetchone()
-    con.close()
     if not row:
+        con.close()
         return None
-    created_at = int(row["created_at"] or 0)
-    # crude TTL check in DB time seconds
-    import time as _time
 
-    if (_time.time() - created_at) > ttl_seconds:
+    created_at = int(row["created_at"] or 0)
+    if (time.time() - created_at) > ttl_seconds:
+        # delete expired
+        cur.execute("DELETE FROM cache WHERE k=?", (k,))
+        con.commit()
+        con.close()
         return None
+
+    con.close()
     try:
         return json.loads(row["v"])
     except Exception:
