@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS*: Peace Hub 💼 (Company + Hiring Scan)
+// @name         7DS*: Peace Hub 💼 (High-Value Theme + Draggable Briefcase + Click to Open/Close)
 // @namespace    7ds-peace-hub
-// @version      1.0.0
-// @description  Company owner hub: employees, trains, contracts, HoF working stat scan. Uses /state (CSP-safe).
+// @version      1.1.0
+// @description  Company owner hub: employees, trains, contracts, HoF working stat scan. Briefcase stays on top, is draggable, and CLICK toggles open/close.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -33,12 +33,8 @@
     return n;
   };
 
-  const getVal = (k, d = "") => {
-    try { return GM_getValue(k, d); } catch { return d; }
-  };
-  const setVal = (k, v) => {
-    try { GM_setValue(k, v); } catch {}
-  };
+  const getVal = (k, d = "") => { try { return GM_getValue(k, d); } catch { return d; } };
+  const setVal = (k, v) => { try { GM_setValue(k, v); } catch {} };
 
   function apiReq(method, url, body, token) {
     return new Promise((resolve, reject) => {
@@ -58,47 +54,173 @@
       });
     });
   }
-
   const apiGet  = (url, token) => apiReq("GET",  url, null, token);
   const apiPost = (url, body, token) => apiReq("POST", url, body, token);
 
+  // ================== HIGH VALUE THEME ==================
   GM_addStyle(`
-    #p7ds-bag { position:fixed; right:14px; bottom:110px; z-index:9999999; width:44px; height:44px;
-      border-radius:14px; background:#132033; border:1px solid #2b4a66; display:flex; align-items:center; justify-content:center;
-      box-shadow:0 10px 30px rgba(0,0,0,.45); cursor:grab; user-select:none; }
-    #p7ds-bag:active{cursor:grabbing}
-    #p7ds-bag .badge{ position:absolute; top:-7px; right:-7px; min-width:20px; height:20px; padding:0 6px;
-      border-radius:999px; background:#ff3b3b; color:#fff; font-weight:700; font-size:12px; display:none; align-items:center; justify-content:center; border:2px solid #0b0f14;}
-    #p7ds-panel { position:fixed; right:14px; bottom:160px; z-index:9999998; width:340px; max-height:70vh; overflow:auto;
-      border-radius:18px; background:#0f1722; border:1px solid #203042; box-shadow:0 12px 42px rgba(0,0,0,.55); display:none; }
-    #p7ds-panel * { box-sizing:border-box; font-family:system-ui; }
-    #p7ds-head { padding:10px 12px; border-bottom:1px solid #203042; display:flex; gap:10px; align-items:center; }
-    #p7ds-title { font-weight:800; font-size:14px; letter-spacing:.2px; }
-    #p7ds-sub { opacity:.8; font-size:12px; }
-    #p7ds-tabs { display:flex; gap:6px; padding:10px 12px; flex-wrap:wrap; border-bottom:1px solid #203042; }
-    .p7btn { background:#0b0f14; border:1px solid #2a3d53; color:#e9eef6; border-radius:12px; padding:8px 10px; font-size:12px; cursor:pointer; }
-    .p7btn.on { border-color:#8bd0ff; }
-    #p7ds-body { padding:12px; }
-    .card { background:#0b0f14; border:1px solid #203042; border-radius:14px; padding:10px; margin:10px 0; }
-    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    input,select,textarea{ width:100%; padding:9px; border-radius:12px; border:1px solid #2a3d53; background:#060a0f; color:#e9eef6; }
-    .mini{ font-size:12px; opacity:.85; }
-    .pill{ display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #2a3d53; font-size:11px; opacity:.9; margin-left:6px; }
-    .emp { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px dashed rgba(255,255,255,.08); }
-    .emp:last-child{border-bottom:none}
-    .bad{ color:#ff8b8b; }
-    .warn{ color:#ffcc66; }
-    a{ color:#8bd0ff; text-decoration:none; }
+    :root{
+      --hv-bg:#070A0F;
+      --hv-panel:#0B1019;
+      --hv-card:#0A0F16;
+      --hv-border:#263548;
+      --hv-border2:#364C67;
+      --hv-text:#E9EEF6;
+      --hv-muted:rgba(233,238,246,.72);
+      --hv-gold:#E6C36A;
+      --hv-gold2:#B8872B;
+      --hv-blue:#8BD0FF;
+      --hv-danger:#ff5b5b;
+      --hv-warn:#ffcc66;
+      --hv-shadow:0 18px 55px rgba(0,0,0,.62);
+    }
+
+    /* Briefcase always OVER the overlay */
+    #p7ds-bag {
+      position:fixed;
+      right:16px; bottom:118px;
+      z-index:99999999;
+      width:60px; height:60px;               /* larger */
+      border-radius:18px;
+      background: radial-gradient(140% 140% at 15% 10%, rgba(230,195,106,.25) 0%, rgba(11,16,25,1) 60%);
+      border:1px solid var(--hv-border2);
+      display:flex; align-items:center; justify-content:center;
+      box-shadow: var(--hv-shadow);
+      cursor:grab;
+      user-select:none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #p7ds-bag:active{ cursor:grabbing; }
+    #p7ds-bag .icon{
+      font-size:28px;                         /* larger icon */
+      filter: drop-shadow(0 2px 8px rgba(0,0,0,.5));
+    }
+    #p7ds-bag .badge{
+      position:absolute; top:-7px; right:-7px;
+      min-width:22px; height:22px; padding:0 6px;
+      border-radius:999px;
+      background: var(--hv-danger);
+      color:#fff;
+      font-weight:800;
+      font-size:12px;
+      display:none; align-items:center; justify-content:center;
+      border:2px solid var(--hv-bg);
+    }
+
+    #p7ds-panel {
+      position:fixed;
+      right:16px; bottom:188px;
+      z-index:9999990;                        /* below bag */
+      width:360px; max-height:72vh; overflow:auto;
+      border-radius:18px;
+      background: linear-gradient(180deg, rgba(15,22,34,.98) 0%, rgba(8,11,16,.98) 100%);
+      border:1px solid var(--hv-border2);
+      box-shadow: var(--hv-shadow);
+      display:none;
+      backdrop-filter: blur(8px);
+    }
+    #p7ds-panel *{ box-sizing:border-box; font-family:system-ui; }
+
+    #p7ds-head{
+      padding:10px 12px;
+      border-bottom:1px solid rgba(54,76,103,.55);
+      display:flex; gap:10px; align-items:center;
+      background: linear-gradient(90deg, rgba(230,195,106,.12) 0%, rgba(11,16,25,.2) 60%);
+    }
+    #p7ds-title{
+      font-weight:900; font-size:13px; letter-spacing:.35px;
+      color: var(--hv-text);
+      text-transform: uppercase;
+    }
+    #p7ds-sub{ color: var(--hv-muted); font-size:12px; }
+
+    #p7ds-tabs{
+      display:flex; gap:6px; padding:10px 12px;
+      flex-wrap:wrap;
+      border-bottom:1px solid rgba(54,76,103,.35);
+    }
+
+    /* Smaller buttons + high-value feel */
+    .p7btn{
+      background: rgba(6,10,15,.92);
+      border:1px solid rgba(38,53,72,.95);
+      color: var(--hv-text);
+      border-radius:12px;
+      padding:6px 8px;                        /* smaller */
+      font-size:11px;                         /* smaller */
+      cursor:pointer;
+      transition: transform .06s ease, border-color .12s ease, box-shadow .12s ease;
+    }
+    .p7btn:hover{ border-color: rgba(230,195,106,.55); }
+    .p7btn:active{ transform: translateY(1px); }
+    .p7btn.on{
+      border-color: rgba(230,195,106,.9);
+      box-shadow: 0 0 0 2px rgba(230,195,106,.12) inset;
+    }
+    .p7btn.gold{
+      border-color: rgba(230,195,106,.9);
+      background: linear-gradient(180deg, rgba(230,195,106,.18), rgba(6,10,15,.92));
+    }
+
+    #p7ds-body{ padding:12px; }
+
+    .card{
+      background: rgba(6,10,15,.88);
+      border:1px solid rgba(38,53,72,.9);
+      border-radius:14px;
+      padding:10px;
+      margin:10px 0;
+    }
+
+    .row{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+
+    input,select,textarea{
+      width:100%;
+      padding:8px;                            /* smaller */
+      border-radius:12px;
+      border:1px solid rgba(38,53,72,.9);
+      background: rgba(4,7,12,.95);
+      color: var(--hv-text);
+      outline:none;
+    }
+    input:focus,select:focus,textarea:focus{
+      border-color: rgba(230,195,106,.65);
+      box-shadow: 0 0 0 3px rgba(230,195,106,.10);
+    }
+
+    .mini{ font-size:12px; color: var(--hv-muted); }
+    .pill{
+      display:inline-block;
+      padding:2px 8px;
+      border-radius:999px;
+      border:1px solid rgba(38,53,72,.95);
+      font-size:11px;
+      color: var(--hv-muted);
+      margin-left:6px;
+    }
+    .pill.gold{ border-color: rgba(230,195,106,.55); color: rgba(230,195,106,.95); }
+    .emp{
+      display:flex; justify-content:space-between; gap:10px;
+      padding:8px 0;
+      border-bottom:1px dashed rgba(233,238,246,.08);
+    }
+    .emp:last-child{ border-bottom:none; }
+    .bad{ color: var(--hv-danger); }
+    .warn{ color: var(--hv-warn); }
+    a{ color: var(--hv-blue); text-decoration:none; }
   `);
 
-  const bag = el("div", { id: "p7ds-bag" }, "💼");
+  // ================== UI ROOTS ==================
+  const bag = el("div", { id: "p7ds-bag", title: "Company Hub" });
+  const icon = el("div", { className: "icon" }, "💼");
   const badge = el("div", { className: "badge" }, "0");
+  bag.appendChild(icon);
   bag.appendChild(badge);
 
   const panel = el("div", { id: "p7ds-panel" });
   panel.innerHTML = `
     <div id="p7ds-head">
-      <div style="font-size:18px">💼</div>
+      <div style="font-size:18px;filter:drop-shadow(0 2px 8px rgba(0,0,0,.45))">💼</div>
       <div style="flex:1">
         <div id="p7ds-title">Company Hub</div>
         <div id="p7ds-sub">Loading...</div>
@@ -112,53 +234,89 @@
   document.body.appendChild(panel);
   document.body.appendChild(bag);
 
-  // drag bag
-  (function () {
-    let dragging = false, sx=0, sy=0, ox=0, oy=0;
-    bag.addEventListener("touchstart", (e) => {
-      dragging = true;
-      const t = e.touches[0];
-      sx = t.clientX; sy = t.clientY;
-      const r = bag.getBoundingClientRect();
-      ox = r.left; oy = r.top;
-      e.preventDefault();
-    }, {passive:false});
-    bag.addEventListener("touchmove", (e) => {
-      if(!dragging) return;
-      const t = e.touches[0];
-      const nx = ox + (t.clientX - sx);
-      const ny = oy + (t.clientY - sy);
-      bag.style.left = nx + "px";
-      bag.style.top  = ny + "px";
-      bag.style.right = "auto";
-      bag.style.bottom = "auto";
-      e.preventDefault();
-    }, {passive:false});
-    bag.addEventListener("touchend", () => dragging = false);
+  // ================== DRAG + CLICK TOGGLE (briefcase) ==================
+  let dragging = false;
+  let moved = false;
+  let sx = 0, sy = 0, ox = 0, oy = 0;
 
-    bag.addEventListener("mousedown", (e) => {
-      dragging = true;
-      sx = e.clientX; sy = e.clientY;
-      const r = bag.getBoundingClientRect();
-      ox = r.left; oy = r.top;
-      e.preventDefault();
-    });
-    window.addEventListener("mousemove", (e) => {
-      if(!dragging) return;
-      const nx = ox + (e.clientX - sx);
-      const ny = oy + (e.clientY - sy);
-      bag.style.left = nx + "px";
-      bag.style.top  = ny + "px";
-      bag.style.right = "auto";
-      bag.style.bottom = "auto";
-    });
-    window.addEventListener("mouseup", () => dragging = false);
-  })();
+  function startDrag(clientX, clientY) {
+    dragging = true;
+    moved = false;
+    sx = clientX; sy = clientY;
+    const r = bag.getBoundingClientRect();
+    ox = r.left; oy = r.top;
+  }
 
+  function doDrag(clientX, clientY) {
+    if (!dragging) return;
+    const dx = clientX - sx;
+    const dy = clientY - sy;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+
+    const nx = ox + dx;
+    const ny = oy + dy;
+
+    bag.style.left = nx + "px";
+    bag.style.top  = ny + "px";
+    bag.style.right = "auto";
+    bag.style.bottom = "auto";
+
+    // keep panel near bag when open (nice UX)
+    if (panel.style.display === "block") {
+      panel.style.left = (nx - 300) + "px";
+      panel.style.top  = (ny - 10) + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+  }
+
+  function endDrag() { dragging = false; }
+
+  // Touch
+  bag.addEventListener("touchstart", (e) => {
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive: false });
+
+  bag.addEventListener("touchmove", (e) => {
+    const t = e.touches[0];
+    doDrag(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive: false });
+
+  bag.addEventListener("touchend", () => endDrag());
+
+  // Mouse
+  bag.addEventListener("mousedown", (e) => {
+    startDrag(e.clientX, e.clientY);
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => doDrag(e.clientX, e.clientY));
+  window.addEventListener("mouseup", () => endDrag());
+
+  // CLICK toggles open/close (but ignore click after dragging)
   bag.addEventListener("click", () => {
-    panel.style.display = (panel.style.display === "none" || !panel.style.display) ? "block" : "none";
+    if (moved) { moved = false; return; }
+    togglePanel();
   });
 
+  function togglePanel() {
+    const open = (panel.style.display === "block");
+    panel.style.display = open ? "none" : "block";
+    if (!open) {
+      // Position panel near briefcase (but don't go off-screen too much)
+      const r = bag.getBoundingClientRect();
+      const left = Math.max(10, r.left - 320);
+      const top  = Math.max(10, r.top - 10);
+      panel.style.left = left + "px";
+      panel.style.top  = top + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+  }
+
+  // ================== APP ==================
   const tabsEl = panel.querySelector("#p7ds-tabs");
   const bodyEl = panel.querySelector("#p7ds-body");
   const subEl  = panel.querySelector("#p7ds-sub");
@@ -172,7 +330,6 @@
     if(n>0){ badge.style.display="flex"; badge.textContent=String(n); }
     else { badge.style.display="none"; }
   }
-
   function money(n){ try{return Number(n).toLocaleString();}catch{return String(n);} }
 
   function renderTabs(){
@@ -204,7 +361,7 @@
       await refresh(sel.value);
     });
 
-    c.appendChild(el("div",{className:"mini"}, "<b>Selected Company</b>"));
+    c.appendChild(el("div",{className:"mini"}, `<b>Selected Company</b> <span class="pill gold">${sel.value || ""}</span>`));
     c.appendChild(sel);
     return c;
   }
@@ -213,7 +370,8 @@
     const c = el("div",{className:"card"});
     const stats = state.stats||{};
     c.appendChild(el("div",{className:"mini"},
-      `<b>Employees</b> <span class="pill">${stats.employee_count||0}</span>
+      `<b>Employees</b>
+       <span class="pill gold">${stats.employee_count||0}</span>
        <span class="pill ${(stats.inactive_3d_plus||0)>0?"bad":""}">Inactive 3d+: ${stats.inactive_3d_plus||0}</span>`
     ));
 
@@ -244,7 +402,7 @@
     const buyer = el("input",{placeholder:"Buyer name"});
     const amt   = el("input",{placeholder:"Trains bought",type:"number"});
     const note  = el("input",{placeholder:"Note (optional)"});
-    const addBtn= el("button",{className:"p7btn",style:"grid-column:1/-1"},"Add Train Record");
+    const addBtn= el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Add Train Record");
 
     addBtn.addEventListener("click", async ()=>{
       await apiPost(`${BASE_URL}/api/trains/add`,{
@@ -299,7 +457,7 @@
     const empI  = el("input",{placeholder:"Employee id (optional)"});
     const exp   = el("input",{placeholder:"Expires ISO (optional) e.g. 2026-03-10T00:00:00+00:00"});
     const note  = el("input",{placeholder:"Note (optional)"});
-    const add   = el("button",{className:"p7btn",style:"margin-top:8px"},"Add Contract");
+    const add   = el("button",{className:"p7btn gold",style:"margin-top:8px"},"Add Contract");
 
     add.addEventListener("click", async ()=>{
       await apiPost(`${BASE_URL}/api/contracts/add`,{
@@ -321,7 +479,7 @@
     (state.contracts||[]).forEach(k=>{
       const r = el("div",{className:"card"});
       r.innerHTML = `
-        <div><b>${k.title}</b> ${k.expires_at?`<span class="pill">${k.expires_at}</span>`:""}</div>
+        <div><b>${k.title}</b> ${k.expires_at?`<span class="pill gold">${k.expires_at}</span>`:""}</div>
         <div class="mini">${k.employee_name||""} ${k.employee_id?`(#${k.employee_id})`:""}</div>
         <div class="mini">${k.note||""}</div>
       `;
@@ -347,7 +505,7 @@
     const maxInt = el("input",{type:"number",placeholder:"Max INT"});
     const minEnd = el("input",{type:"number",placeholder:"Min END"});
     const maxEnd = el("input",{type:"number",placeholder:"Max END"});
-    const go     = el("button",{className:"p7btn",style:"grid-column:1/-1"},"Scan");
+    const go     = el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Scan");
 
     const out = el("div",{className:"mini",style:"margin-top:10px"},"");
 
@@ -398,7 +556,7 @@
     c.appendChild(el("div",{className:"mini"},"<b>Broadcast</b> (copy/paste)"));
     const ta = el("textarea",{rows:5,placeholder:"Write message..."});
     ta.value = "Reminder: contracts renewing soon. Please stay active and reply if you need anything.";
-    const copy = el("button",{className:"p7btn",style:"margin-top:8px"},"Copy");
+    const copy = el("button",{className:"p7btn gold",style:"margin-top:8px"},"Copy");
     copy.addEventListener("click", async ()=>{
       await navigator.clipboard.writeText(ta.value);
       copy.textContent="Copied!";
@@ -419,7 +577,7 @@
     api.value   = getVal(K_API,"");
     comps.value = getVal(K_COMP,"");
 
-    const save = el("button",{className:"p7btn",style:"margin-top:8px"},"Login / Save");
+    const save = el("button",{className:"p7btn gold",style:"margin-top:8px"},"Login / Save");
     const info = el("div",{className:"mini",style:"margin-top:8px"},"");
 
     save.addEventListener("click", async ()=>{
@@ -495,7 +653,6 @@
   async function render(){
     renderTabs();
     bodyEl.innerHTML = "";
-
     const token = getVal(K_TOK,"");
 
     if(!state || !state.ok){
@@ -524,7 +681,7 @@
     await refresh(state?.selected_company_id||"");
   });
 
-  // start
+  // Start + polling
   refresh(getVal(K_SEL,""));
   setInterval(()=>refresh(state?.selected_company_id||getVal(K_SEL,"")), 15000);
 })();
