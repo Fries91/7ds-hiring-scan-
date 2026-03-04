@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (Repo-Matched Admin Token + Click Toggle + Badge On-Top)
+// @name         Company Hub 💼 (No Duplicates + Repo Admin Token + Click Toggle + Draggable)
 // @namespace    sevends-hiring-scan
-// @version      2.1.0
-// @description  Matches Fries91/7ds-hiring-scan- backend: ADMIN_TOKEN via ?admin=. Badge click opens/closes, draggable, always on top. BASE_URL hardcoded.
+// @version      2.1.1
+// @description  Prevents duplicate badge/panel injections. Matches Fries91/7ds-hiring-scan- backend: ADMIN_TOKEN via ?admin=. Badge click opens/closes, draggable, badge stays on top.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -18,11 +18,23 @@
   // ✅ HARD-CODED SERVICE URL
   const BASE_URL = "https://sevends-hiring-scan.onrender.com";
 
+  // ✅ UNIQUE IDS (used to prevent duplicates)
+  const BADGE_ID = "companyhub-badge";
+  const PANEL_ID = "companyhub-panel";
+  const STYLE_ID = "companyhub-style";
+
+  // ✅ If already injected (script re-ran), do nothing
+  if (document.getElementById(BADGE_ID) || document.getElementById(PANEL_ID)) {
+    return;
+  }
+
+  // -----------------------
   // Storage keys
+  // -----------------------
   const K_ADMIN = "company_hub_admin_token";
-  const K_API = "company_hub_user_api_key"; // optional: used for /api/applicant (if you add that UI later)
-  const K_BADGE_POS = "company_hub_badge_pos_v5";
-  const K_PANEL_POS = "company_hub_panel_pos_v5";
+  const K_API = "company_hub_user_api_key";
+  const K_BADGE_POS = "company_hub_badge_pos_v6";
+  const K_PANEL_POS = "company_hub_panel_pos_v6";
 
   // -----------------------
   // Helpers
@@ -73,7 +85,9 @@
         data: dataObj ? JSON.stringify(dataObj) : null,
         onload: (res) => {
           let json = {};
-          try { json = JSON.parse(res.responseText || "{}"); } catch {}
+          try {
+            json = JSON.parse(res.responseText || "{}");
+          } catch {}
           resolve({ status: res.status, json });
         },
         onerror: () => reject(new Error("network error")),
@@ -81,12 +95,11 @@
     });
   }
 
-  // ✅ IMPORTANT: backend expects ?admin=TOKEN on every endpoint
+  // ✅ backend expects ?admin=TOKEN on every endpoint
   function withAdmin(url) {
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
-    if (!admin) return url; // will fail with unauthorized if server requires it
     const join = url.includes("?") ? "&" : "?";
-    return `${url}${join}admin=${encodeURIComponent(admin)}`;
+    return `${url}${join}admin=${encodeURIComponent(admin || "")}`;
   }
 
   function promptMaybe(label, currentVal) {
@@ -99,177 +112,186 @@
     const curAdmin = (GM_getValue(K_ADMIN, "") || "").trim();
     const curApi = (GM_getValue(K_API, "") || "").trim();
 
-    const a = promptMaybe("Admin Token (matches your Render ENV: ADMIN_TOKEN)", curAdmin);
+    const a = promptMaybe("Admin Token (must match Render ENV: ADMIN_TOKEN)", curAdmin);
     if (a === null) return { ok: false, error: "Cancelled" };
 
-    const k = promptMaybe("Your Torn API Key (optional, for applicant workstats tools)", curApi);
+    const k = promptMaybe("Your Torn API Key (optional, for applicant tools)", curApi);
     if (k === null) return { ok: false, error: "Cancelled" };
 
     GM_setValue(K_ADMIN, a);
     GM_setValue(K_API, k);
-
     return { ok: true };
   }
 
   // -----------------------
-  // UI
+  // CSS (inject once)
   // -----------------------
-  GM_addStyle(`
-    :root{
-      --hv-text: #e5e7eb;
-      --hv-muted: rgba(229,231,235,0.72);
-    }
+  if (!document.getElementById(STYLE_ID)) {
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      :root{
+        --hv-text: #e5e7eb;
+        --hv-muted: rgba(229,231,235,0.72);
+      }
 
-    #companyhub-badge, #companyhub-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
+      #${BADGE_ID}, #${PANEL_ID} { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
 
-    /* Badge always on top */
-    #companyhub-badge {
-      position: fixed; right: 14px; bottom: 110px;
-      z-index: 1000001;
-      width: 44px; height: 44px; border-radius: 14px;
-      background:
-        radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
-        linear-gradient(135deg, rgba(18,22,32,0.95), rgba(7,9,13,0.95));
-      border: 1px solid rgba(212,175,55,0.35);
-      box-shadow:
-        0 14px 34px rgba(0,0,0,0.55),
-        0 0 0 1px rgba(255,255,255,0.06) inset;
-      display: grid; place-items: center; cursor: pointer;
-      user-select:none;
-      touch-action: none;
-    }
+      /* Badge always on top */
+      #${BADGE_ID} {
+        position: fixed; right: 14px; bottom: 110px;
+        z-index: 1000001;
+        width: 44px; height: 44px; border-radius: 14px;
+        background:
+          radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
+          linear-gradient(135deg, rgba(18,22,32,0.95), rgba(7,9,13,0.95));
+        border: 1px solid rgba(212,175,55,0.35);
+        box-shadow:
+          0 14px 34px rgba(0,0,0,0.55),
+          0 0 0 1px rgba(255,255,255,0.06) inset;
+        display: grid; place-items: center; cursor: pointer;
+        user-select:none;
+        touch-action: none;
+      }
 
-    #companyhub-badge::after{
-      content:"";
-      position:absolute; inset: 5px;
-      border-radius: 11px;
-      border: 1px solid rgba(247,231,169,0.18);
-      pointer-events:none;
-    }
+      #${BADGE_ID}::after{
+        content:"";
+        position:absolute; inset: 5px;
+        border-radius: 11px;
+        border: 1px solid rgba(247,231,169,0.18);
+        pointer-events:none;
+      }
 
-    #companyhub-badge span {
-      font-size: 22px; line-height: 1;
-      filter: drop-shadow(0 2px 6px rgba(0,0,0,0.55));
-    }
+      #${BADGE_ID} span {
+        font-size: 22px; line-height: 1;
+        filter: drop-shadow(0 2px 6px rgba(0,0,0,0.55));
+      }
 
-    #companyhub-panel {
-      position: fixed; right: 14px; bottom: 170px;
-      z-index: 1000000; /* under badge */
-      width: min(92vw, 360px);
-      background:
-        radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.10), transparent 40%),
-        radial-gradient(120% 120% at 100% 0%, rgba(99,102,241,0.08), transparent 45%),
-        linear-gradient(180deg, rgba(14,18,28,0.96), rgba(8,10,14,0.96));
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 16px;
-      box-shadow: 0 18px 52px rgba(0,0,0,0.65);
-      overflow: hidden;
-      display: none;
-      backdrop-filter: blur(8px);
-      touch-action: none;
-    }
+      #${PANEL_ID} {
+        position: fixed; right: 14px; bottom: 170px;
+        z-index: 1000000;
+        width: min(92vw, 360px);
+        background:
+          radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.10), transparent 40%),
+          radial-gradient(120% 120% at 100% 0%, rgba(99,102,241,0.08), transparent 45%),
+          linear-gradient(180deg, rgba(14,18,28,0.96), rgba(8,10,14,0.96));
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 16px;
+        box-shadow: 0 18px 52px rgba(0,0,0,0.65);
+        overflow: hidden;
+        display: none;
+        backdrop-filter: blur(8px);
+        touch-action: none;
+      }
 
-    #companyhub-head {
-      padding: 10px 12px;
-      display:flex; align-items:center; justify-content:space-between;
-      border-bottom: 1px solid rgba(255,255,255,0.10);
-      color: var(--hv-text);
-      font-weight: 950;
-      cursor: move;
-      user-select:none;
-      letter-spacing: 0.2px;
-    }
+      #companyhub-head {
+        padding: 10px 12px;
+        display:flex; align-items:center; justify-content:space-between;
+        border-bottom: 1px solid rgba(255,255,255,0.10);
+        color: var(--hv-text);
+        font-weight: 950;
+        cursor: move;
+        user-select:none;
+        letter-spacing: 0.2px;
+      }
 
-    #companyhub-title { display:flex; align-items:center; gap:8px; min-width:0; }
-    #companyhub-title .crest{
-      width: 18px; height: 18px; border-radius: 6px;
-      background:
-        radial-gradient(110% 110% at 30% 20%, rgba(247,231,169,0.35), transparent 55%),
-        linear-gradient(135deg, rgba(212,175,55,0.32), rgba(212,175,55,0.10));
-      border: 1px solid rgba(212,175,55,0.35);
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
-      flex: 0 0 auto;
-    }
-    #companyhub-title .text{ display:flex; flex-direction:column; min-width:0; }
-    #companyhub-title .text .main{ font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    #companyhub-title .text .sub{ font-size: 11px; color: rgba(247,231,169,0.70); font-weight: 800; margin-top: 2px; }
+      #companyhub-title { display:flex; align-items:center; gap:8px; min-width:0; }
 
-    #companyhub-tabs {
-      display:flex; gap:6px; padding: 8px 10px;
-      border-bottom: 1px solid rgba(255,255,255,0.08);
-      flex-wrap: wrap;
-    }
+      #companyhub-title .crest{
+        width: 18px; height: 18px; border-radius: 6px;
+        background:
+          radial-gradient(110% 110% at 30% 20%, rgba(247,231,169,0.35), transparent 55%),
+          linear-gradient(135deg, rgba(212,175,55,0.32), rgba(212,175,55,0.10));
+        border: 1px solid rgba(212,175,55,0.35);
+        box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
+        flex: 0 0 auto;
+      }
 
-    .ch-tab {
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.08);
-      color: var(--hv-text);
-      font-weight: 900;
-      border-radius: 10px;
-      padding: 6px 8px;
-      font-size: 12px;
-      cursor: pointer;
-      user-select:none;
-    }
+      #companyhub-title .text{ display:flex; flex-direction:column; min-width:0; }
+      #companyhub-title .text .main{ font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #companyhub-title .text .sub{ font-size: 11px; color: rgba(247,231,169,0.70); font-weight: 800; margin-top: 2px; }
 
-    .ch-tab.active {
-      background: linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
-      border-color: rgba(212,175,55,0.28);
-    }
+      #companyhub-tabs {
+        display:flex; gap:6px; padding: 8px 10px;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        flex-wrap: wrap;
+      }
 
-    #companyhub-body { padding: 10px; color: var(--hv-text); }
+      .ch-tab {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: var(--hv-text);
+        font-weight: 900;
+        border-radius: 10px;
+        padding: 6px 8px;
+        font-size: 12px;
+        cursor: pointer;
+        user-select:none;
+      }
 
-    .ch-btn {
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      color: var(--hv-text);
-      border-radius: 10px;
-      padding: 8px 10px;
-      font-weight: 950;
-      cursor: pointer;
-      font-size: 12px;
-      white-space: nowrap;
-      user-select:none;
-    }
-    .ch-btn.primary{ background: rgba(16,185,129,0.16); border-color: rgba(16,185,129,0.25); }
-    .ch-btn.red { background: rgba(239,68,68,0.16); border-color: rgba(239,68,68,0.25); }
+      .ch-tab.active {
+        background: linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
+        border-color: rgba(212,175,55,0.28);
+      }
 
-    .muted { color: var(--hv-muted); font-size: 12px; }
+      #companyhub-body { padding: 10px; color: var(--hv-text); }
 
-    .card {
-      background:
-        radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.07), transparent 45%),
-        rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 12px;
-      padding: 10px;
-      margin: 8px 0;
-      box-shadow: 0 6px 20px rgba(0,0,0,0.35);
-    }
+      .ch-btn {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: var(--hv-text);
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-weight: 950;
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+        user-select:none;
+      }
+      .ch-btn.primary{ background: rgba(16,185,129,0.16); border-color: rgba(16,185,129,0.25); }
+      .ch-btn.red { background: rgba(239,68,68,0.16); border-color: rgba(239,68,68,0.25); }
 
-    .card .headline{ font-weight: 950; letter-spacing: 0.1px; }
+      .muted { color: var(--hv-muted); font-size: 12px; }
 
-    .pill{
-      display:inline-flex; align-items:center; gap:6px;
-      font-size: 11px; padding: 3px 8px; border-radius: 999px;
-      background: rgba(255,255,255,0.07);
-      border: 1px solid rgba(255,255,255,0.10);
-    }
-    .pill.gold{
-      background: rgba(212,175,55,0.12);
-      border-color: rgba(212,175,55,0.22);
-      color: rgba(247,231,169,0.92);
-    }
-    .row-actions{ display:flex; gap:6px; align-items:center; }
-  `);
+      .card {
+        background:
+          radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.07), transparent 45%),
+          rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 12px;
+        padding: 10px;
+        margin: 8px 0;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+      }
 
+      .card .headline{ font-weight: 950; letter-spacing: 0.1px; }
+
+      .pill{
+        display:inline-flex; align-items:center; gap:6px;
+        font-size: 11px; padding: 3px 8px; border-radius: 999px;
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.10);
+      }
+      .pill.gold{
+        background: rgba(212,175,55,0.12);
+        border-color: rgba(212,175,55,0.22);
+        color: rgba(247,231,169,0.92);
+      }
+      .row-actions{ display:flex; gap:6px; align-items:center; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // -----------------------
+  // DOM
+  // -----------------------
   const badge = document.createElement("div");
-  badge.id = "companyhub-badge";
+  badge.id = BADGE_ID;
   badge.innerHTML = `<span>💼</span>`;
   document.body.appendChild(badge);
 
   const panel = document.createElement("div");
-  panel.id = "companyhub-panel";
+  panel.id = PANEL_ID;
   panel.innerHTML = `
     <div id="companyhub-head">
       <div id="companyhub-title">
@@ -303,6 +325,7 @@
       badge.style.right = "auto";
       badge.style.bottom = "auto";
     }
+
     const p = getSavedPos(K_PANEL_POS, null);
     if (p) {
       panel.style.left = p.x + "px";
@@ -312,12 +335,14 @@
     }
   })();
 
+  // -----------------------
+  // Badge: draggable + tap toggle (no duplicates)
+  // -----------------------
   function togglePanel() {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
     if (panel.style.display !== "none") renderActiveTab();
   }
 
-  // Badge: draggable + tap toggles open/close (no double handlers)
   function makeBadgeDraggableAndToggle(el, storeKey) {
     const threshold = 8;
     let down = false;
@@ -490,12 +515,14 @@
 
   // Buttons
   panel.querySelector("#ch-close").addEventListener("click", (e) => {
-    e.preventDefault(); e.stopPropagation();
+    e.preventDefault();
+    e.stopPropagation();
     togglePanel();
   });
 
   panel.querySelector("#ch-settings").addEventListener("click", async (e) => {
-    e.preventDefault(); e.stopPropagation();
+    e.preventDefault();
+    e.stopPropagation();
     const res = await openSettings();
     renderActiveTab(res.ok ? null : res.error);
   });
@@ -505,7 +532,8 @@
   let active = "companies";
   tabs.forEach((b) => {
     b.addEventListener("click", (e) => {
-      e.preventDefault(); e.stopPropagation();
+      e.preventDefault();
+      e.stopPropagation();
       tabs.forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       active = b.getAttribute("data-tab");
@@ -532,7 +560,7 @@
           <div class="headline">Setup needed</div>
           <div class="muted" style="margin-top:6px;">
             Click <b>Settings</b> and enter your Admin Token.
-            <br/>Your server checks <b>?admin=</b> against <b>ADMIN_TOKEN</b>.
+            <br/>Server checks <b>?admin=</b> against <b>ADMIN_TOKEN</b>.
           </div>
         </div>`;
       return;
@@ -571,10 +599,7 @@
         <div class="card">
           <div class="headline">Unauthorized</div>
           <div class="muted" style="margin-top:6px;">
-            Your Admin Token does not match the server’s <b>ADMIN_TOKEN</b>.
-          </div>
-          <div class="muted" style="margin-top:6px;">
-            Fix: Render → Environment → set <b>ADMIN_TOKEN</b> exactly, then redeploy.
+            Admin Token mismatch. Render → Environment → set <b>ADMIN_TOKEN</b> exactly, then redeploy.
           </div>
         </div>`;
       return;
@@ -592,23 +617,25 @@
       return;
     }
 
-    body.innerHTML = rows.map((c) => {
-      const emps = (c.employees || []).length;
-      const err = c.error
-        ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>`
-        : "";
-      return `
-        <div class="card">
-          <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
-          <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-            <div class="pill gold">👥 ${escapeHtml(String(emps))} employees</div>
-            <div class="pill">🆔 ${escapeHtml(c.company_id)}</div>
-          </div>
-          ${err}
-        </div>`;
-    }).join("");
+    body.innerHTML = rows
+      .map((c) => {
+        const emps = (c.employees || []).length;
+        const err = c.error
+          ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>`
+          : "";
+        return `
+          <div class="card">
+            <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
+            <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+              <div class="pill gold">👥 ${escapeHtml(String(emps))} employees</div>
+              <div class="pill">🆔 ${escapeHtml(c.company_id)}</div>
+            </div>
+            ${err}
+          </div>`;
+      })
+      .join("");
   }
 
-  // Start hidden
+  // start hidden
   panel.style.display = "none";
 })();
