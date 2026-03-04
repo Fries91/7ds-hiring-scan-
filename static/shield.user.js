@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (HoF Range Fix + PDA)
+// @name         Company Hub 💼 (HoF Range Fix + Profile Links + PDA)
 // @namespace    Fries-company-hub
-// @version      3.0.0
-// @description  Company Hub: login with admin key + own API key. HoF workstats scan supports large ranges (e.g., 500-120000). PDA/mobile friendly.
+// @version      3.1.0
+// @description  Company Hub: login with admin key + own API key. HoF workstats scan supports large ranges (e.g., 500-120000). Adds profile links. PDA/mobile friendly.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -23,15 +23,15 @@
   const K_API   = "hub_api_key_v3";
   const K_SESS  = "hub_session_token_v3";
 
-  function $(sel, root=document){ return root.querySelector(sel); }
-  function el(tag, attrs={}, html=""){
+  function $(sel, root = document) { return root.querySelector(sel); }
+  function el(tag, attrs = {}, html = "") {
     const n = document.createElement(tag);
-    Object.entries(attrs).forEach(([k,v]) => n.setAttribute(k, v));
+    Object.entries(attrs).forEach(([k, v]) => n.setAttribute(k, v));
     if (html) n.innerHTML = html;
     return n;
   }
 
-  function api(method, path, body){
+  function api(method, path, body) {
     const token = GM_getValue(K_SESS, "");
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -45,7 +45,7 @@
         onload: (r) => {
           let j;
           try { j = JSON.parse(r.responseText || "{}"); }
-          catch (e) { return reject(new Error("Bad JSON from server: " + (r.responseText || "").slice(0, 120))); }
+          catch (e) { return reject(new Error("Bad JSON from server: " + (r.responseText || "").slice(0, 160))); }
           if (!j.ok) return reject(new Error(j.error || "Request failed"));
           resolve(j.data);
         },
@@ -54,6 +54,44 @@
         timeout: 60000
       });
     });
+  }
+
+  function escapeHtml(s) {
+    return String(s || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function openProfile(tornId) {
+    const id = String(tornId || "").trim();
+    if (!id) return;
+    // Torn profile URL pattern:
+    // https://www.torn.com/profiles.php?XID=####
+    const url = `https://www.torn.com/profiles.php?XID=${encodeURIComponent(id)}`;
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(String(text));
+      return true;
+    } catch (e) {
+      // Fallback
+      try {
+        const ta = el("textarea", {});
+        ta.value = String(text);
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        return true;
+      } catch {
+        return false;
+      }
+    }
   }
 
   GM_addStyle(`
@@ -92,11 +130,11 @@
       background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
       border-bottom: 1px solid rgba(255,255,255,0.08);
     }
-    #hub-title { font-weight: 800; letter-spacing: 0.2px; }
+    #hub-title { font-weight: 900; letter-spacing: 0.2px; }
     #hub-close {
       border: 0; background: rgba(255,255,255,0.08);
       color: #fff; border-radius: 10px;
-      padding: 6px 10px; font-weight: 700;
+      padding: 6px 10px; font-weight: 800;
     }
 
     #hub-tabs { display:flex; gap:8px; padding: 10px 12px; flex-wrap: wrap; }
@@ -105,7 +143,7 @@
       background: rgba(255,255,255,0.06);
       color: #e9eef6;
       padding: 6px 10px; border-radius: 999px;
-      font-weight: 700; font-size: 12px;
+      font-weight: 800; font-size: 12px;
     }
     .hub-tabbtn.active { background: rgba(255,255,255,0.14); }
 
@@ -132,21 +170,50 @@
       border: 0;
       border-radius: 10px;
       padding: 8px 10px;
-      font-weight: 800;
+      font-weight: 900;
       background: linear-gradient(180deg, rgba(60,175,255,0.35), rgba(60,175,255,0.18));
       color: #e9eef6;
+    }
+    .hub-btn.ghost{
+      background: rgba(255,255,255,0.10);
+      border: 1px solid rgba(255,255,255,0.10);
+      font-weight: 800;
+    }
+    .hub-btn.danger{
+      background: rgba(255,90,90,0.22);
+      border: 1px solid rgba(255,90,90,0.18);
     }
     .hub-small{ font-size: 12px; opacity: 0.9; }
     .hub-list{ margin-top: 8px; display:grid; gap:6px; }
     .hub-item{
-      border-radius: 10px;
-      padding: 8px 10px;
+      border-radius: 12px;
+      padding: 10px;
       border: 1px solid rgba(255,255,255,0.08);
       background: rgba(0,0,0,0.16);
       display:flex; justify-content:space-between; gap:10px;
       font-size: 13px;
+      align-items:flex-start;
     }
     .hub-item b{ font-weight: 900; }
+    .hub-actions{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      justify-content:flex-end;
+      flex-wrap:wrap;
+      min-width: 120px;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.10);
+      font-size: 12px;
+      white-space: nowrap;
+    }
   `);
 
   // UI nodes
@@ -168,14 +235,10 @@
   document.body.appendChild(overlay);
   document.body.appendChild(badge);
 
-  function showOverlay(on){
-    overlay.style.display = on ? "block" : "none";
-  }
-  function toggleOverlay(){
-    showOverlay(overlay.style.display !== "block");
-  }
+  function showOverlay(on) { overlay.style.display = on ? "block" : "none"; }
+  function toggleOverlay() { showOverlay(overlay.style.display !== "block"); }
 
-  // badge click toggles overlay
+  // Tap badge toggles overlay
   badge.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -185,8 +248,8 @@
   $("#hub-close", overlay).addEventListener("click", () => showOverlay(false));
 
   // draggable badge (mobile-friendly)
-  (function makeDraggable(node){
-    let dragging=false, startX=0, startY=0, origX=0, origY=0;
+  (function makeDraggable(node) {
+    let dragging = false, startX = 0, startY = 0, origX = 0, origY = 0;
     node.addEventListener("pointerdown", (e) => {
       dragging = true;
       node.setPointerCapture(e.pointerId);
@@ -202,13 +265,13 @@
       node.style.top  = Math.max(6, origY + dy) + "px";
       node.style.right = "auto";
     });
-    node.addEventListener("pointerup", () => dragging=false);
-    node.addEventListener("pointercancel", () => dragging=false);
+    node.addEventListener("pointerup", () => dragging = false);
+    node.addEventListener("pointercancel", () => dragging = false);
   })(badge);
 
   const body = $("#hub-body", overlay);
 
-  function setActiveTab(tab){
+  function setActiveTab(tab) {
     overlay.querySelectorAll(".hub-tabbtn").forEach(b => {
       b.classList.toggle("active", b.dataset.tab === tab);
     });
@@ -219,19 +282,19 @@
     b.addEventListener("click", () => setActiveTab(b.dataset.tab));
   });
 
-  function renderTab(tab){
+  function renderTab(tab) {
     if (tab === "login") return renderLogin();
     if (tab === "search") return renderSearch();
     if (tab === "trains") return renderTrains();
   }
 
-  async function renderLogin(){
+  async function renderLogin() {
     const savedAdmin = GM_getValue(K_ADMIN, "");
     const savedApi   = GM_getValue(K_API, "");
     body.innerHTML = `
       <div class="hub-card">
         <div style="font-weight:900;margin-bottom:6px;">Login</div>
-        <div class="hub-small">Admin key = the one you give your users. API key = their own Torn API key.</div>
+        <div class="hub-small">Admin key = the one you give users. API key = their own Torn API key.</div>
         <div class="hub-row" style="margin-top:10px;">
           <input id="hub-admin" placeholder="Admin key" value="${escapeHtml(savedAdmin)}" />
           <input id="hub-api" placeholder="Your API key" value="${escapeHtml(savedApi)}" />
@@ -249,17 +312,17 @@
       GM_setValue(K_API, api_key);
 
       $("#hub-loginmsg", body).textContent = "Signing in...";
-      try{
+      try {
         const data = await api("POST", "/api/login", { admin_key, api_key });
         GM_setValue(K_SESS, data.token);
         $("#hub-loginmsg", body).textContent = `✅ Logged in as ${data.name} [${data.user_id}]`;
-      }catch(err){
+      } catch (err) {
         $("#hub-loginmsg", body).textContent = "❌ " + err.message;
       }
     });
   }
 
-  async function renderSearch(){
+  async function renderSearch() {
     body.innerHTML = `
       <div class="hub-card">
         <div style="font-weight:900;margin-bottom:6px;">Hall of Fame: Work Stats Search</div>
@@ -280,30 +343,62 @@
       $("#hof-msg", body).textContent = "Scanning HoF...";
       $("#hof-list", body).innerHTML = "";
 
-      try{
+      try {
         const data = await api("GET", `/api/hof_scan?min=${encodeURIComponent(min)}&max=${encodeURIComponent(max)}`);
-        $("#hof-msg", body).textContent = `✅ Found ${data.count} results (showing up to 200)`;
-        const list = $("#hof-list", body);
+        const count = Number(data.count || 0);
+        $("#hof-msg", body).textContent = `✅ Found ${count} results (showing up to 200)`;
 
+        const list = $("#hof-list", body);
         (data.results || []).slice(0, 200).forEach(r => {
-          const id = r.id || "";
+          const id = (r.id || "").toString();
           const name = r.name || "(unknown)";
-          const val = r.value || 0;
+          const val = Number(r.value || 0);
           const rank = r.rank || "";
-          const node = el("div", { class: "hub-item" },
-            `<div><b>${escapeHtml(name)}</b> <span class="hub-small">[${escapeHtml(id)}]</span></div>
-             <div><span class="hub-small">rank</span> <b>${rank}</b> · <span class="hub-small">value</span> <b>${val.toLocaleString()}</b></div>`
-          );
+
+          const node = el("div", { class: "hub-item" });
+          node.innerHTML = `
+            <div>
+              <div><b>${escapeHtml(name)}</b> <span class="hub-small">[${escapeHtml(id)}]</span></div>
+              <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+                <span class="pill"><span class="hub-small">rank</span> <b>${escapeHtml(String(rank))}</b></span>
+                <span class="pill"><span class="hub-small">value</span> <b>${val.toLocaleString()}</b></span>
+              </div>
+              <div class="hub-small" style="margin-top:6px; opacity:0.85;">
+                Tap Profile to open Torn profile. Tap Copy to copy ID.
+              </div>
+            </div>
+            <div class="hub-actions">
+              <button class="hub-btn ghost" data-act="profile" data-id="${escapeHtml(id)}">Profile</button>
+              <button class="hub-btn ghost" data-act="copy" data-id="${escapeHtml(id)}">Copy</button>
+            </div>
+          `;
+
+          // actions
+          const profileBtn = node.querySelector("button[data-act='profile']");
+          const copyBtn = node.querySelector("button[data-act='copy']");
+
+          profileBtn.addEventListener("click", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            openProfile(id);
+          });
+
+          copyBtn.addEventListener("click", async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const ok = await copyToClipboard(id);
+            copyBtn.textContent = ok ? "Copied" : "Nope";
+            setTimeout(() => (copyBtn.textContent = "Copy"), 900);
+          });
+
           list.appendChild(node);
         });
 
-      }catch(err){
+      } catch (err) {
         $("#hof-msg", body).textContent = "❌ " + err.message + " (Try logging in again.)";
       }
     });
   }
 
-  async function renderTrains(){
+  async function renderTrains() {
     body.innerHTML = `
       <div class="hub-card">
         <div style="font-weight:900;margin-bottom:6px;">Trains</div>
@@ -324,39 +419,38 @@
       const amount = parseInt(($("#tr-amount", body).value || "0").trim(), 10);
 
       $("#tr-msg", body).textContent = "Saving...";
-      try{
+      try {
         await api("POST", "/api/trains", { company_id, buyer, amount });
         $("#tr-msg", body).textContent = "✅ Saved";
         await refreshTrains();
-      }catch(err){
+      } catch (err) {
         $("#tr-msg", body).textContent = "❌ " + err.message;
       }
     });
 
     await refreshTrains();
 
-    async function refreshTrains(){
+    async function refreshTrains() {
       const list = $("#tr-list", body);
       list.innerHTML = "";
-      try{
+      try {
         const trains = await api("GET", "/api/trains");
         trains.forEach(t => {
-          const node = el("div", { class: "hub-item" }, `
+          const node = el("div", { class: "hub-item" });
+          node.innerHTML = `
             <div>
               <b>${escapeHtml(t.buyer || "buyer")}</b>
               <span class="hub-small"> ${escapeHtml(String(t.company_id || ""))}</span>
               <div class="hub-small">${escapeHtml(String(t.created_at || ""))}</div>
             </div>
-            <div style="display:flex;gap:8px;align-items:center;">
-              <b>${Number(t.amount||0)}</b>
-              <button class="hub-btn" data-id="${t.id}" data-act="toggle" style="padding:6px 10px;">
+            <div class="hub-actions">
+              <span class="pill"><b>${Number(t.amount || 0)}</b></span>
+              <button class="hub-btn ghost" data-id="${t.id}" data-act="toggle">
                 ${t.used ? "Used" : "New"}
               </button>
-              <button class="hub-btn" data-id="${t.id}" data-act="del" style="padding:6px 10px;background:rgba(255,90,90,0.22);">
-                Del
-              </button>
+              <button class="hub-btn danger" data-id="${t.id}" data-act="del">Del</button>
             </div>
-          `);
+          `;
           list.appendChild(node);
         });
 
@@ -377,19 +471,10 @@
           });
         });
 
-      }catch(err){
+      } catch (err) {
         $("#tr-msg", body).textContent = "❌ " + err.message + " (Login first.)";
       }
     }
-  }
-
-  function escapeHtml(s){
-    return String(s || "")
-      .replaceAll("&","&amp;")
-      .replaceAll("<","&lt;")
-      .replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;")
-      .replaceAll("'","&#039;");
   }
 
   // default tab
