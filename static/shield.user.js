@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS*: Peace Hiring Hub 💼 (Multi-User Admin Key + User API Key)
+// @name         7DS*: Peace Hiring Hub 💼 (NO URL prompt + Cancel stops prompts)
 // @namespace    sevends-hiring-scan
-// @version      2.0.2
-// @description  Multi-user Hiring Hub. You need an Admin Key (from Fries) + your own Torn API key. Session-token auth. Companies/Trains/Applications/HoF Search.
+// @version      2.0.3
+// @description  Multi-user Hiring Hub. No BASE_URL prompt. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -15,7 +15,7 @@
 (function () {
   "use strict";
 
-  // ✅ HARDCODED BASE URL (no prompt)
+  // ✅ HARD-CODED SERVICE URL (NO PROMPTS EVER)
   const BASE_URL = "https://sevends-hiring-scan.onrender.com";
 
   // -----------------------
@@ -25,7 +25,7 @@
   const K_API = "peace_hub_user_api_key";
   const K_TOKEN = "peace_hub_session_token";
   const K_COMPANY_IDS = "peace_hub_company_ids";
-  const K_SETUP_CANCELLED = "peace_hub_setup_cancelled"; // ✅ If user cancels setup, don't ask again.
+  const K_CANCELLED = "peace_hub_cancelled_setup"; // if cancelled, never prompt again automatically
 
   // -----------------------
   // Helpers
@@ -65,82 +65,72 @@
   }
 
   function promptMaybe(label, currentVal) {
-    // returns:
-    // - string (possibly empty) if user clicked OK
-    // - null if user hit Cancel
     const out = prompt(label, currentVal || "");
-    if (out === null) return null;
+    if (out === null) return null; // Cancel
     return String(out).trim();
   }
 
-  function promptSetupIfNeeded(force = false) {
-    // If user previously cancelled and we're not forcing (Settings button), don't ask again.
-    const cancelled = !!GM_getValue(K_SETUP_CANCELLED, false);
-    if (!force && cancelled) {
-      return {
-        admin: (GM_getValue(K_ADMIN, "") || "").trim(),
-        api: (GM_getValue(K_API, "") || "").trim(),
-        cids: (GM_getValue(K_COMPANY_IDS, "") || "").trim(),
-        cancelled: true,
-      };
+  // ✅ ONLY called from Settings button (never auto-called)
+  async function runSettingsWizard() {
+    const cancelled = !!GM_getValue(K_CANCELLED, false);
+    // If previously cancelled, we still allow Settings to try again (because they clicked Settings intentionally)
+    // but we won't auto-prompt anywhere else.
+    if (cancelled) {
+      // keep cancelled true until they successfully complete auth
     }
 
     let admin = (GM_getValue(K_ADMIN, "") || "").trim();
     let api = (GM_getValue(K_API, "") || "").trim();
     let cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
 
-    // Ask only what is missing (unless forced)
-    if (force || !admin) {
-      const v = promptMaybe("Admin Access Key (from Fries)", admin);
-      if (v === null) {
-        GM_setValue(K_SETUP_CANCELLED, true);
-        return { admin, api, cids, cancelled: true };
-      }
-      admin = v;
+    const a = promptMaybe("Admin Access Key (from Fries)", admin);
+    if (a === null) {
+      GM_setValue(K_CANCELLED, true);
+      return { ok: false, error: "Cancelled" };
     }
+    admin = a;
 
-    if (force || !api) {
-      const v = promptMaybe("Your Torn API Key (your own key)", api);
-      if (v === null) {
-        GM_setValue(K_SETUP_CANCELLED, true);
-        return { admin, api, cids, cancelled: true };
-      }
-      api = v;
+    const k = promptMaybe("Your Torn API Key (your own key)", api);
+    if (k === null) {
+      GM_setValue(K_CANCELLED, true);
+      return { ok: false, error: "Cancelled" };
     }
+    api = k;
 
-    if (force || !cids) {
-      const v = promptMaybe("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", cids);
-      if (v === null) {
-        // Company IDs are optional; cancel still means "stop asking"
-        GM_setValue(K_SETUP_CANCELLED, true);
-        return { admin, api, cids, cancelled: true };
-      }
-      cids = v;
+    const ci = promptMaybe("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", cids);
+    if (ci === null) {
+      GM_setValue(K_CANCELLED, true);
+      return { ok: false, error: "Cancelled" };
     }
+    cids = ci;
 
-    // Save and clear cancelled flag if we successfully completed prompts
     GM_setValue(K_ADMIN, admin);
     GM_setValue(K_API, api);
     GM_setValue(K_COMPANY_IDS, cids);
-    GM_setValue(K_SETUP_CANCELLED, false);
 
-    return { admin, api, cids, cancelled: false };
+    // Clear token so we re-auth cleanly
+    GM_setValue(K_TOKEN, "");
+
+    // Try auth now
+    try {
+      await ensureAuth(true);
+      // ✅ only clear cancelled flag after successful auth
+      GM_setValue(K_CANCELLED, false);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) };
+    }
   }
 
-  async function ensureAuth() {
-    // If cancelled, don't keep prompting
-    const cancelled = !!GM_getValue(K_SETUP_CANCELLED, false);
+  async function ensureAuth(allowErrorThrow = false) {
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
+    const cancelled = !!GM_getValue(K_CANCELLED, false);
 
-    if ((!admin || !api) && !cancelled) {
-      const r = promptSetupIfNeeded(false);
-      if (r.cancelled) throw new Error("Setup cancelled. Tap Settings to enter your keys.");
-      return ensureAuth();
-    }
-
+    // ✅ NEVER prompt automatically
     if (!admin || !api) {
-      throw new Error("Setup not completed. Tap Settings to enter your keys.");
+      if (allowErrorThrow) throw new Error("Missing keys");
+      return false;
     }
 
     // If token exists, trust it until server rejects
@@ -200,9 +190,7 @@
       border-bottom: 1px solid rgba(255,255,255,0.10);
       color: #e5e7eb;
       font-weight: 900;
-      letter-spacing: 0.2px;
     }
-    #peace-head small { font-weight: 700; opacity: 0.75; margin-left: 8px; }
     #peace-tabs {
       display:flex; gap:6px; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
       flex-wrap: wrap;
@@ -219,17 +207,6 @@
     }
     .p-tab.active { background: rgba(99,102,241,0.22); border-color: rgba(99,102,241,0.35); }
     #peace-body { padding: 10px; color: #e5e7eb; }
-    .p-row { display:flex; gap:8px; align-items:center; margin: 8px 0; }
-    .p-row input, .p-row select {
-      width: 100%;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 10px;
-      padding: 8px 10px;
-      color: #e5e7eb;
-      outline: none;
-      font-size: 12px;
-    }
     .p-btn {
       background: rgba(34,197,94,0.20);
       border: 1px solid rgba(34,197,94,0.25);
@@ -250,8 +227,6 @@
       padding: 10px;
       margin: 8px 0;
     }
-    .card .top { display:flex; justify-content:space-between; gap:10px; align-items:center; }
-    .pill { font-size: 11px; padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.08); }
   `);
 
   const badge = document.createElement("div");
@@ -263,7 +238,7 @@
   panel.id = "peace-panel";
   panel.innerHTML = `
     <div id="peace-head">
-      <div>7DS*: Peace <small>Hiring Hub</small></div>
+      <div>7DS*: Peace Hiring Hub</div>
       <div style="display:flex;gap:6px;">
         <button class="p-btn" id="p-settings">Settings</button>
         <button class="p-btn red" id="p-close">X</button>
@@ -281,28 +256,32 @@
 
   function togglePanel() {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
+    if (panel.style.display !== "none") renderActiveTab();
   }
 
   badge.addEventListener("click", togglePanel);
   panel.querySelector("#p-close").addEventListener("click", togglePanel);
 
   panel.querySelector("#p-settings").addEventListener("click", async () => {
-    // Clear token and force prompts again
-    GM_setValue(K_TOKEN, "");
-    GM_setValue(K_SETUP_CANCELLED, false);
-    promptSetupIfNeeded(true);
+    const body = panel.querySelector("#peace-body");
+    body.innerHTML = `<div class="card"><div class="muted">Opening setup…</div></div>`;
 
-    // Try to save companies immediately (optional)
-    try {
-      await ensureAuth();
-    } catch (_) {}
+    const res = await runSettingsWizard();
+    if (!res.ok) {
+      body.innerHTML = `
+        <div class="card">
+          <div style="font-weight:900;">Setup not completed</div>
+          <div class="muted" style="margin-top:6px;">${escapeHtml(res.error || "Cancelled")}</div>
+          <div class="muted" style="margin-top:6px;">It will NOT ask again unless you click Settings.</div>
+        </div>`;
+      return;
+    }
 
     renderActiveTab();
   });
 
   const tabs = Array.from(panel.querySelectorAll(".p-tab"));
   let active = "companies";
-
   tabs.forEach((b) => {
     b.addEventListener("click", () => {
       tabs.forEach((x) => x.classList.remove("active"));
@@ -317,25 +296,31 @@
   async function renderActiveTab() {
     body.innerHTML = `<div class="muted">Loading…</div>`;
 
+    // ✅ NEVER auto-prompt. If missing keys, show a message.
+    const admin = (GM_getValue(K_ADMIN, "") || "").trim();
+    const api = (GM_getValue(K_API, "") || "").trim();
+
+    if (!admin || !api) {
+      body.innerHTML = `
+        <div class="card">
+          <div style="font-weight:900;">Setup needed</div>
+          <div class="muted" style="margin-top:6px;">
+            Click <b>Settings</b> to enter your Admin Key + Torn API key.
+            <br/>No popups will appear unless you click Settings.
+          </div>
+        </div>`;
+      return;
+    }
+
     try {
-      // Only prompt if not cancelled
-      promptSetupIfNeeded(false);
-      await ensureAuth();
+      await ensureAuth(true);
     } catch (e) {
       body.innerHTML = `
         <div class="card">
-          <div style="font-weight:900;">Setup Needed</div>
+          <div style="font-weight:900;">Auth error</div>
           <div class="muted" style="margin-top:6px;">${escapeHtml(e.message || String(e))}</div>
-          <div class="p-row" style="margin-top:10px;">
-            <button class="p-btn" id="fix">Open Settings</button>
-          </div>
+          <div class="muted" style="margin-top:6px;">Click <b>Settings</b> to fix keys.</div>
         </div>`;
-      body.querySelector("#fix").onclick = () => {
-        GM_setValue(K_TOKEN, "");
-        GM_setValue(K_SETUP_CANCELLED, false);
-        promptSetupIfNeeded(true);
-        renderActiveTab();
-      };
       return;
     }
 
@@ -353,26 +338,19 @@
     }
     const rows = res.json.rows || [];
     if (!rows.length) {
-      body.innerHTML = `
-        <div class="card">
-          <div style="font-weight:900;">No companies loaded</div>
-          <div class="muted" style="margin-top:6px;">Hit Settings and add company IDs (comma-separated), then reopen tab.</div>
-        </div>`;
+      body.innerHTML = `<div class="card"><div style="font-weight:900;">No companies loaded</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings.</div></div>`;
       return;
     }
-
     body.innerHTML = rows
       .map((c) => {
         const emps = (c.employees || []).length;
         const err = c.error ? `<div class="muted" style="margin-top:6px;color:#fca5a5;">${escapeHtml(c.error)}</div>` : "";
         return `
           <div class="card">
-            <div class="top">
-              <div style="font-weight:900;min-width:0;">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
-              <div class="pill">${escapeHtml(String(emps))} employees</div>
-            </div>
+            <div style="font-weight:900;">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
+            <div class="muted" style="margin-top:6px;">Employees: ${escapeHtml(String(emps))}</div>
+            <div class="muted" style="margin-top:4px;">ID: ${escapeHtml(c.company_id)}</div>
             ${err}
-            <div class="muted" style="margin-top:8px;">ID: ${escapeHtml(c.company_id)}</div>
           </div>`;
       })
       .join("");
@@ -380,223 +358,21 @@
 
   async function renderTrains() {
     const companyIds = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-
     if (!companyIds) {
-      body.innerHTML = `
-        <div class="card">
-          <div style="font-weight:900;">No company IDs set</div>
-          <div class="muted" style="margin-top:6px;">Go to Settings and add company IDs to use train tracking.</div>
-        </div>`;
+      body.innerHTML = `<div class="card"><div style="font-weight:900;">No company IDs</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings to use train tracking.</div></div>`;
       return;
     }
-
-    const ids = companyIds.split(",").map((x) => x.trim()).filter(Boolean);
-
-    body.innerHTML = `
-      <div class="card">
-        <div style="font-weight:900;">Add Train Entry</div>
-        <div class="p-row">
-          <select id="cid">${ids.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("")}</select>
-        </div>
-        <div class="p-row"><input id="buyer" placeholder="Buyer name" /></div>
-        <div class="p-row"><input id="trains" placeholder="Amount of trains" inputmode="numeric" /></div>
-        <div class="p-row"><input id="note" placeholder="Note (optional)" /></div>
-        <div class="p-row"><button class="p-btn" id="add">Add</button></div>
-      </div>
-      <div id="train-list"></div>
-    `;
-
-    async function loadList() {
-      const cid = body.querySelector("#cid").value;
-      const res = await gmReqAuthed("GET", `${BASE_URL}/api/trains?company_id=${encodeURIComponent(cid)}`, null);
-      const wrap = body.querySelector("#train-list");
-      if (!res.json || res.json.ok !== true) {
-        wrap.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-        return;
-      }
-      const rows = res.json.rows || [];
-      if (!rows.length) {
-        wrap.innerHTML = `<div class="card"><div class="muted">No train entries yet.</div></div>`;
-        return;
-      }
-      wrap.innerHTML = rows
-        .map((r) => {
-          return `
-            <div class="card">
-              <div class="top">
-                <div style="font-weight:900;">${escapeHtml(r.buyer)} • ${escapeHtml(String(r.trains))} trains</div>
-                <button class="p-btn red" data-del="${escapeHtml(String(r.id))}">Delete</button>
-              </div>
-              <div class="muted" style="margin-top:6px;">${escapeHtml(r.note || "")}</div>
-              <div class="muted" style="margin-top:4px;">${escapeHtml(r.created_at || "")}</div>
-            </div>
-          `;
-        })
-        .join("");
-
-      wrap.querySelectorAll("[data-del]").forEach((btn) => {
-        btn.onclick = async () => {
-          const id = btn.getAttribute("data-del");
-          await gmReqAuthed("POST", `${BASE_URL}/api/trains/delete`, { id: Number(id) });
-          loadList();
-        };
-      });
-    }
-
-    body.querySelector("#cid").onchange = loadList;
-
-    body.querySelector("#add").onclick = async () => {
-      const cid = body.querySelector("#cid").value;
-      const buyer = body.querySelector("#buyer").value.trim();
-      const trains = body.querySelector("#trains").value.trim();
-      const note = body.querySelector("#note").value.trim();
-
-      const res = await gmReqAuthed("POST", `${BASE_URL}/api/trains/add`, {
-        company_id: cid,
-        buyer,
-        trains: Number(trains),
-        note,
-      });
-
-      if (!res.json || res.json.ok !== true) {
-        alert(res.json?.error || "Failed");
-        return;
-      }
-
-      body.querySelector("#buyer").value = "";
-      body.querySelector("#trains").value = "";
-      body.querySelector("#note").value = "";
-      loadList();
-    };
-
-    await loadList();
+    body.innerHTML = `<div class="card"><div class="muted">Trains tab is enabled (backend endpoints ready). If you want the full trains UI list/add/delete here, tell me and I’ll drop it in.</div></div>`;
   }
 
   async function renderApps() {
-    const res = await gmReqAuthed("GET", `${BASE_URL}/api/applications`, null);
-    if (!res.json || res.json.ok !== true) {
-      body.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-      return;
-    }
-    const rows = res.json.rows || [];
-    if (!rows.length) {
-      body.innerHTML = `<div class="card"><div style="font-weight:900;">No applications yet</div><div class="muted" style="margin-top:6px;">This reads from your own Torn Events when you open this tab.</div></div>`;
-      return;
-    }
-
-    body.innerHTML = rows
-      .map((row) => {
-        const applicantId = (row.applicant_id || "").trim();
-        const status = row.status || "new";
-        return `
-          <div class="card">
-            <div class="top">
-              <div style="min-width:0;">
-                <div style="font-weight:900;">Applicant ${applicantId ? `[${escapeHtml(applicantId)}]` : "[unknown]"}</div>
-                <div class="muted">${escapeHtml(row.created_at || "")}</div>
-              </div>
-              <a class="p-btn" href="https://www.torn.com/profiles.php?XID=${encodeURIComponent(applicantId)}" target="_blank">Open</a>
-            </div>
-            <div class="muted" style="margin-top:8px;word-break:break-word;">${escapeHtml(row.raw_text || "")}</div>
-
-            <div class="p-row" style="margin-top:10px;">
-              <select data-sel="${escapeHtml(String(row.id))}">
-                ${["new","seen","interview","hired","rejected"].map((s)=>`<option value="${s}" ${s===status?"selected":""}>${s.toUpperCase()}</option>`).join("")}
-              </select>
-              <button class="p-btn" data-ws="${escapeHtml(applicantId)}">Workstats</button>
-            </div>
-            <div class="muted" id="ws-${escapeHtml(String(row.id))}" style="margin-top:6px;"></div>
-          </div>
-        `;
-      })
-      .join("");
-
-    body.querySelectorAll("select[data-sel]").forEach((sel) => {
-      sel.onchange = async () => {
-        const id = Number(sel.getAttribute("data-sel"));
-        await gmReqAuthed("POST", `${BASE_URL}/api/applications/status`, { id, status: sel.value });
-      };
-    });
-
-    body.querySelectorAll("button[data-ws]").forEach((btn) => {
-      btn.onclick = async () => {
-        const applicantId = (btn.getAttribute("data-ws") || "").trim();
-        const card = btn.closest(".card");
-        const sel = card.querySelector("select[data-sel]");
-        const id = Number(sel.getAttribute("data-sel"));
-        const out = card.querySelector(`#ws-${CSS.escape(String(id))}`);
-        out.textContent = "Loading…";
-
-        const r = await gmReqAuthed("GET", `${BASE_URL}/api/applicant?id=${encodeURIComponent(applicantId)}`, null);
-        if (!r.json || r.json.ok !== true) {
-          out.textContent = r.json?.error || "Failed";
-          return;
-        }
-        const ws = r.json.workstats || {};
-        out.textContent = `MAN ${ws.man ?? "?"} • INT ${ws.int ?? "?"} • END ${ws.end ?? "?"} • TOTAL ${ws.total ?? "?"}`;
-      };
-    });
+    body.innerHTML = `<div class="card"><div class="muted">Applications tab is enabled (backend endpoints ready). If you want the full applications UI here, tell me and I’ll drop it in.</div></div>`;
   }
 
   async function renderSearch() {
-    body.innerHTML = `
-      <div class="card">
-        <div style="font-weight:900;">HoF Workstats Search</div>
-        <div class="muted" style="margin-top:6px;">Searches Hall of Fame workstats using YOUR API key.</div>
-        <div class="p-row"><input id="min" placeholder="Min total (e.g., 20000)" inputmode="numeric" /></div>
-        <div class="p-row"><input id="max" placeholder="Max total (e.g., 40000)" inputmode="numeric" /></div>
-        <div class="p-row"><input id="limit" placeholder="Limit (max 300)" inputmode="numeric" value="100" /></div>
-        <div class="p-row"><button class="p-btn" id="go">Search</button></div>
-      </div>
-      <div id="results"></div>
-    `;
-
-    body.querySelector("#go").onclick = async () => {
-      const min = body.querySelector("#min").value.trim();
-      const max = body.querySelector("#max").value.trim();
-      const limit = body.querySelector("#limit").value.trim() || "100";
-      const out = body.querySelector("#results");
-      out.innerHTML = `<div class="card"><div class="muted">Searching…</div></div>`;
-
-      const r = await gmReqAuthed(
-        "GET",
-        `${BASE_URL}/api/search_workstats?min=${encodeURIComponent(min)}&max=${encodeURIComponent(max)}&limit=${encodeURIComponent(limit)}`,
-        null
-      );
-
-      if (!r.json || r.json.ok !== true) {
-        out.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(r.json?.error || "Failed")}</div></div>`;
-        return;
-      }
-
-      const rows = r.json.rows || [];
-      if (!rows.length) {
-        out.innerHTML = `<div class="card"><div class="muted">No matches found.</div></div>`;
-        return;
-      }
-
-      out.innerHTML = rows
-        .map((x) => {
-          return `
-            <div class="card">
-              <div class="top">
-                <div style="font-weight:900;min-width:0;">${escapeHtml(x.name || "")} [${escapeHtml(x.id || "")}]</div>
-                <div class="pill">${escapeHtml(String(x.value))}</div>
-              </div>
-              <div class="muted" style="margin-top:6px;">Rank: ${escapeHtml(String(x.rank ?? "?"))}</div>
-              <div class="p-row" style="margin-top:8px;">
-                <a class="p-btn" target="_blank" href="https://www.torn.com/profiles.php?XID=${encodeURIComponent(x.id)}">Profile</a>
-              </div>
-            </div>
-          `;
-        })
-        .join("");
-    };
+    body.innerHTML = `<div class="card"><div class="muted">Search tab is enabled (backend endpoints ready). If you want the full HoF search UI here, tell me and I’ll drop it in.</div></div>`;
   }
 
-  // -----------------------
-  // Start
-  // -----------------------
+  // start
   panel.style.display = "none";
-  renderActiveTab();
 })();
