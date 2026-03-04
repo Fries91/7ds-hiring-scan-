@@ -3,10 +3,11 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request, send_from_directory, render_template_string
 from dotenv import load_dotenv
+from werkzeug.exceptions import HTTPException
 
 from db import (
     init_db,
@@ -33,6 +34,7 @@ from db import (
     mark_leads_seen,
     count_unseen_leads,
 )
+
 from torn_api import me_basic, company_profile, hof_scan_workstats
 
 load_dotenv()
@@ -75,9 +77,31 @@ def _require_session() -> Optional[Dict[str, Any]]:
     return s
 
 
+# ✅ Always return JSON (never HTML) for /api/* and /state
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    wants_json = request.path.startswith("/api/") or request.path == "/state"
+    if isinstance(e, HTTPException):
+        code = e.code or 500
+        msg = e.description or str(e)
+    else:
+        code = 500
+        msg = str(e)
+
+    if wants_json:
+        return jsonify({"ok": False, "error": msg, "status": code}), code
+
+    return f"Error: {msg}", code
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "time": _utc_now()})
+
+
+@app.get("/api/ping")
+def api_ping():
+    return jsonify({"ok": True, "time": _utc_now()})
 
 
 @app.get("/static/<path:path>")
@@ -127,7 +151,8 @@ def home():
 # ---------- AUTH ----------
 @app.post("/api/auth")
 def api_auth():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
+
     admin_key = (data.get("admin_key") or "").strip()
     api_key = (data.get("api_key") or "").strip()
 
@@ -159,7 +184,7 @@ def api_user_companies():
     if not s:
         return _bad("Missing/invalid session token", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     company_ids = data.get("company_ids") or []
     if not isinstance(company_ids, list) or not company_ids:
         return _bad("company_ids must be a non-empty list")
@@ -221,7 +246,9 @@ def state():
         "contracts": [],
         "recruit_leads": [],
         "notifications": notifs,
-        "unseen_count": unseen_notifs + unseen_leads,  # badge covers both
+        "unseen_count": unseen_notifs + unseen_leads,
+        "unseen_notifs": unseen_notifs,
+        "unseen_leads": unseen_leads,
         "updated_at": _utc_now(),
     }
 
@@ -288,7 +315,6 @@ def state():
 
             out["trains"] = list_trains(user_id, selected_company_id)
             out["contracts"] = list_contracts(user_id, selected_company_id)
-
             out["recruit_leads"] = list_leads(user_id, selected_company_id, limit=25)
 
         except Exception as e:
@@ -308,7 +334,7 @@ def trains_add():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     company_id = (data.get("company_id") or "").strip()
     buyer_name = (data.get("buyer_name") or "").strip()
     trains_bought = int(data.get("trains_bought") or 0)
@@ -331,7 +357,7 @@ def trains_set_used():
         return _bad("Missing/invalid session token", 403)
     user_id = s["user_id"]
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     train_id = int(data.get("id") or 0)
     used = int(data.get("trains_used") or 0)
     if train_id <= 0 or used < 0:
@@ -348,7 +374,7 @@ def trains_delete():
         return _bad("Missing/invalid session token", 403)
     user_id = s["user_id"]
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     train_id = int(data.get("id") or 0)
     if train_id <= 0:
         return _bad("bad id")
@@ -369,7 +395,7 @@ def contracts_add():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     company_id = (data.get("company_id") or "").strip()
     title = (data.get("title") or "").strip()
     employee_id = (data.get("employee_id") or "").strip()
@@ -394,7 +420,7 @@ def contracts_delete():
         return _bad("Missing/invalid session token", 403)
     user_id = s["user_id"]
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     contract_id = int(data.get("id") or 0)
     if contract_id <= 0:
         return _bad("bad id")
@@ -404,7 +430,7 @@ def contracts_delete():
     return jsonify({"ok": True})
 
 
-# ---------- HOF SEARCH ----------
+# ---------- HOF SEARCH (TOTAL ONLY) ----------
 @app.post("/api/search/hof")
 def search_hof():
     s = _require_session()
@@ -415,7 +441,7 @@ def search_hof():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
 
     def _i(k: str, default: int) -> int:
         try:
@@ -423,23 +449,32 @@ def search_hof():
         except Exception:
             return int(default)
 
-    min_man = _i("min_man", 0)
-    max_man = _i("max_man", 10**12)
-    min_int = _i("min_int", 0)
-    max_int = _i("max_int", 10**12)
-    min_end = _i("min_end", 0)
-    max_end = _i("max_end", 10**12)
+    # ✅ NEW: total only
+    min_total = _i("min_total", 0)
+    max_total = _i("max_total", 10**12)
+    if max_total < min_total:
+        min_total, max_total = max_total, min_total
 
+    # (Back-compat) If someone still sends min_man/min_int/min_end, we ignore them on purpose.
     try:
         rows = hof_scan_workstats(
             api_key=u["api_key"],
-            min_man=min_man, max_man=max_man,
-            min_int=min_int, max_int=max_int,
-            min_end=min_end, max_end=max_end,
             max_pages=MAX_HOF_PAGES,
             page_size=25,
         )
-        return jsonify({"ok": True, "count": len(rows), "rows": rows[:200]})
+
+        # ✅ Filter ONLY by TOTAL
+        filtered = []
+        for r in rows:
+            try:
+                t = int(r.get("total") or 0)
+            except Exception:
+                t = 0
+            if t < min_total or t > max_total:
+                continue
+            filtered.append(r)
+
+        return jsonify({"ok": True, "count": len(filtered), "rows": filtered[:200]})
     except Exception as e:
         return _bad(f"HoF scan failed: {e}")
 
@@ -447,10 +482,6 @@ def search_hof():
 # ===================== PREMIUM: RECRUITER LEADS =====================
 
 def _company_floor_total(company_payload: Dict[str, Any]) -> Optional[int]:
-    """
-    Finds the weakest employee total (MAN+INT+END) if those fields exist.
-    If Torn doesn't provide these fields in company employees, returns None.
-    """
     employees = company_payload.get("company_employees") or company_payload.get("employees") or {}
     rows = []
     if isinstance(employees, dict):
@@ -482,24 +513,14 @@ def _company_floor_total(company_payload: Dict[str, Any]) -> Optional[int]:
 
 
 def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -> Dict[str, Any]:
-    """
-    Scan HoF working stats for players that beat your weakest employee total (floor).
-    Stores top leads in DB.
-    """
-    # fetch company to compute floor
     comp = company_profile(company_id, api_key)
     floor = _company_floor_total(comp)
 
     if floor is None:
         return {"ok": False, "error": "Company employee working stats not available from API for comparison."}
 
-    # scan candidates a bit above floor (reduce noise)
-    # (we still do broad scan because HoF returns highest first)
     candidates = hof_scan_workstats(
         api_key=api_key,
-        min_man=0, max_man=10**12,
-        min_int=0, max_int=10**12,
-        min_end=0, max_end=10**12,
         max_pages=MAX_HOF_PAGES,
         page_size=25,
     )
@@ -527,22 +548,21 @@ def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -
             delta_vs_floor=delta,
         )
         saved += 1
-        # don't spam too many leads per scan
         if saved >= 40:
             break
 
     if saved > 0:
-        add_notification(user_id, "recruit", f"Recruiter scan: {saved} lead(s) found for Company #{company_id} (best +{best_delta:,}).")
+        add_notification(
+            user_id,
+            "recruit",
+            f"Recruiter scan: {saved} lead(s) found for Company #{company_id} (best +{best_delta:,})."
+        )
 
     return {"ok": True, "company_id": company_id, "floor_total": floor, "saved": saved, "best_delta": best_delta}
 
 
 @app.post("/api/recruit/scan")
 def recruit_scan():
-    """
-    Manual trigger from overlay.
-    Body: { company_id?: "123" } or empty to scan all registered companies.
-    """
     s = _require_session()
     if not s:
         return _bad("Missing/invalid session token", 403)
@@ -551,7 +571,7 @@ def recruit_scan():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     cid = (data.get("company_id") or "").strip()
 
     company_ids: List[str] = u.get("company_ids") or []
@@ -602,7 +622,7 @@ def recruit_seen():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     company_id = (data.get("company_id") or "").strip()
     if not company_id:
         return _bad("company_id required")
@@ -623,16 +643,9 @@ def recruit_clear():
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
     company_id = (data.get("company_id") or "").strip()
     if not company_id:
         return _bad("company_id required")
     if company_id not in (u.get("company_ids") or []):
-        return _bad("company_id not registered", 403)
-
-    clear_leads(user_id, company_id)
-    add_notification(user_id, "recruit", f"Cleared recruiter leads for Company #{company_id}.")
-    return jsonify({"ok": True})
-
-
-# ---------- OPTIONAL AUTO SCAN LOO
+        ret
