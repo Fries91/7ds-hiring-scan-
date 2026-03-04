@@ -3,7 +3,7 @@ import json
 import sqlite3
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 DB_PATH = os.getenv("DB_PATH", "hub.db")
 
@@ -90,7 +90,6 @@ def init_db():
         """
     )
 
-    # Recruit leads (premium killer feature)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recruit_leads (
