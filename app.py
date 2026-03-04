@@ -1,10 +1,8 @@
 import os
 import re
-import time
-import sqlite3
 import secrets
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 
 from flask import Flask, jsonify, request
 
@@ -36,10 +34,12 @@ from db import (
 
 app = Flask(__name__)
 
-DB_PATH = (os.getenv("DB_PATH") or "hiring.db").strip()
+DB_PATH = (os.getenv("DB_PATH") or "/var/data/hiring.db").strip()
 ADMIN_KEYS = [k.strip() for k in (os.getenv("ADMIN_KEYS") or "").split(",") if k.strip()]
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS") or "2592000")  # 30 days
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS") or "60")  # per-user small cache
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS") or "60")  # small cache for heavy endpoints
+
+_DB_INIT = False
 
 
 def utc() -> str:
@@ -51,14 +51,14 @@ def _json_error(msg: str, code: int = 400):
 
 
 def _require_admin_key(admin_key: str) -> bool:
-    # If ADMIN_KEYS is empty, nobody can auth (fail closed)
+    # If ADMIN_KEYS empty => fail closed
     if not ADMIN_KEYS:
         return False
     return admin_key in ADMIN_KEYS
 
 
 def _get_token_from_request() -> str:
-    # Prefer header, allow query for convenience
+    # Prefer header, allow query
     tok = (request.headers.get("X-Session-Token") or "").strip()
     if not tok:
         tok = (request.args.get("token") or "").strip()
@@ -69,7 +69,7 @@ def require_session() -> Dict[str, Any]:
     tok = _get_token_from_request()
     if not tok:
         raise PermissionError("missing token")
-    user = get_user_by_token(DB_PATH, tok, SESSION_TTL_SECONDS)
+    user = get_user_by_token(DB_PATH, tok, SESSION_TTL_SECONDS, now_iso=utc())
     if not user:
         raise PermissionError("invalid/expired token")
     return user
@@ -77,7 +77,10 @@ def require_session() -> Dict[str, Any]:
 
 @app.before_request
 def boot_once():
-    init_db(DB_PATH)
+    global _DB_INIT
+    if not _DB_INIT:
+        init_db(DB_PATH)
+        _DB_INIT = True
 
 
 @app.get("/")
@@ -95,7 +98,7 @@ def index():
         "POST  /api/trains/delete\n"
         "GET   /api/applicant\n"
         "GET   /api/search_workstats\n\n"
-        "Use the userscript (static/shield.user.js) to access UI.\n",
+        "Use the userscript to access UI.\n",
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
@@ -135,7 +138,6 @@ def api_auth():
     if not user_id:
         return _json_error("could not read user_id from api key", 401)
 
-    # Create session token (random)
     token = secrets.token_urlsafe(32)
 
     upsert_user(
@@ -148,13 +150,7 @@ def api_auth():
         last_seen_at=utc(),
     )
 
-    return jsonify(
-        {
-            "ok": True,
-            "token": token,
-            "user": {"id": user_id, "name": name},
-        }
-    )
+    return jsonify({"ok": True, "token": token, "user": {"id": user_id, "name": name}})
 
 
 @app.post("/api/user/companies")
@@ -165,16 +161,15 @@ def api_user_companies():
         return _json_error(str(e), 401)
 
     body = request.get_json(silent=True) or {}
-    company_ids_raw = (body.get("company_ids") or "").strip()
+    company_ids_raw = body.get("company_ids")
 
-    # Accept "123,456" or array
     ids: List[str] = []
-    if isinstance(body.get("company_ids"), list):
-        ids = [str(x).strip() for x in body["company_ids"] if str(x).strip()]
+    if isinstance(company_ids_raw, list):
+        ids = [str(x).strip() for x in company_ids_raw if str(x).strip()]
     else:
-        ids = [c.strip() for c in company_ids_raw.split(",") if c.strip()]
+        raw = (str(company_ids_raw or "")).strip()
+        ids = [c.strip() for c in raw.split(",") if c.strip()]
 
-    # Normalize digits only
     ids = [re.sub(r"\D+", "", c) for c in ids]
     ids = [c for c in ids if c]
 
@@ -186,16 +181,10 @@ def api_user_companies():
 # APPLICATIONS (pull on demand from user events)
 # ------------------------
 def _extract_application_events(events_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Torn user events contain strings like '... applied to your company ... [123456]'
-    This keeps it broad (schema changes safe).
-    """
     events = events_payload.get("events", {}) or {}
     rows: List[Dict[str, Any]] = []
-
     id_pattern = re.compile(r"\[(\d+)\]")
 
-    # events is usually dict { "event_id": {event,...} }
     for k, v in events.items():
         try:
             eid = int(k)
@@ -203,8 +192,10 @@ def _extract_application_events(events_payload: Dict[str, Any]) -> List[Dict[str
             continue
         if not isinstance(v, dict):
             continue
+
         text = (v.get("event") or "").strip()
         low = text.lower()
+
         if ("appl" in low or "apply" in low) and "company" in low:
             m = id_pattern.search(text)
             applicant_id = m.group(1) if m else None
@@ -216,6 +207,7 @@ def _extract_application_events(events_payload: Dict[str, Any]) -> List[Dict[str
                     "created_at": utc(),
                 }
             )
+
     return rows
 
 
@@ -226,7 +218,6 @@ def api_applications():
     except PermissionError as e:
         return _json_error(str(e), 401)
 
-    # Pull latest events and upsert applications (fast; Torn returns recent events only)
     try:
         events_payload = get_user_events(user["api_key"])
         new_rows = _extract_application_events(events_payload)
@@ -291,7 +282,7 @@ def api_companies():
             )
         except TornAPIError as e:
             rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": str(e)})
-        except Exception as e:
+        except Exception:
             rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": "fetch failed"})
 
     data = {"updated_at": utc(), "rows": rows}
@@ -309,9 +300,7 @@ def api_trains_list():
     except PermissionError as e:
         return _json_error(str(e), 401)
 
-    company_id = (request.args.get("company_id") or "").strip()
-    company_id = re.sub(r"\D+", "", company_id)
-
+    company_id = re.sub(r"\D+", "", (request.args.get("company_id") or "").strip())
     if not company_id:
         return _json_error("missing company_id", 400)
 
