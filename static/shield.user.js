@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (Multi-User Auth + No Duplicates + Click Toggle + Draggable)
+// @name         Company Hub 💼 (Multi-User + Disk + HoF Auto-Offset Search)
 // @namespace    sevends-hiring-scan
-// @version      3.0.1
-// @description  Works with app.py multi-user: POST /api/auth {admin_key, api_key} -> X-Session-Token. No duplicates. Badge click open/close. Draggable. High-value theme.
+// @version      3.1.0
+// @description  Works with sevends-hiring-scan.onrender.com multi-user backend. No duplicates. Badge click open/close. Draggable. Companies/Trains/Apps/Search. HoF Search includes Auto-Find Offset.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -16,7 +16,7 @@
 (function () {
   "use strict";
 
-  // ✅ LOCKED BASE URL (no asking, no prompts)
+  // ✅ LOCKED BASE URL
   const BASE_URL = "https://sevends-hiring-scan.onrender.com";
 
   // ✅ Element IDs
@@ -25,8 +25,8 @@
   const STYLE_ID = "companyhub-style";
 
   // ✅ Strong de-dupe: global flag + remove any existing nodes
-  if (window.__COMPANY_HUB_V3__) return;
-  window.__COMPANY_HUB_V3__ = true;
+  if (window.__COMPANY_HUB_V31__) return;
+  window.__COMPANY_HUB_V31__ = true;
 
   // Remove any leftover elements from older script runs/versions
   const oldBadge = document.getElementById(BADGE_ID);
@@ -96,7 +96,7 @@
           try {
             json = JSON.parse(res.responseText || "{}");
           } catch {}
-          resolve({ status: res.status, json });
+          resolve({ status: res.status, json, raw: res.responseText || "" });
         },
         onerror: () => reject(new Error("network error")),
       });
@@ -116,6 +116,15 @@
     const out = prompt(label, currentVal || "");
     if (out === null) return null;
     return String(out).trim();
+  }
+
+  function toInt(val, fallback) {
+    const n = parseInt(String(val || "").trim(), 10);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
   }
 
   // -----------------------
@@ -275,6 +284,7 @@
       }
       .ch-btn.primary{ background:rgba(16,185,129,0.16); border-color:rgba(16,185,129,0.25); }
       .ch-btn.red{ background:rgba(239,68,68,0.16); border-color:rgba(239,68,68,0.25); }
+      .ch-btn.gold{ background:rgba(212,175,55,0.16); border-color:rgba(212,175,55,0.28); color:rgba(247,231,169,0.95); }
 
       .card{
         background: radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.07), transparent 45%),
@@ -314,6 +324,12 @@
       .listrow .left{ min-width:0; }
       .listrow .left .t{ font-weight:950; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
       .listrow .left .s{ font-size:11px; color:var(--hv-muted); margin-top:2px; }
+      .hint{
+        font-size:11px;
+        color:rgba(247,231,169,0.85);
+        font-weight:800;
+        margin-top:6px;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -448,7 +464,7 @@
 
     function onDown(ev) {
       const t = ev.target;
-      if (t && (t.tagName === "BUTTON" || t.closest("button") || t.tagName === "INPUT" || t.tagName === "SELECT")) return;
+      if (t && (t.tagName === "BUTTON" || t.closest("button") || t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "A")) return;
 
       dragging = true;
       const pt = ev.touches ? ev.touches[0] : ev;
@@ -839,40 +855,229 @@
     });
   }
 
-  // ---------------- Search ----------------
+  // ---------------- Search (HoF) with AUTO OFFSET ----------------
+  async function hofSearch(minv, maxv, lim, off, pg) {
+    return authed(
+      "GET",
+      `/api/search_workstats?min=${encodeURIComponent(minv)}&max=${encodeURIComponent(maxv)}&limit=${encodeURIComponent(lim)}&offset=${encodeURIComponent(off)}&pages=${encodeURIComponent(pg)}`,
+      null
+    );
+  }
+
+  function summarizeRange(resJson) {
+    const rows = resJson?.rows || [];
+    let minVal = null, maxVal = null;
+    for (const r of rows) {
+      const v = Number(r?.value);
+      if (!Number.isFinite(v)) continue;
+      if (minVal === null || v < minVal) minVal = v;
+      if (maxVal === null || v > maxVal) maxVal = v;
+    }
+    return { rowsCount: rows.length, minVal, maxVal };
+  }
+
+  async function autoFindOffset(minWanted, maxWanted, limitWanted, outEl, opts) {
+    // Strategy: probe offsets progressively until we find a page-range that overlaps [minWanted..maxWanted],
+    // then run a proper scan starting from that offset with user pages value.
+    const step = opts.step;
+    const maxOffset = opts.maxOffset;
+    const probePages = opts.probePages;
+    const tries = Math.ceil(maxOffset / step);
+
+    // Start with a few good common guesses first
+    const seed = [0, 20000, 50000, 80000, 120000, 160000, 220000, 300000].filter((x) => x <= maxOffset);
+    const visited = new Set();
+
+    function log(msg) {
+      outEl.innerHTML = `
+        <div class="card">
+          <div class="headline">Auto-Find Offset</div>
+          <div class="muted" style="margin-top:6px;">${escapeHtml(msg)}</div>
+        </div>
+      ` + outEl.innerHTML;
+    }
+
+    let bestCandidate = null;
+
+    async function probe(offset) {
+      visited.add(offset);
+      outEl.innerHTML = `
+        <div class="card">
+          <div class="headline">Auto-Find Offset</div>
+          <div class="muted" style="margin-top:6px;">
+            Probing offset <b>${escapeHtml(String(offset))}</b> (pages=${escapeHtml(String(probePages))})…
+          </div>
+        </div>
+      `;
+
+      const res = await hofSearch(minWanted, maxWanted, Math.min(limitWanted, 50), offset, probePages);
+
+      if (res.status === 401) {
+        GM_setValue(K_TOKEN, "");
+        return { ok: false, fatal: true, error: "Session expired. Re-login." };
+      }
+
+      if (!res.json || res.json.ok !== true) {
+        return { ok: false, fatal: false, error: res.json?.error || "Probe failed" };
+      }
+
+      const summary = summarizeRange(res.json);
+      const overlap =
+        summary.maxVal !== null &&
+        summary.minVal !== null &&
+        !(summary.maxVal < minWanted || summary.minVal > maxWanted);
+
+      return { ok: true, res, summary, overlap };
+    }
+
+    // 1) Seed probes
+    for (const off of seed) {
+      if (visited.has(off)) continue;
+      const p = await probe(off);
+      if (!p.ok) {
+        if (p.fatal) return { ok: false, error: p.error, fatal: true };
+        // keep going on non-fatal
+        log(`Probe failed at offset ${off}: ${p.error}`);
+        await sleep(250);
+        continue;
+      }
+
+      if (p.summary.rowsCount > 0) {
+        // If it already found matches, we’re done: use this offset
+        return { ok: true, foundOffset: off, note: "Matches already found in probe." };
+      }
+
+      // no matches, but we can still use page min/max as guidance if present
+      if (p.summary.minVal !== null && p.summary.maxVal !== null) {
+        // bestCandidate: closest page range to target window
+        const dist =
+          (p.summary.maxVal < minWanted) ? (minWanted - p.summary.maxVal) :
+          (p.summary.minVal > maxWanted) ? (p.summary.minVal - maxWanted) :
+          0;
+
+        if (!bestCandidate || dist < bestCandidate.dist) {
+          bestCandidate = { off, dist, range: [p.summary.minVal, p.summary.maxVal] };
+        }
+
+        if (p.overlap) {
+          // Page range overlaps but no exact matches; still a great starting point
+          return { ok: true, foundOffset: off, note: "Probe range overlaps target window." };
+        }
+      }
+
+      await sleep(250);
+    }
+
+    // 2) Progressive stepping (coarse scan)
+    for (let i = 0; i < tries; i++) {
+      const off = i * step;
+      if (visited.has(off)) continue;
+
+      const p = await probe(off);
+      if (!p.ok) {
+        if (p.fatal) return { ok: false, error: p.error, fatal: true };
+        log(`Probe failed at offset ${off}: ${p.error}`);
+        await sleep(250);
+        continue;
+      }
+
+      if (p.summary.rowsCount > 0) {
+        return { ok: true, foundOffset: off, note: "Matches found during step scan." };
+      }
+
+      if (p.summary.minVal !== null && p.summary.maxVal !== null) {
+        const dist =
+          (p.summary.maxVal < minWanted) ? (minWanted - p.summary.maxVal) :
+          (p.summary.minVal > maxWanted) ? (p.summary.minVal - maxWanted) :
+          0;
+
+        if (!bestCandidate || dist < bestCandidate.dist) {
+          bestCandidate = { off, dist, range: [p.summary.minVal, p.summary.maxVal] };
+        }
+
+        if (p.overlap) {
+          return { ok: true, foundOffset: off, note: "Overlapping range discovered during step scan." };
+        }
+
+        // If the entire page is already below minWanted, further offsets likely even lower -> stop early
+        if (p.summary.maxVal < minWanted) {
+          return {
+            ok: true,
+            foundOffset: off,
+            note: "Values dropped below your min — using this offset as last best (try lowering min or offset).",
+          };
+        }
+      }
+
+      await sleep(250);
+    }
+
+    // fallback: bestCandidate or 0
+    if (bestCandidate) {
+      return { ok: true, foundOffset: bestCandidate.off, note: `Best nearby range was ~${bestCandidate.range[0]}-${bestCandidate.range[1]}` };
+    }
+    return { ok: true, foundOffset: 0, note: "Could not infer offset; defaulting to 0." };
+  }
+
   async function renderSearch() {
     body.innerHTML = `
       <div class="card">
         <div class="headline">HoF Workstats Search</div>
-        <div class="muted" style="margin-top:6px;">Scans HoF pages using your API key.</div>
+        <div class="muted" style="margin-top:6px;">
+          If you get 0 results, HoF is huge — use <b>Offset</b> or hit <b>Auto-Find Offset</b>.
+        </div>
+        <div class="hint">
+          Tips: Try Offset 20000 / 50000 / 80000 if you don’t want Auto.
+        </div>
         <div class="line"></div>
+
         <div class="mini">Min Total Workstats</div>
         <div class="row"><input class="ch-in" id="minv" placeholder="e.g. 50000" inputmode="numeric"></div>
+
         <div class="mini" style="margin-top:10px;">Max Total Workstats</div>
         <div class="row"><input class="ch-in" id="maxv" placeholder="e.g. 120000" inputmode="numeric"></div>
+
         <div class="mini" style="margin-top:10px;">Limit (1-300)</div>
         <div class="row"><input class="ch-in" id="lim" placeholder="100" inputmode="numeric" value="100"></div>
-        <div class="row"><button class="ch-btn primary" id="runSearch">Search</button></div>
+
+        <div class="mini" style="margin-top:10px;">Offset (rank position)</div>
+        <div class="row"><input class="ch-in" id="off" placeholder="0 (top) • try 20000 / 50000 / 80000" inputmode="numeric" value="0"></div>
+
+        <div class="mini" style="margin-top:10px;">Pages to scan (1-300)</div>
+        <div class="row"><input class="ch-in" id="pg" placeholder="50" inputmode="numeric" value="50"></div>
+
+        <div class="row">
+          <button class="ch-btn primary" id="runSearch">Search</button>
+          <button class="ch-btn gold" id="autoOffset">Auto-Find Offset</button>
+        </div>
       </div>
       <div id="searchOut"></div>
     `;
 
-    body.querySelector("#runSearch").onclick = async () => {
-      const out = body.querySelector("#searchOut");
-      const minv = (body.querySelector("#minv").value || "").trim();
-      const maxv = (body.querySelector("#maxv").value || "").trim();
-      const lim = (body.querySelector("#lim").value || "100").trim();
+    const out = body.querySelector("#searchOut");
 
-      out.innerHTML = `<div class="card"><div class="muted">Searching…</div></div>`;
-      const res = await authed(
-        "GET",
-        `/api/search_workstats?min=${encodeURIComponent(minv)}&max=${encodeURIComponent(maxv)}&limit=${encodeURIComponent(lim)}`,
-        null
-      );
+    async function run(minv, maxv, lim, off, pg, label) {
+      out.innerHTML = `<div class="card"><div class="muted">${escapeHtml(label || "Searching…")}</div></div>`;
 
-      if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
+      const res = await hofSearch(minv, maxv, lim, off, pg);
+
+      if (res.status === 401) {
+        GM_setValue(K_TOKEN, "");
+        return renderActiveTab();
+      }
+
       if (!res.json || res.json.ok !== true) {
-        out.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
+        out.innerHTML = `
+          <div class="card">
+            <div class="headline">Error</div>
+            <div class="muted" style="margin-top:6px;">
+              ${escapeHtml(res.json?.error || "Failed")}
+            </div>
+            <div class="muted" style="margin-top:8px;">
+              If it says missing offset/pages, update your backend /api/search_workstats to accept them.
+            </div>
+          </div>
+        `;
         return;
       }
 
@@ -881,14 +1086,23 @@
         <div class="card">
           <div class="headline">Results</div>
           <div class="muted" style="margin-top:6px;">
-            Count: ${escapeHtml(String(res.json.count || rows.length))} • Pages: ${escapeHtml(String(res.json.scanned_pages || "?"))}
+            Count: ${escapeHtml(String(res.json.count || rows.length))}
+            • Offset: ${escapeHtml(String(res.json.offset ?? off))}
+            • Pages scanned: ${escapeHtml(String(res.json.scanned_pages || "?"))}
             ${res.json.cached ? " • cached" : ""}
           </div>
         </div>
       `;
 
       if (!rows.length) {
-        html += `<div class="card"><div class="muted">No matches.</div></div>`;
+        html += `
+          <div class="card">
+            <div class="headline">No matches</div>
+            <div class="muted" style="margin-top:6px;">
+              Try Auto-Find Offset or use offsets like 20000 / 50000 / 80000.
+            </div>
+          </div>
+        `;
         out.innerHTML = html;
         return;
       }
@@ -897,7 +1111,7 @@
       for (const r of rows.slice(0, 100)) {
         const name = r.name || "Player";
         const id = r.id || "";
-        const total = r.value ?? r.total ?? "";
+        const total = r.value ?? "";
         html += `
           <div class="listrow">
             <div class="left">
@@ -912,6 +1126,70 @@
       }
       html += `</div>`;
       out.innerHTML = html;
+    }
+
+    body.querySelector("#runSearch").onclick = async () => {
+      const minv = (body.querySelector("#minv").value || "").trim();
+      const maxv = (body.querySelector("#maxv").value || "").trim();
+      const lim  = (body.querySelector("#lim").value || "100").trim();
+      const off  = (body.querySelector("#off").value || "0").trim();
+      const pg   = (body.querySelector("#pg").value || "50").trim();
+      await run(minv, maxv, lim, off, pg, "Searching…");
+    };
+
+    body.querySelector("#autoOffset").onclick = async () => {
+      const minWanted = toInt(body.querySelector("#minv").value, NaN);
+      const maxWanted = toInt(body.querySelector("#maxv").value, NaN);
+      const lim = toInt(body.querySelector("#lim").value, 100);
+      const pg = toInt(body.querySelector("#pg").value, 50);
+
+      if (!Number.isFinite(minWanted) || !Number.isFinite(maxWanted)) {
+        out.innerHTML = `<div class="card"><div class="headline">Need min/max</div><div class="muted" style="margin-top:6px;">Enter min and max first, then Auto-Find Offset.</div></div>`;
+        return;
+      }
+
+      out.innerHTML = `<div class="card"><div class="muted">Auto-Find Offset running…</div></div>`;
+
+      const auto = await autoFindOffset(
+        minWanted,
+        maxWanted,
+        lim,
+        out,
+        {
+          step: 20000,
+          maxOffset: 300000,
+          probePages: 1,
+        }
+      );
+
+      if (!auto.ok) {
+        if (auto.fatal) {
+          out.innerHTML = `<div class="card"><div class="headline">Session</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.error || "Session expired")}</div></div>`;
+          return;
+        }
+        out.innerHTML = `<div class="card"><div class="headline">Auto-Find failed</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.error || "Failed")}</div></div>`;
+        return;
+      }
+
+      const foundOffset = auto.foundOffset ?? 0;
+      body.querySelector("#off").value = String(foundOffset);
+
+      // run full search starting from found offset using user pages
+      await run(
+        String(minWanted),
+        String(maxWanted),
+        String(lim),
+        String(foundOffset),
+        String(pg),
+        `Auto-Find picked offset ${foundOffset}. Searching with pages=${pg}…`
+      );
+
+      // add a tiny note at the top (keeps results)
+      if (auto.note) {
+        out.innerHTML =
+          `<div class="card"><div class="headline">Auto-Find Note</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.note)}</div></div>` +
+          out.innerHTML;
+      }
     };
   }
 
