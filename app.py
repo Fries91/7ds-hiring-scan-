@@ -1,568 +1,404 @@
 import os
 import re
 import time
-import threading
 import sqlite3
+import secrets
 from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
 
-import requests
 from flask import Flask, jsonify, request
-from dotenv import load_dotenv
 
-from torn_api import get_user_workstats, normalize_workstats
+from torn_api import (
+    TornAPIError,
+    get_user_basic,
+    get_user_events,
+    get_company_employees,
+    get_user_workstats,
+    normalize_workstats,
+    search_hof_workstats_v2,
+)
 
-load_dotenv()
+from db import (
+    init_db,
+    upsert_user,
+    get_user_by_token,
+    set_user_company_ids,
+    get_user_company_ids,
+    upsert_application_rows,
+    list_applications,
+    update_application_status,
+    add_train_entry,
+    list_train_entries,
+    delete_train_entry,
+    cache_get,
+    cache_set,
+)
+
 app = Flask(__name__)
 
-TORN_API_KEY = (os.getenv("TORN_API_KEY") or "").strip()
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
-COMPANY_IDS = [c.strip() for c in (os.getenv("COMPANY_IDS") or "").split(",") if c.strip()]
-
 DB_PATH = (os.getenv("DB_PATH") or "hiring.db").strip()
-POLL_SECONDS = int(os.getenv("POLL_SECONDS") or "45")
-COMPANY_POLL_SECONDS = int(os.getenv("COMPANY_POLL_SECONDS") or "90")
+ADMIN_KEYS = [k.strip() for k in (os.getenv("ADMIN_KEYS") or "").split(",") if k.strip()]
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS") or "2592000")  # 30 days
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS") or "60")  # per-user small cache
 
-API_V1_BASE = "https://api.torn.com"
-API_V2_BASE = "https://api.torn.com/v2"
 
-# ------------------------
-# helpers
-# ------------------------
-
-def utc():
+def utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def db():
-    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
 
-def init_db():
-    con = db()
-    cur = con.cursor()
+def _json_error(msg: str, code: int = 400):
+    return jsonify({"ok": False, "error": msg}), code
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        k TEXT PRIMARY KEY,
-        v TEXT
-    )
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS applications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id INTEGER UNIQUE,
-        company_id TEXT,
-        applicant_id TEXT,
-        raw_text TEXT,
-        status TEXT DEFAULT 'new',
-        created_at TEXT
-    )
-    """)
+def _require_admin_key(admin_key: str) -> bool:
+    # If ADMIN_KEYS is empty, nobody can auth (fail closed)
+    if not ADMIN_KEYS:
+        return False
+    return admin_key in ADMIN_KEYS
 
-    # Train tracker (server-side, shared)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS train_entries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company_id TEXT NOT NULL,
-        buyer TEXT NOT NULL,
-        trains INTEGER NOT NULL,
-        note TEXT,
-        created_at TEXT
-    )
-    """)
 
-    con.commit()
-    con.close()
+def _get_token_from_request() -> str:
+    # Prefer header, allow query for convenience
+    tok = (request.headers.get("X-Session-Token") or "").strip()
+    if not tok:
+        tok = (request.args.get("token") or "").strip()
+    return tok
 
-def get_setting(k, default="0"):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT v FROM settings WHERE k=?", (k,))
-    row = cur.fetchone()
-    con.close()
-    return row["v"] if row else default
 
-def set_setting(k, v):
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (k, v))
-    con.commit()
-    con.close()
+def require_session() -> Dict[str, Any]:
+    tok = _get_token_from_request()
+    if not tok:
+        raise PermissionError("missing token")
+    user = get_user_by_token(DB_PATH, tok, SESSION_TTL_SECONDS)
+    if not user:
+        raise PermissionError("invalid/expired token")
+    return user
 
-def require_admin():
-    # If ADMIN_TOKEN is empty, admin guard is disabled
-    if not ADMIN_TOKEN:
-        return None
-    got = (request.args.get("admin", "") or "").strip()
-    if got != ADMIN_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
-
-# ------------------------
-# EVENT POLLING (applications)
-# ------------------------
-
-ID_PATTERN = re.compile(r"\[(\d+)\]")
-
-def poll_events_loop():
-    session = requests.Session()
-
-    while True:
-        try:
-            if not TORN_API_KEY:
-                time.sleep(10)
-                continue
-
-            last = int(get_setting("last_event_id", "0"))
-
-            r = session.get(
-                f"{API_V1_BASE}/user/",
-                params={"selections": "events", "key": TORN_API_KEY},
-                timeout=20,
-            )
-            r.raise_for_status()
-            data = r.json()
-
-            events = data.get("events", {}) or {}
-            ids = sorted(int(i) for i in events.keys() if str(i).isdigit())
-
-            max_seen = last
-
-            for eid in ids:
-                if eid <= last:
-                    continue
-
-                ev = events.get(str(eid), {}) or {}
-                text = (ev.get("event") or "").strip()
-
-                low = text.lower()
-                if "appl" in low and "company" in low:
-                    match = ID_PATTERN.search(text)
-                    applicant_id = match.group(1) if match else None
-
-                    con = db()
-                    cur = con.cursor()
-                    cur.execute("""
-                        INSERT OR IGNORE INTO applications
-                        (event_id, company_id, applicant_id, raw_text, status, created_at)
-                        VALUES (?,?,?,?,?,?)
-                    """, (eid, None, applicant_id, text, "new", utc()))
-                    con.commit()
-                    con.close()
-
-                if eid > max_seen:
-                    max_seen = eid
-
-            if max_seen > last:
-                set_setting("last_event_id", str(max_seen))
-
-        except Exception as e:
-            print("[poll_events_loop] ERROR:", repr(e), flush=True)
-
-        time.sleep(POLL_SECONDS)
-
-# ------------------------
-# COMPANY + EMPLOYEE POLLING
-# ------------------------
-
-_company_lock = threading.Lock()
-_company_state = {
-    "updated_at": None,
-    "rows": []  # [{company_id, name, employees:[{id,name,position,days_in_company,status}]}]
-}
-
-def _parse_employees(payload: dict):
-    company = payload.get("company", payload) if isinstance(payload, dict) else {}
-    name = company.get("name") or company.get("company_name") or company.get("company") or None
-
-    employees_obj = company.get("employees") or company.get("employee") or {}
-    employees = []
-
-    if isinstance(employees_obj, dict):
-        for k, v in employees_obj.items():
-            if not isinstance(v, dict):
-                continue
-            uid = str(v.get("id") or k or "")
-            employees.append({
-                "id": uid,
-                "name": v.get("name") or v.get("username") or "",
-                "position": v.get("position") or v.get("job") or v.get("role") or "",
-                "days_in_company": v.get("days_in_company") or v.get("daysincompany") or v.get("days") or None,
-                "status": v.get("status") or "",
-            })
-    elif isinstance(employees_obj, list):
-        for v in employees_obj:
-            if not isinstance(v, dict):
-                continue
-            uid = str(v.get("id") or "")
-            employees.append({
-                "id": uid,
-                "name": v.get("name") or v.get("username") or "",
-                "position": v.get("position") or v.get("job") or v.get("role") or "",
-                "days_in_company": v.get("days_in_company") or v.get("daysincompany") or v.get("days") or None,
-                "status": v.get("status") or "",
-            })
-
-    employees.sort(key=lambda x: (x.get("position") or "", x.get("name") or ""))
-    return name, employees
-
-def fetch_company(company_id: str, session: requests.Session):
-    url = f"{API_V1_BASE}/company/{company_id}"
-    r = session.get(url, params={"selections": "employees", "key": TORN_API_KEY}, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-def poll_companies_loop():
-    session = requests.Session()
-
-    while True:
-        try:
-            if not TORN_API_KEY or not COMPANY_IDS:
-                time.sleep(10)
-                continue
-
-            rows = []
-            for cid in COMPANY_IDS:
-                try:
-                    payload = fetch_company(cid, session)
-                    name, employees = _parse_employees(payload)
-                    rows.append({
-                        "company_id": str(cid),
-                        "name": name or f"Company {cid}",
-                        "employees": employees,
-                    })
-                except Exception as e:
-                    print(f"[poll_companies_loop] company {cid} ERROR:", repr(e), flush=True)
-                    rows.append({
-                        "company_id": str(cid),
-                        "name": f"Company {cid}",
-                        "employees": [],
-                        "error": str(e),
-                    })
-
-            with _company_lock:
-                _company_state["updated_at"] = utc()
-                _company_state["rows"] = rows
-
-        except Exception as e:
-            print("[poll_companies_loop] ERROR:", repr(e), flush=True)
-
-        time.sleep(COMPANY_POLL_SECONDS)
-
-# ------------------------
-# HOF SEARCH (workstats)
-# ------------------------
-
-# Very lightweight cache to avoid hammering Torn API
-_hof_cache_lock = threading.Lock()
-_hof_cache = {
-    "key": None,
-    "ts": 0.0,
-    "data": None
-}
-
-def _hof_fetch_page(session: requests.Session, offset: int, limit: int):
-    # Torn API v2 hall of fame endpoint
-    # https://api.torn.com/v2/torn/hof?key=XXX&limit=100&offset=0&cat=workstats
-    url = f"{API_V2_BASE}/torn/hof"
-    r = session.get(url, params={
-        "key": TORN_API_KEY,
-        "cat": "workstats",
-        "limit": limit,
-        "offset": offset,
-    }, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-def _hof_extract_entries(payload: dict):
-    """
-    Tries multiple possible schemas, returns list of dict entries.
-    We expect each entry to have:
-      - user_id / id
-      - name
-      - value (workstats)
-      - rank
-    """
-    if not isinstance(payload, dict):
-        return []
-
-    # common candidates
-    for k in ("hof", "hall_of_fame", "rankings", "entries", "data"):
-        v = payload.get(k)
-        if isinstance(v, list):
-            return v
-
-    # sometimes nested
-    if isinstance(payload.get("hall_of_fame"), dict):
-        for k in ("entries", "rankings", "hof"):
-            v = payload["hall_of_fame"].get(k)
-            if isinstance(v, list):
-                return v
-
-    return []
-
-def search_hof_workstats(min_val: int, max_val: int, limit_results: int = 100):
-    """
-    Searches HoF workstats for values between [min_val, max_val].
-    To keep this safe + fast:
-      - scans a bounded number of pages
-      - stops once it collects enough results
-    """
-    if min_val > max_val:
-        min_val, max_val = max_val, min_val
-
-    session = requests.Session()
-
-    found = []
-    scanned_pages = 0
-
-    # You can tweak these to balance speed vs coverage
-    page_limit = 100           # results per page from HoF
-    max_pages = 30             # hard cap API calls (safety)
-    offsets = [i * page_limit for i in range(max_pages)]
-
-    for off in offsets:
-        scanned_pages += 1
-        try:
-            payload = _hof_fetch_page(session, off, page_limit)
-        except Exception as e:
-            print("[hof] fetch error:", repr(e), flush=True)
-            continue
-
-        entries = _hof_extract_entries(payload)
-
-        if not entries:
-            # no entries means end or schema changed; stop to avoid spamming
-            break
-
-        for e in entries:
-            # normalize keys
-            uid = str(e.get("user_id") or e.get("id") or e.get("userid") or "")
-            name = e.get("name") or e.get("username") or ""
-            rank = e.get("rank") or e.get("position") or e.get("place") or None
-
-            # workstats value may be called "value" or "score"
-            raw_val = e.get("value")
-            if raw_val is None:
-                raw_val = e.get("score")
-            if raw_val is None:
-                raw_val = e.get("workstats")
-
-            try:
-                val = int(raw_val)
-            except Exception:
-                continue
-
-            if min_val <= val <= max_val:
-                found.append({
-                    "id": uid,
-                    "name": name,
-                    "rank": rank,
-                    "value": val,
-                })
-
-            if len(found) >= limit_results:
-                return found, scanned_pages
-
-        # OPTIONAL early break if we're clearly beyond the range:
-        # If HoF is sorted descending, once values drop below min_val, later pages will be even smaller.
-        try:
-            # find smallest value on page
-            vals = []
-            for e in entries:
-                raw_val = e.get("value") if e.get("value") is not None else e.get("score")
-                if raw_val is None:
-                    raw_val = e.get("workstats")
-                try:
-                    vals.append(int(raw_val))
-                except Exception:
-                    pass
-            if vals and min(vals) < min_val and max(vals) < min_val:
-                # whole page below min => stop
-                break
-        except Exception:
-            pass
-
-    return found, scanned_pages
-
-# ------------------------
-# safe boot
-# ------------------------
-
-_boot_lock = threading.Lock()
-_booted = False
 
 @app.before_request
 def boot_once():
-    global _booted
-    if _booted:
-        return
-    with _boot_lock:
-        if _booted:
-            return
-        init_db()
-        threading.Thread(target=poll_events_loop, daemon=True).start()
-        threading.Thread(target=poll_companies_loop, daemon=True).start()
-        _booted = True
+    init_db(DB_PATH)
 
-# ------------------------
-# ROUTES
-# ------------------------
 
 @app.get("/")
 def index():
     return (
-        "7DS Hiring Scan is running.\n"
-        "Use /health, /api/applications, /api/companies, /api/trains, /api/search_workstats\n",
+        "7DS*: Peace Hiring Scan is running.\n\n"
+        "Endpoints:\n"
+        "POST  /api/auth\n"
+        "POST  /api/user/companies\n"
+        "GET   /api/applications\n"
+        "POST  /api/applications/status\n"
+        "GET   /api/companies\n"
+        "GET   /api/trains\n"
+        "POST  /api/trains/add\n"
+        "POST  /api/trains/delete\n"
+        "GET   /api/applicant\n"
+        "GET   /api/search_workstats\n\n"
+        "Use the userscript (static/shield.user.js) to access UI.\n",
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
+
 
 @app.get("/health")
 def health():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
-# -------- Applications --------
+
+# ------------------------
+# AUTH
+# ------------------------
+@app.post("/api/auth")
+def api_auth():
+    body = request.get_json(silent=True) or {}
+    admin_key = (body.get("admin_key") or "").strip()
+    api_key = (body.get("api_key") or "").strip()
+
+    if not admin_key or not api_key:
+        return _json_error("missing admin_key/api_key", 400)
+
+    if not _require_admin_key(admin_key):
+        return _json_error("admin key not allowed", 401)
+
+    # Validate Torn key by pulling basic user info
+    try:
+        basic = get_user_basic(api_key)
+    except TornAPIError as e:
+        return _json_error(f"torn api error: {e}", 401)
+    except Exception:
+        return _json_error("failed to validate api key", 401)
+
+    user_id = str(basic.get("player_id") or basic.get("user_id") or basic.get("id") or "")
+    name = (basic.get("name") or basic.get("username") or "").strip()
+
+    if not user_id:
+        return _json_error("could not read user_id from api key", 401)
+
+    # Create session token (random)
+    token = secrets.token_urlsafe(32)
+
+    upsert_user(
+        DB_PATH,
+        user_id=user_id,
+        name=name,
+        api_key=api_key,
+        token=token,
+        token_created_at=utc(),
+        last_seen_at=utc(),
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "token": token,
+            "user": {"id": user_id, "name": name},
+        }
+    )
+
+
+@app.post("/api/user/companies")
+def api_user_companies():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
+
+    body = request.get_json(silent=True) or {}
+    company_ids_raw = (body.get("company_ids") or "").strip()
+
+    # Accept "123,456" or array
+    ids: List[str] = []
+    if isinstance(body.get("company_ids"), list):
+        ids = [str(x).strip() for x in body["company_ids"] if str(x).strip()]
+    else:
+        ids = [c.strip() for c in company_ids_raw.split(",") if c.strip()]
+
+    # Normalize digits only
+    ids = [re.sub(r"\D+", "", c) for c in ids]
+    ids = [c for c in ids if c]
+
+    set_user_company_ids(DB_PATH, user["user_id"], ids)
+    return jsonify({"ok": True, "company_ids": ids})
+
+
+# ------------------------
+# APPLICATIONS (pull on demand from user events)
+# ------------------------
+def _extract_application_events(events_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Torn user events contain strings like '... applied to your company ... [123456]'
+    This keeps it broad (schema changes safe).
+    """
+    events = events_payload.get("events", {}) or {}
+    rows: List[Dict[str, Any]] = []
+
+    id_pattern = re.compile(r"\[(\d+)\]")
+
+    # events is usually dict { "event_id": {event,...} }
+    for k, v in events.items():
+        try:
+            eid = int(k)
+        except Exception:
+            continue
+        if not isinstance(v, dict):
+            continue
+        text = (v.get("event") or "").strip()
+        low = text.lower()
+        if ("appl" in low or "apply" in low) and "company" in low:
+            m = id_pattern.search(text)
+            applicant_id = m.group(1) if m else None
+            rows.append(
+                {
+                    "event_id": eid,
+                    "applicant_id": applicant_id,
+                    "raw_text": text,
+                    "created_at": utc(),
+                }
+            )
+    return rows
+
 
 @app.get("/api/applications")
-def apps():
-    guard = require_admin()
-    if guard:
-        return guard
+def api_applications():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM applications ORDER BY id DESC LIMIT 50")
-    rows = [dict(r) for r in cur.fetchall()]
-    con.close()
-    return {"ok": True, "rows": rows}
+    # Pull latest events and upsert applications (fast; Torn returns recent events only)
+    try:
+        events_payload = get_user_events(user["api_key"])
+        new_rows = _extract_application_events(events_payload)
+        if new_rows:
+            upsert_application_rows(DB_PATH, user["user_id"], new_rows)
+    except TornAPIError as e:
+        return _json_error(f"torn api error: {e}", 400)
+    except Exception:
+        return _json_error("failed to fetch events", 500)
+
+    rows = list_applications(DB_PATH, user["user_id"], limit=60)
+    return jsonify({"ok": True, "rows": rows})
+
 
 @app.post("/api/applications/status")
-def app_status():
-    guard = require_admin()
-    if guard:
-        return guard
+def api_applications_status():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
     body = request.get_json(silent=True) or {}
     app_id = body.get("id")
-    status = body.get("status")
+    status = (body.get("status") or "").strip()
 
     if not app_id or not status:
-        return {"ok": False, "error": "missing id/status"}, 400
+        return _json_error("missing id/status", 400)
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("UPDATE applications SET status=? WHERE id=?", (status, app_id))
-    con.commit()
-    con.close()
-    return {"ok": True}
+    update_application_status(DB_PATH, user["user_id"], int(app_id), status)
+    return jsonify({"ok": True})
 
-# -------- Applicant workstats --------
 
-@app.get("/api/applicant")
-def applicant():
-    guard = require_admin()
-    if guard:
-        return guard
-
-    uid = (request.args.get("id") or "").strip()
-    key = (request.args.get("key") or "").strip()
-
-    if not uid or not key:
-        return {"ok": False, "error": "missing id/key"}, 400
-
-    data = get_user_workstats(uid, key)
-    ws = normalize_workstats(data)
-    return {"ok": True, "workstats": ws}
-
-# -------- Companies + employees --------
-
+# ------------------------
+# COMPANIES + EMPLOYEES (per-user)
+# ------------------------
 @app.get("/api/companies")
-def companies():
-    guard = require_admin()
-    if guard:
-        return guard
+def api_companies():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
-    with _company_lock:
-        payload = {
-            "ok": True,
-            "updated_at": _company_state["updated_at"],
-            "rows": _company_state["rows"],
-        }
-    return payload
+    company_ids = get_user_company_ids(DB_PATH, user["user_id"])
+    if not company_ids:
+        return jsonify({"ok": True, "updated_at": utc(), "rows": [], "note": "No company IDs set for this user."})
 
-# -------- Train tracker --------
+    cache_key = f"companies:{user['user_id']}:{','.join(company_ids)}"
+    cached = cache_get(DB_PATH, cache_key, CACHE_TTL_SECONDS)
+    if cached is not None:
+        return jsonify({"ok": True, "cached": True, **cached})
 
+    rows = []
+    for cid in company_ids:
+        try:
+            payload = get_company_employees(cid, user["api_key"])
+            rows.append(
+                {
+                    "company_id": cid,
+                    "name": payload.get("company_name") or payload.get("name") or f"Company {cid}",
+                    "employees": payload.get("employees") or [],
+                }
+            )
+        except TornAPIError as e:
+            rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": str(e)})
+        except Exception as e:
+            rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": "fetch failed"})
+
+    data = {"updated_at": utc(), "rows": rows}
+    cache_set(DB_PATH, cache_key, data)
+    return jsonify({"ok": True, "cached": False, **data})
+
+
+# ------------------------
+# TRAIN TRACKER (per-user)
+# ------------------------
 @app.get("/api/trains")
-def trains_list():
-    guard = require_admin()
-    if guard:
-        return guard
+def api_trains_list():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
     company_id = (request.args.get("company_id") or "").strip()
-    if not company_id:
-        return {"ok": False, "error": "missing company_id"}, 400
+    company_id = re.sub(r"\D+", "", company_id)
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT id, company_id, buyer, trains, note, created_at
-        FROM train_entries
-        WHERE company_id=?
-        ORDER BY id DESC
-        LIMIT 50
-    """, (company_id,))
-    rows = [dict(r) for r in cur.fetchall()]
-    con.close()
-    return {"ok": True, "rows": rows}
+    if not company_id:
+        return _json_error("missing company_id", 400)
+
+    rows = list_train_entries(DB_PATH, user["user_id"], company_id, limit=80)
+    return jsonify({"ok": True, "rows": rows})
+
 
 @app.post("/api/trains/add")
-def trains_add():
-    guard = require_admin()
-    if guard:
-        return guard
+def api_trains_add():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
     body = request.get_json(silent=True) or {}
-    company_id = (body.get("company_id") or "").strip()
+    company_id = re.sub(r"\D+", "", (body.get("company_id") or "").strip())
     buyer = (body.get("buyer") or "").strip()
     trains = body.get("trains")
     note = (body.get("note") or "").strip()
 
     if not company_id or not buyer or trains is None:
-        return {"ok": False, "error": "missing company_id/buyer/trains"}, 400
+        return _json_error("missing company_id/buyer/trains", 400)
 
     try:
         trains_int = int(trains)
     except Exception:
-        return {"ok": False, "error": "trains must be int"}, 400
+        return _json_error("trains must be int", 400)
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO train_entries(company_id, buyer, trains, note, created_at)
-        VALUES (?,?,?,?,?)
-    """, (company_id, buyer, trains_int, note, utc()))
-    con.commit()
-    con.close()
-    return {"ok": True}
+    add_train_entry(DB_PATH, user["user_id"], company_id, buyer, trains_int, note, utc())
+    return jsonify({"ok": True})
 
-# -------- Search HoF workstats --------
 
+@app.post("/api/trains/delete")
+def api_trains_delete():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
+
+    body = request.get_json(silent=True) or {}
+    entry_id = body.get("id")
+    if not entry_id:
+        return _json_error("missing id", 400)
+
+    delete_train_entry(DB_PATH, user["user_id"], int(entry_id))
+    return jsonify({"ok": True})
+
+
+# ------------------------
+# APPLICANT WORKSTATS (uses user's own key)
+# ------------------------
+@app.get("/api/applicant")
+def api_applicant():
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
+
+    uid = re.sub(r"\D+", "", (request.args.get("id") or "").strip())
+    if not uid:
+        return _json_error("missing id", 400)
+
+    try:
+        payload = get_user_workstats(uid, user["api_key"])
+        ws = normalize_workstats(payload)
+        return jsonify({"ok": True, "workstats": ws})
+    except TornAPIError as e:
+        return _json_error(f"torn api error: {e}", 400)
+    except Exception:
+        return _json_error("failed to fetch workstats", 500)
+
+
+# ------------------------
+# HoF SEARCH (uses user's own key)
+# ------------------------
 @app.get("/api/search_workstats")
 def api_search_workstats():
-    guard = require_admin()
-    if guard:
-        return guard
-
-    if not TORN_API_KEY:
-        return {"ok": False, "error": "TORN_API_KEY not set on server"}, 400
+    try:
+        user = require_session()
+    except PermissionError as e:
+        return _json_error(str(e), 401)
 
     try:
         min_val = int((request.args.get("min") or "").strip())
         max_val = int((request.args.get("max") or "").strip())
     except Exception:
-        return {"ok": False, "error": "min/max must be integers"}, 400
+        return _json_error("min/max must be integers", 400)
 
     try:
         limit_results = int((request.args.get("limit") or "100").strip())
@@ -570,15 +406,17 @@ def api_search_workstats():
     except Exception:
         limit_results = 100
 
-    # cache for 60s per exact query to avoid spam
-    cache_key = f"{min_val}:{max_val}:{limit_results}"
-    now = time.time()
+    cache_key = f"hof:{user['user_id']}:{min_val}:{max_val}:{limit_results}"
+    cached = cache_get(DB_PATH, cache_key, 60)
+    if cached is not None:
+        return jsonify({"ok": True, "cached": True, **cached})
 
-    with _hof_cache_lock:
-        if _hof_cache["key"] == cache_key and (now - _hof_cache["ts"]) < 60 and _hof_cache["data"] is not None:
-            return {"ok": True, "cached": True, **_hof_cache["data"]}
-
-    rows, pages = search_hof_workstats(min_val, max_val, limit_results=limit_results)
+    try:
+        rows, pages = search_hof_workstats_v2(user["api_key"], min_val, max_val, limit_results=limit_results)
+    except TornAPIError as e:
+        return _json_error(f"torn api error: {e}", 400)
+    except Exception:
+        return _json_error("HoF search failed", 500)
 
     data = {
         "cached": False,
@@ -589,10 +427,5 @@ def api_search_workstats():
         "rows": rows,
         "updated_at": utc(),
     }
-
-    with _hof_cache_lock:
-        _hof_cache["key"] = cache_key
-        _hof_cache["ts"] = now
-        _hof_cache["data"] = data
-
-    return {"ok": True, **data}
+    cache_set(DB_PATH, cache_key, data)
+    return jsonify({"ok": True, **data})
