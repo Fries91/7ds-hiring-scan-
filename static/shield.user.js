@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (High-Value Theme + Click-to-Open/Close + Badge On-Top)
+// @name         Company Hub 💼 (Repo-Matched Admin Token + Click Toggle + Badge On-Top)
 // @namespace    sevends-hiring-scan
-// @version      2.0.7
-// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Badge is smaller, draggable, and CLICK toggles open/close. Badge stays ON TOP of the panel.
+// @version      2.1.0
+// @description  Matches Fries91/7ds-hiring-scan- backend: ADMIN_TOKEN via ?admin=. Badge click opens/closes, draggable, always on top. BASE_URL hardcoded.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -15,48 +15,18 @@
 (function () {
   "use strict";
 
-  // ✅ HARD-CODED SERVICE URL (NO PROMPTS EVER)
+  // ✅ HARD-CODED SERVICE URL
   const BASE_URL = "https://sevends-hiring-scan.onrender.com";
 
-  // -----------------------
   // Storage keys
-  // -----------------------
-  const K_ADMIN = "company_hub_admin_key";
-  const K_API = "company_hub_user_api_key";
-  const K_TOKEN = "company_hub_session_token";
-  const K_COMPANY_IDS = "company_hub_company_ids";
-  const K_CANCELLED = "company_hub_cancelled_setup";
-  const K_BADGE_POS = "company_hub_badge_pos_v4";
-  const K_PANEL_POS = "company_hub_panel_pos_v4";
+  const K_ADMIN = "company_hub_admin_token";
+  const K_API = "company_hub_user_api_key"; // optional: used for /api/applicant (if you add that UI later)
+  const K_BADGE_POS = "company_hub_badge_pos_v5";
+  const K_PANEL_POS = "company_hub_panel_pos_v5";
 
   // -----------------------
   // Helpers
   // -----------------------
-  function gmReq(method, url, dataObj, extraHeaders = {}) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method,
-        url,
-        headers: { "Content-Type": "application/json", ...extraHeaders },
-        data: dataObj ? JSON.stringify(dataObj) : null,
-        onload: (res) => {
-          try {
-            const json = JSON.parse(res.responseText || "{}");
-            resolve({ status: res.status, json });
-          } catch {
-            resolve({ status: res.status, json: { ok: false, error: "bad json" } });
-          }
-        },
-        onerror: () => reject(new Error("network error")),
-      });
-    });
-  }
-
-  function gmReqAuthed(method, url, dataObj) {
-    const token = (GM_getValue(K_TOKEN, "") || "").trim();
-    return gmReq(method, url, dataObj, { "X-Session-Token": token });
-  }
-
   function escapeHtml(s) {
     return String(s || "")
       .replace(/&/g, "&amp;")
@@ -94,101 +64,68 @@
     return Math.max(min, Math.min(max, v));
   }
 
+  function gmReq(method, url, dataObj) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url,
+        headers: { "Content-Type": "application/json" },
+        data: dataObj ? JSON.stringify(dataObj) : null,
+        onload: (res) => {
+          let json = {};
+          try { json = JSON.parse(res.responseText || "{}"); } catch {}
+          resolve({ status: res.status, json });
+        },
+        onerror: () => reject(new Error("network error")),
+      });
+    });
+  }
+
+  // ✅ IMPORTANT: backend expects ?admin=TOKEN on every endpoint
+  function withAdmin(url) {
+    const admin = (GM_getValue(K_ADMIN, "") || "").trim();
+    if (!admin) return url; // will fail with unauthorized if server requires it
+    const join = url.includes("?") ? "&" : "?";
+    return `${url}${join}admin=${encodeURIComponent(admin)}`;
+  }
+
   function promptMaybe(label, currentVal) {
     const out = prompt(label, currentVal || "");
     if (out === null) return null;
     return String(out).trim();
   }
 
-  async function runSettingsWizard() {
-    let admin = (GM_getValue(K_ADMIN, "") || "").trim();
-    let api = (GM_getValue(K_API, "") || "").trim();
-    let cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
+  async function openSettings() {
+    const curAdmin = (GM_getValue(K_ADMIN, "") || "").trim();
+    const curApi = (GM_getValue(K_API, "") || "").trim();
 
-    const a = promptMaybe("Admin Access Key (from Fries)", admin);
-    if (a === null) {
-      GM_setValue(K_CANCELLED, true);
-      return { ok: false, error: "Cancelled" };
-    }
-    admin = a;
+    const a = promptMaybe("Admin Token (matches your Render ENV: ADMIN_TOKEN)", curAdmin);
+    if (a === null) return { ok: false, error: "Cancelled" };
 
-    const k = promptMaybe("Your Torn API Key (your own key)", api);
-    if (k === null) {
-      GM_setValue(K_CANCELLED, true);
-      return { ok: false, error: "Cancelled" };
-    }
-    api = k;
+    const k = promptMaybe("Your Torn API Key (optional, for applicant workstats tools)", curApi);
+    if (k === null) return { ok: false, error: "Cancelled" };
 
-    const ci = promptMaybe("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", cids);
-    if (ci === null) {
-      GM_setValue(K_CANCELLED, true);
-      return { ok: false, error: "Cancelled" };
-    }
-    cids = ci;
+    GM_setValue(K_ADMIN, a);
+    GM_setValue(K_API, k);
 
-    GM_setValue(K_ADMIN, admin);
-    GM_setValue(K_API, api);
-    GM_setValue(K_COMPANY_IDS, cids);
-    GM_setValue(K_TOKEN, "");
-
-    try {
-      await ensureAuth(true);
-      GM_setValue(K_CANCELLED, false);
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, error: e?.message || String(e) };
-    }
-  }
-
-  async function ensureAuth(allowThrow = false) {
-    const admin = (GM_getValue(K_ADMIN, "") || "").trim();
-    const api = (GM_getValue(K_API, "") || "").trim();
-
-    if (!admin || !api) {
-      if (allowThrow) throw new Error("Missing keys. Click Settings.");
-      return false;
-    }
-
-    const tok = (GM_getValue(K_TOKEN, "") || "").trim();
-    if (tok) return true;
-
-    const { status, json } = await gmReq("POST", `${BASE_URL}/api/auth`, {
-      admin_key: admin,
-      api_key: api,
-    });
-
-    if (!json || json.ok !== true || !json.token) {
-      GM_setValue(K_TOKEN, "");
-      throw new Error(json?.error || `Auth failed (HTTP ${status})`);
-    }
-
-    GM_setValue(K_TOKEN, json.token);
-
-    const cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-    if (cids) {
-      await gmReqAuthed("POST", `${BASE_URL}/api/user/companies`, { company_ids: cids });
-    }
-
-    return true;
+    return { ok: true };
   }
 
   // -----------------------
-  // UI (Badge always on top of panel)
+  // UI
   // -----------------------
   GM_addStyle(`
     :root{
       --hv-text: #e5e7eb;
       --hv-muted: rgba(229,231,235,0.72);
-      --hv-gold: #d4af37;
-      --hv-gold2: #f7e7a9;
     }
 
     #companyhub-badge, #companyhub-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
 
-    /* ✅ Badge ALWAYS on top */
+    /* Badge always on top */
     #companyhub-badge {
       position: fixed; right: 14px; bottom: 110px;
-      z-index: 1000001; /* higher than panel */
+      z-index: 1000001;
       width: 44px; height: 44px; border-radius: 14px;
       background:
         radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
@@ -244,7 +181,6 @@
     }
 
     #companyhub-title { display:flex; align-items:center; gap:8px; min-width:0; }
-
     #companyhub-title .crest{
       width: 18px; height: 18px; border-radius: 6px;
       background:
@@ -254,7 +190,6 @@
       box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
       flex: 0 0 auto;
     }
-
     #companyhub-title .text{ display:flex; flex-direction:column; min-width:0; }
     #companyhub-title .text .main{ font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #companyhub-title .text .sub{ font-size: 11px; color: rgba(247,231,169,0.70); font-weight: 800; margin-top: 2px; }
@@ -328,7 +263,6 @@
     .row-actions{ display:flex; gap:6px; align-items:center; }
   `);
 
-  // ---- Create badge + panel
   const badge = document.createElement("div");
   badge.id = "companyhub-badge";
   badge.innerHTML = `<span>💼</span>`;
@@ -360,7 +294,7 @@
   `;
   document.body.appendChild(panel);
 
-  // ---- restore saved positions
+  // Restore positions
   (function restorePositions() {
     const b = getSavedPos(K_BADGE_POS, null);
     if (b) {
@@ -369,7 +303,6 @@
       badge.style.right = "auto";
       badge.style.bottom = "auto";
     }
-
     const p = getSavedPos(K_PANEL_POS, null);
     if (p) {
       panel.style.left = p.x + "px";
@@ -379,16 +312,14 @@
     }
   })();
 
-  // -----------------------
-  // Click-to-open/close + draggable badge
-  // -----------------------
   function togglePanel() {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
     if (panel.style.display !== "none") renderActiveTab();
   }
 
+  // Badge: draggable + tap toggles open/close (no double handlers)
   function makeBadgeDraggableAndToggle(el, storeKey) {
-    const threshold = 8; // px
+    const threshold = 8;
     let down = false;
     let moved = false;
     let startX = 0, startY = 0;
@@ -436,11 +367,8 @@
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const rect = el.getBoundingClientRect();
-      const w = rect.width;
-      const h = rect.height;
-
-      x = clamp(x, 6, vw - w - 6);
-      y = clamp(y, 6, vh - h - 6);
+      x = clamp(x, 6, vw - rect.width - 6);
+      y = clamp(y, 6, vh - rect.height - 6);
 
       el.style.left = x + "px";
       el.style.top = y + "px";
@@ -464,8 +392,8 @@
       window.removeEventListener("touchend", onUp);
       window.removeEventListener("touchcancel", onUp);
 
-      // ✅ tap toggles open/close, drag does not
       if (!moved) togglePanel();
+
       ev?.preventDefault?.();
       ev?.stopPropagation?.();
     }
@@ -474,10 +402,9 @@
     el.addEventListener("touchstart", onDown, { passive: false });
   }
 
-  // Badge: click toggles open/close AND draggable
   makeBadgeDraggableAndToggle(badge, K_BADGE_POS);
 
-  // Panel drag (header)
+  // Panel drag
   function makePanelDraggable(handleEl, moveEl, storeKey) {
     let dragging = false;
     let startX = 0, startY = 0;
@@ -528,11 +455,8 @@
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const rect = moveEl.getBoundingClientRect();
-      const w = rect.width;
-      const h = rect.height;
-
-      x = clamp(x, 6, vw - w - 6);
-      y = clamp(y, 6, vh - h - 6);
+      x = clamp(x, 6, vw - rect.width - 6);
+      y = clamp(y, 6, vh - rect.height - 6);
 
       moveEl.style.left = x + "px";
       moveEl.style.top = y + "px";
@@ -564,32 +488,16 @@
 
   makePanelDraggable(panel.querySelector("#companyhub-head"), panel, K_PANEL_POS);
 
-  // Close button (still works)
+  // Buttons
   panel.querySelector("#ch-close").addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
+    e.preventDefault(); e.stopPropagation();
     togglePanel();
   });
 
-  // Settings button
   panel.querySelector("#ch-settings").addEventListener("click", async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const body = panel.querySelector("#companyhub-body");
-    body.innerHTML = `<div class="card"><div class="muted">Opening setup…</div></div>`;
-
-    const res = await runSettingsWizard();
-    if (!res.ok) {
-      body.innerHTML = `
-        <div class="card">
-          <div class="headline">Setup not completed</div>
-          <div class="muted" style="margin-top:6px;">${escapeHtml(res.error || "Cancelled")}</div>
-          <div class="muted" style="margin-top:6px;">It will NOT ask again unless you click Settings.</div>
-        </div>`;
-      return;
-    }
-
-    renderActiveTab();
+    e.preventDefault(); e.stopPropagation();
+    const res = await openSettings();
+    renderActiveTab(res.ok ? null : res.error);
   });
 
   // Tabs
@@ -597,8 +505,7 @@
   let active = "companies";
   tabs.forEach((b) => {
     b.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+      e.preventDefault(); e.stopPropagation();
       tabs.forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       active = b.getAttribute("data-tab");
@@ -608,88 +515,100 @@
 
   const body = panel.querySelector("#companyhub-body");
 
-  async function renderActiveTab() {
-    body.innerHTML = `<div class="muted">Loading…</div>`;
+  async function renderActiveTab(optionalError) {
+    if (optionalError) {
+      body.innerHTML = `
+        <div class="card">
+          <div class="headline">Settings</div>
+          <div class="muted" style="margin-top:6px;">${escapeHtml(optionalError)}</div>
+        </div>`;
+      return;
+    }
 
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
-    const api = (GM_getValue(K_API, "") || "").trim();
-
-    if (!admin || !api) {
+    if (!admin) {
       body.innerHTML = `
         <div class="card">
           <div class="headline">Setup needed</div>
           <div class="muted" style="margin-top:6px;">
-            Click <b>Settings</b> to enter your Admin Key + Torn API key.
-            <br/>No popups will appear unless you click Settings.
+            Click <b>Settings</b> and enter your Admin Token.
+            <br/>Your server checks <b>?admin=</b> against <b>ADMIN_TOKEN</b>.
           </div>
-          <div class="pill gold" style="margin-top:10px;">🔒 Access controlled by admin keys</div>
         </div>`;
       return;
     }
 
+    body.innerHTML = `<div class="muted">Loading…</div>`;
+
     try {
-      await ensureAuth(true);
+      if (active === "companies") return renderCompanies();
+      if (active === "trains") return renderPlaceholder("Trains UI (hooked to /api/trains)");
+      if (active === "apps") return renderPlaceholder("Applications UI (hooked to /api/applications)");
+      if (active === "search") return renderPlaceholder("Search UI (hooked to /api/search_workstats)");
     } catch (e) {
       body.innerHTML = `
         <div class="card">
-          <div class="headline">Auth error</div>
+          <div class="headline">Error</div>
           <div class="muted" style="margin-top:6px;">${escapeHtml(e.message || String(e))}</div>
-          <div class="muted" style="margin-top:6px;">Click <b>Settings</b> to fix keys.</div>
+        </div>`;
+    }
+  }
+
+  function renderPlaceholder(txt) {
+    body.innerHTML = `
+      <div class="card">
+        <div class="headline">${escapeHtml(txt)}</div>
+        <div class="muted" style="margin-top:6px;">Say “enable full UI for this tab” and I’ll wire it completely.</div>
+      </div>`;
+  }
+
+  async function renderCompanies() {
+    const url = withAdmin(`${BASE_URL}/api/companies`);
+    const res = await gmReq("GET", url, null);
+
+    if (res.status === 401 || res.json?.ok === false) {
+      body.innerHTML = `
+        <div class="card">
+          <div class="headline">Unauthorized</div>
+          <div class="muted" style="margin-top:6px;">
+            Your Admin Token does not match the server’s <b>ADMIN_TOKEN</b>.
+          </div>
+          <div class="muted" style="margin-top:6px;">
+            Fix: Render → Environment → set <b>ADMIN_TOKEN</b> exactly, then redeploy.
+          </div>
         </div>`;
       return;
     }
 
-    if (active === "companies") return renderCompanies();
-    if (active === "trains") return renderTrains();
-    if (active === "apps") return renderApps();
-    if (active === "search") return renderSearch();
-  }
-
-  async function renderCompanies() {
-    const res = await gmReqAuthed("GET", `${BASE_URL}/api/companies`, null);
-    if (!res.json || res.json.ok !== true) {
-      body.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-      return;
-    }
-    const rows = res.json.rows || [];
+    const rows = res.json?.rows || [];
     if (!rows.length) {
-      body.innerHTML = `<div class="card"><div class="headline">No companies loaded</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings.</div></div>`;
+      body.innerHTML = `
+        <div class="card">
+          <div class="headline">No companies yet</div>
+          <div class="muted" style="margin-top:6px;">
+            Your server fills company data using its own <b>TORN_API_KEY</b> + <b>COMPANY_IDS</b>.
+          </div>
+        </div>`;
       return;
     }
-    body.innerHTML = rows
-      .map((c) => {
-        const emps = (c.employees || []).length;
-        const err = c.error ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>` : "";
-        return `
-          <div class="card">
-            <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
-            <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-              <div class="pill gold">👥 ${escapeHtml(String(emps))} employees</div>
-              <div class="pill">🆔 ${escapeHtml(c.company_id)}</div>
-            </div>
-            ${err}
-          </div>`;
-      })
-      .join("");
+
+    body.innerHTML = rows.map((c) => {
+      const emps = (c.employees || []).length;
+      const err = c.error
+        ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>`
+        : "";
+      return `
+        <div class="card">
+          <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
+          <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+            <div class="pill gold">👥 ${escapeHtml(String(emps))} employees</div>
+            <div class="pill">🆔 ${escapeHtml(c.company_id)}</div>
+          </div>
+          ${err}
+        </div>`;
+    }).join("");
   }
 
-  async function renderTrains() {
-    const companyIds = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-    if (!companyIds) {
-      body.innerHTML = `<div class="card"><div class="headline">No company IDs</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings to use train tracking.</div></div>`;
-      return;
-    }
-    body.innerHTML = `<div class="card"><div class="muted">Trains endpoints are ready. If you want the full trains UI (add/list/delete) here, say “add full trains UI”.</div></div>`;
-  }
-
-  async function renderApps() {
-    body.innerHTML = `<div class="card"><div class="muted">Applications endpoints are ready. If you want the full applications UI here, say “add full applications UI”.</div></div>`;
-  }
-
-  async function renderSearch() {
-    body.innerHTML = `<div class="card"><div class="muted">HoF search endpoints are ready. If you want the full search UI here, say “add full search UI”.</div></div>`;
-  }
-
-  // start hidden
+  // Start hidden
   panel.style.display = "none";
 })();
