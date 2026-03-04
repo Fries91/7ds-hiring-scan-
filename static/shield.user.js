@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         7DS*: Peace Company Hub 💼 (Session + Tabs Fixed)
-// @namespace    fries-7ds-peace-hub
+// @name         Company Hub 💼 
+// @namespace    fries-7ds-company-hub
 // @version      6.0.0
 // @description  Peace Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. Trains, Contracts, Recruit Leads, HoF Search.
 // @match        https://www.torn.com/*
