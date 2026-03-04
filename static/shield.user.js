@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (High-Value Theme + Clickable/Draggable Icon + No URL Prompt)
+// @name         Company Hub 💼 (High-Value Theme + Click-to-Open/Close + Badge On-Top)
 // @namespace    sevends-hiring-scan
-// @version      2.0.6
-// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Icon is smaller + clickable + draggable.
+// @version      2.0.7
+// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Badge is smaller, draggable, and CLICK toggles open/close. Badge stays ON TOP of the panel.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -25,9 +25,9 @@
   const K_API = "company_hub_user_api_key";
   const K_TOKEN = "company_hub_session_token";
   const K_COMPANY_IDS = "company_hub_company_ids";
-  const K_CANCELLED = "company_hub_cancelled_setup"; // if cancelled, never prompt again automatically
-  const K_BADGE_POS = "company_hub_badge_pos_v3"; // {x,y}
-  const K_PANEL_POS = "company_hub_panel_pos_v3"; // {x,y}
+  const K_CANCELLED = "company_hub_cancelled_setup";
+  const K_BADGE_POS = "company_hub_badge_pos_v4";
+  const K_PANEL_POS = "company_hub_panel_pos_v4";
 
   // -----------------------
   // Helpers
@@ -43,7 +43,7 @@
           try {
             const json = JSON.parse(res.responseText || "{}");
             resolve({ status: res.status, json });
-          } catch (e) {
+          } catch {
             resolve({ status: res.status, json: { ok: false, error: "bad json" } });
           }
         },
@@ -96,11 +96,10 @@
 
   function promptMaybe(label, currentVal) {
     const out = prompt(label, currentVal || "");
-    if (out === null) return null; // Cancel
+    if (out === null) return null;
     return String(out).trim();
   }
 
-  // ✅ ONLY called from Settings button (never auto-called)
   async function runSettingsWizard() {
     let admin = (GM_getValue(K_ADMIN, "") || "").trim();
     let api = (GM_getValue(K_API, "") || "").trim();
@@ -130,11 +129,8 @@
     GM_setValue(K_ADMIN, admin);
     GM_setValue(K_API, api);
     GM_setValue(K_COMPANY_IDS, cids);
-
-    // Clear token so we re-auth cleanly
     GM_setValue(K_TOKEN, "");
 
-    // Try auth now
     try {
       await ensureAuth(true);
       GM_setValue(K_CANCELLED, false);
@@ -148,13 +144,11 @@
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
 
-    // ✅ NEVER prompt automatically
     if (!admin || !api) {
       if (allowThrow) throw new Error("Missing keys. Click Settings.");
       return false;
     }
 
-    // If token exists, trust it until server rejects
     const tok = (GM_getValue(K_TOKEN, "") || "").trim();
     if (tok) return true;
 
@@ -170,7 +164,6 @@
 
     GM_setValue(K_TOKEN, json.token);
 
-    // Push company IDs right after auth (optional)
     const cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
     if (cids) {
       await gmReqAuthed("POST", `${BASE_URL}/api/user/companies`, { company_ids: cids });
@@ -180,7 +173,7 @@
   }
 
   // -----------------------
-  // UI (High-Value Company Theme)
+  // UI (Badge always on top of panel)
   // -----------------------
   GM_addStyle(`
     :root{
@@ -192,9 +185,10 @@
 
     #companyhub-badge, #companyhub-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
 
-    /* ✅ Smaller icon (44x44) */
+    /* ✅ Badge ALWAYS on top */
     #companyhub-badge {
-      position: fixed; right: 14px; bottom: 110px; z-index: 999999;
+      position: fixed; right: 14px; bottom: 110px;
+      z-index: 1000001; /* higher than panel */
       width: 44px; height: 44px; border-radius: 14px;
       background:
         radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
@@ -222,7 +216,8 @@
     }
 
     #companyhub-panel {
-      position: fixed; right: 14px; bottom: 170px; z-index: 999999;
+      position: fixed; right: 14px; bottom: 170px;
+      z-index: 1000000; /* under badge */
       width: min(92vw, 360px);
       background:
         radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.10), transparent 40%),
@@ -248,10 +243,7 @@
       letter-spacing: 0.2px;
     }
 
-    #companyhub-title {
-      display:flex; align-items:center; gap:8px;
-      min-width:0;
-    }
+    #companyhub-title { display:flex; align-items:center; gap:8px; min-width:0; }
 
     #companyhub-title .crest{
       width: 18px; height: 18px; border-radius: 6px;
@@ -263,21 +255,9 @@
       flex: 0 0 auto;
     }
 
-    #companyhub-title .text{
-      display:flex; flex-direction:column; min-width:0;
-    }
-
-    #companyhub-title .text .main{
-      font-size: 14px;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-
-    #companyhub-title .text .sub{
-      font-size: 11px;
-      color: rgba(247,231,169,0.70);
-      font-weight: 800;
-      margin-top: 2px;
-    }
+    #companyhub-title .text{ display:flex; flex-direction:column; min-width:0; }
+    #companyhub-title .text .main{ font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #companyhub-title .text .sub{ font-size: 11px; color: rgba(247,231,169,0.70); font-weight: 800; margin-top: 2px; }
 
     #companyhub-tabs {
       display:flex; gap:6px; padding: 8px 10px;
@@ -316,16 +296,8 @@
       white-space: nowrap;
       user-select:none;
     }
-
-    .ch-btn.primary{
-      background: rgba(16,185,129,0.16);
-      border-color: rgba(16,185,129,0.25);
-    }
-
-    .ch-btn.red {
-      background: rgba(239,68,68,0.16);
-      border-color: rgba(239,68,68,0.25);
-    }
+    .ch-btn.primary{ background: rgba(16,185,129,0.16); border-color: rgba(16,185,129,0.25); }
+    .ch-btn.red { background: rgba(239,68,68,0.16); border-color: rgba(239,68,68,0.25); }
 
     .muted { color: var(--hv-muted); font-size: 12px; }
 
@@ -343,22 +315,16 @@
     .card .headline{ font-weight: 950; letter-spacing: 0.1px; }
 
     .pill{
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 999px;
+      display:inline-flex; align-items:center; gap:6px;
+      font-size: 11px; padding: 3px 8px; border-radius: 999px;
       background: rgba(255,255,255,0.07);
       border: 1px solid rgba(255,255,255,0.10);
     }
-
     .pill.gold{
       background: rgba(212,175,55,0.12);
       border-color: rgba(212,175,55,0.22);
       color: rgba(247,231,169,0.92);
     }
-
     .row-actions{ display:flex; gap:6px; align-items:center; }
   `);
 
@@ -413,41 +379,42 @@
     }
   })();
 
-  // ---- draggable helper (touch + mouse) + click preserved
-  function makeDraggableClickable(handleEl, moveEl, storeKey, opts = {}) {
-    const threshold = opts.threshold ?? 8; // px
-    const restrictToViewport = opts.restrictToViewport ?? true;
-    const onClick = opts.onClick ?? null;
+  // -----------------------
+  // Click-to-open/close + draggable badge
+  // -----------------------
+  function togglePanel() {
+    panel.style.display = panel.style.display === "none" ? "block" : "none";
+    if (panel.style.display !== "none") renderActiveTab();
+  }
 
-    let dragging = false;
+  function makeBadgeDraggableAndToggle(el, storeKey) {
+    const threshold = 8; // px
+    let down = false;
     let moved = false;
     let startX = 0, startY = 0;
     let startLeft = 0, startTop = 0;
 
-    function getLeftTop(el) {
-      const r = el.getBoundingClientRect();
+    function getLeftTop(node) {
+      const r = node.getBoundingClientRect();
       return { left: r.left, top: r.top };
     }
 
     function onDown(ev) {
       const pt = ev.touches ? ev.touches[0] : ev;
-
-      dragging = true;
+      down = true;
       moved = false;
 
-      const pos = getLeftTop(moveEl);
+      const pos = getLeftTop(el);
       startX = pt.clientX;
       startY = pt.clientY;
       startLeft = pos.left;
       startTop = pos.top;
 
-      // Force to left/top positioning so it moves cleanly
-      moveEl.style.left = startLeft + "px";
-      moveEl.style.top = startTop + "px";
-      moveEl.style.right = "auto";
-      moveEl.style.bottom = "auto";
+      el.style.left = startLeft + "px";
+      el.style.top = startTop + "px";
+      el.style.right = "auto";
+      el.style.bottom = "auto";
 
-      // Don't preventDefault here—so taps can still become clicks if no move
       window.addEventListener("mousemove", onMove, { passive: false });
       window.addEventListener("mouseup", onUp, { passive: false });
       window.addEventListener("touchmove", onMove, { passive: false });
@@ -456,7 +423,7 @@
     }
 
     function onMove(ev) {
-      if (!dragging) return;
+      if (!down) return;
       const pt = ev.touches ? ev.touches[0] : ev;
       const dx = pt.clientX - startX;
       const dy = pt.clientY - startY;
@@ -466,20 +433,18 @@
       let x = startLeft + dx;
       let y = startTop + dy;
 
-      if (restrictToViewport) {
-        const vw = window.innerWidth;
-        const vh = window.innerHeight;
-        const rect = moveEl.getBoundingClientRect();
-        const w = rect.width;
-        const h = rect.height;
-        x = clamp(x, 6, vw - w - 6);
-        y = clamp(y, 6, vh - h - 6);
-      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const rect = el.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
 
-      moveEl.style.left = x + "px";
-      moveEl.style.top = y + "px";
+      x = clamp(x, 6, vw - w - 6);
+      y = clamp(y, 6, vh - h - 6);
 
-      // If we are really moving, prevent scroll
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+
       if (moved) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -487,10 +452,10 @@
     }
 
     function onUp(ev) {
-      if (!dragging) return;
-      dragging = false;
+      if (!down) return;
+      down = false;
 
-      const rect = moveEl.getBoundingClientRect();
+      const rect = el.getBoundingClientRect();
       savePos(storeKey, Math.round(rect.left), Math.round(rect.top));
 
       window.removeEventListener("mousemove", onMove);
@@ -499,34 +464,37 @@
       window.removeEventListener("touchend", onUp);
       window.removeEventListener("touchcancel", onUp);
 
-      // If it was a tap (no move), treat as click
-      if (!moved && typeof onClick === "function") {
-        onClick();
-      }
+      // ✅ tap toggles open/close, drag does not
+      if (!moved) togglePanel();
+      ev?.preventDefault?.();
+      ev?.stopPropagation?.();
     }
 
-    handleEl.addEventListener("mousedown", onDown, { passive: false });
-    handleEl.addEventListener("touchstart", onDown, { passive: false });
+    el.addEventListener("mousedown", onDown, { passive: false });
+    el.addEventListener("touchstart", onDown, { passive: false });
   }
 
-  function makeDraggable(handleEl, moveEl, storeKey, restrictToViewport = true) {
+  // Badge: click toggles open/close AND draggable
+  makeBadgeDraggableAndToggle(badge, K_BADGE_POS);
+
+  // Panel drag (header)
+  function makePanelDraggable(handleEl, moveEl, storeKey) {
     let dragging = false;
     let startX = 0, startY = 0;
     let startLeft = 0, startTop = 0;
 
-    function getLeftTop(el) {
-      const r = el.getBoundingClientRect();
+    function getLeftTop(node) {
+      const r = node.getBoundingClientRect();
       return { left: r.left, top: r.top };
     }
 
     function onDown(ev) {
       const t = ev.target;
-      if (t && (t.tagName === "BUTTON" || t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.closest("button"))) {
-        return;
-      }
+      if (t && (t.tagName === "BUTTON" || t.closest("button"))) return;
 
       dragging = true;
       const pt = ev.touches ? ev.touches[0] : ev;
+
       const pos = getLeftTop(moveEl);
       startX = pt.clientX;
       startY = pt.clientY;
@@ -557,15 +525,14 @@
       let x = startLeft + dx;
       let y = startTop + dy;
 
-      if (restrictToViewport) {
-        const vw = window.innerWidth;
-        const vh = window.innerHeight;
-        const rect = moveEl.getBoundingClientRect();
-        const w = rect.width;
-        const h = rect.height;
-        x = clamp(x, 6, vw - w - 6);
-        y = clamp(y, 6, vh - h - 6);
-      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const rect = moveEl.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+
+      x = clamp(x, 6, vw - w - 6);
+      y = clamp(y, 6, vh - h - 6);
 
       moveEl.style.left = x + "px";
       moveEl.style.top = y + "px";
@@ -595,28 +562,19 @@
     handleEl.addEventListener("touchstart", onDown, { passive: false });
   }
 
-  // ---- open/close
-  function togglePanel() {
-    panel.style.display = panel.style.display === "none" ? "block" : "none";
-    if (panel.style.display !== "none") renderActiveTab();
-  }
+  makePanelDraggable(panel.querySelector("#companyhub-head"), panel, K_PANEL_POS);
 
-  // ✅ Badge is BOTH clickable and draggable (tap toggles, drag moves)
-  makeDraggableClickable(badge, badge, K_BADGE_POS, {
-    threshold: 8,
-    restrictToViewport: true,
-    onClick: togglePanel,
+  // Close button (still works)
+  panel.querySelector("#ch-close").addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    togglePanel();
   });
 
-  // ✅ Panel draggable (drag header)
-  const panelHeader = panel.querySelector("#companyhub-head");
-  makeDraggable(panelHeader, panel, K_PANEL_POS, true);
-
-  // Close button
-  panel.querySelector("#ch-close").addEventListener("click", () => togglePanel());
-
-  // ---- settings
-  panel.querySelector("#ch-settings").addEventListener("click", async () => {
+  // Settings button
+  panel.querySelector("#ch-settings").addEventListener("click", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
     const body = panel.querySelector("#companyhub-body");
     body.innerHTML = `<div class="card"><div class="muted">Opening setup…</div></div>`;
 
@@ -634,11 +592,13 @@
     renderActiveTab();
   });
 
-  // ---- tabs
+  // Tabs
   const tabs = Array.from(panel.querySelectorAll(".ch-tab"));
   let active = "companies";
   tabs.forEach((b) => {
-    b.addEventListener("click", () => {
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
       tabs.forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       active = b.getAttribute("data-tab");
@@ -651,7 +611,6 @@
   async function renderActiveTab() {
     body.innerHTML = `<div class="muted">Loading…</div>`;
 
-    // ✅ NEVER auto-prompt. If missing keys, show message.
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
 
