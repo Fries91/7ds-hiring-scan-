@@ -1,22 +1,22 @@
 // ==UserScript==
 // @name         Company Hub 💼 
 // @namespace    Fries-company-hub
-// @version      2.0.0
-// @description  Company hub: employees, trains, contracts, HoF scan + PREMIUM Recruit Leads (beats your floor employee).
+// @version      2.0.1
+// @description  Company hub: employees, trains, contracts, recruit leads, HoF scan. Briefcase tap toggles overlay (mobile-safe).
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
-// @connect      YOUR-SERVICE.onrender.com
+// @connect      https://sevends-hiring-scan.onrender.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
   // ================= USER CONFIG =================
-  const BASE_URL = "https://YOUR-SERVICE.onrender.com"; // <-- CHANGE
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // <-- CHANGE
   // ==============================================
 
   const K_ADMIN = "hub_admin_key_v2";
@@ -55,34 +55,35 @@
   const apiGet  = (url, token) => apiReq("GET",  url, null, token);
   const apiPost = (url, body, token) => apiReq("POST", url, body, token);
 
-  // ================== High Value Theme ==================
   GM_addStyle(`
     :root{
-      --hv-bg:#070A0F; --hv-panel:#0B1019; --hv-card:#0A0F16;
-      --hv-border:#263548; --hv-border2:#364C67;
-      --hv-text:#E9EEF6; --hv-muted:rgba(233,238,246,.72);
+      --hv-bg:#070A0F; --hv-border2:#364C67; --hv-text:#E9EEF6; --hv-muted:rgba(233,238,246,.72);
       --hv-gold:#E6C36A; --hv-danger:#ff5b5b; --hv-warn:#ffcc66; --hv-blue:#8BD0FF;
       --hv-shadow:0 18px 55px rgba(0,0,0,.62);
     }
 
+    /* Briefcase always above overlay */
     #p7ds-bag{
       position:fixed; right:16px; bottom:118px;
       z-index:99999999;
-      width:60px; height:60px;
+      width:56px; height:56px;
       border-radius:18px;
-      background: radial-gradient(140% 140% at 15% 10%, rgba(230,195,106,.25) 0%, rgba(11,16,25,1) 60%);
+      background: radial-gradient(140% 140% at 15% 10%, rgba(230,195,106,.22) 0%, rgba(11,16,25,1) 60%);
       border:1px solid var(--hv-border2);
       display:flex; align-items:center; justify-content:center;
       box-shadow: var(--hv-shadow);
       cursor:grab; user-select:none; -webkit-tap-highlight-color: transparent;
+      touch-action:none; /* important for drag/tap */
     }
     #p7ds-bag:active{cursor:grabbing}
-    #p7ds-bag .icon{ font-size:28px; filter: drop-shadow(0 2px 8px rgba(0,0,0,.5)); }
+    #p7ds-bag .icon{
+      font-size:24px; /* smaller icon */
+      filter: drop-shadow(0 2px 8px rgba(0,0,0,.5));
+    }
     #p7ds-bag .badge{
       position:absolute; top:-7px; right:-7px;
       min-width:22px; height:22px; padding:0 6px;
-      border-radius:999px;
-      background: var(--hv-danger);
+      border-radius:999px; background:var(--hv-danger);
       color:#fff; font-weight:800; font-size:12px;
       display:none; align-items:center; justify-content:center;
       border:2px solid var(--hv-bg);
@@ -114,7 +115,6 @@
       display:flex; gap:6px; padding:10px 12px; flex-wrap:wrap;
       border-bottom:1px solid rgba(54,76,103,.35);
     }
-
     .p7btn{
       background: rgba(6,10,15,.92);
       border:1px solid rgba(38,53,72,.95);
@@ -128,17 +128,15 @@
     .p7btn.gold{ border-color: rgba(230,195,106,.9); background: linear-gradient(180deg, rgba(230,195,106,.18), rgba(6,10,15,.92)); }
 
     #p7ds-body{ padding:12px; }
-
     .card{ background: rgba(6,10,15,.88); border:1px solid rgba(38,53,72,.9); border-radius:14px; padding:10px; margin:10px 0; }
     .row{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-
     input,select,textarea{
       width:100%; padding:8px; border-radius:12px;
       border:1px solid rgba(38,53,72,.9);
       background: rgba(4,7,12,.95);
       color: var(--hv-text);
+      outline:none;
     }
-
     .mini{ font-size:12px; color: var(--hv-muted); }
     .pill{ display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid rgba(38,53,72,.95); font-size:11px; color: var(--hv-muted); margin-left:6px; }
     .pill.gold{ border-color: rgba(230,195,106,.55); color: rgba(230,195,106,.95); }
@@ -168,55 +166,101 @@
     <div id="p7ds-tabs"></div>
     <div id="p7ds-body"></div>
   `;
+
   document.body.appendChild(panel);
   document.body.appendChild(bag);
 
-  // ---- draggable + click toggle (ignore click if dragged) ----
-  let dragging = false, moved = false, sx=0, sy=0, ox=0, oy=0;
+  // ---------- Overlay toggle ----------
+  function togglePanel(force) {
+    const open = (panel.style.display === "block");
+    const next = (typeof force === "boolean") ? force : !open;
+    panel.style.display = next ? "block" : "none";
 
-  function startDrag(x,y){
-    dragging = true; moved = false;
-    sx=x; sy=y;
-    const r = bag.getBoundingClientRect();
-    ox=r.left; oy=r.top;
-  }
-  function doDrag(x,y){
-    if(!dragging) return;
-    const dx=x-sx, dy=y-sy;
-    if (Math.abs(dx)>4 || Math.abs(dy)>4) moved = true;
-
-    const nx = ox + dx, ny = oy + dy;
-    bag.style.left = nx+"px";
-    bag.style.top  = ny+"px";
-    bag.style.right="auto"; bag.style.bottom="auto";
-
-    if(panel.style.display==="block"){
-      panel.style.left = Math.max(10, nx-320) + "px";
-      panel.style.top  = Math.max(10, ny-10) + "px";
-      panel.style.right="auto"; panel.style.bottom="auto";
-    }
-  }
-  function endDrag(){ dragging=false; }
-
-  bag.addEventListener("touchstart",(e)=>{ const t=e.touches[0]; startDrag(t.clientX,t.clientY); e.preventDefault(); },{passive:false});
-  bag.addEventListener("touchmove",(e)=>{ const t=e.touches[0]; doDrag(t.clientX,t.clientY); e.preventDefault(); },{passive:false});
-  bag.addEventListener("touchend",()=>endDrag());
-  bag.addEventListener("mousedown",(e)=>{ startDrag(e.clientX,e.clientY); e.preventDefault(); });
-  window.addEventListener("mousemove",(e)=>doDrag(e.clientX,e.clientY));
-  window.addEventListener("mouseup",()=>endDrag());
-
-  function togglePanel(){
-    const open = (panel.style.display==="block");
-    panel.style.display = open ? "none" : "block";
-    if(!open){
+    if (next) {
       const r = bag.getBoundingClientRect();
-      panel.style.left = Math.max(10, r.left-320) + "px";
-      panel.style.top  = Math.max(10, r.top-10) + "px";
-      panel.style.right="auto"; panel.style.bottom="auto";
+      panel.style.left = Math.max(10, r.left - 320) + "px";
+      panel.style.top  = Math.max(10, r.top - 10) + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
     }
   }
-  bag.addEventListener("click",()=>{ if(moved){ moved=false; return; } togglePanel(); });
 
+  // ---------- DRAG + TAP (mobile safe) ----------
+  let dragging = false;
+  let moved = false;
+  let sx = 0, sy = 0, ox = 0, oy = 0;
+  let touchStartTime = 0;
+
+  function startDrag(x, y) {
+    dragging = true;
+    moved = false;
+    sx = x; sy = y;
+    const r = bag.getBoundingClientRect();
+    ox = r.left; oy = r.top;
+  }
+  function doDrag(x, y) {
+    if (!dragging) return;
+    const dx = x - sx;
+    const dy = y - sy;
+    if (Math.abs(dx) > 6 || Math.abs(dy) > 6) moved = true;
+
+    const nx = ox + dx;
+    const ny = oy + dy;
+
+    bag.style.left = nx + "px";
+    bag.style.top  = ny + "px";
+    bag.style.right = "auto";
+    bag.style.bottom = "auto";
+
+    // keep panel near bag if open
+    if (panel.style.display === "block") {
+      panel.style.left = Math.max(10, nx - 320) + "px";
+      panel.style.top  = Math.max(10, ny - 10) + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+  }
+  function endDrag() {
+    dragging = false;
+  }
+
+  // Touch: we toggle on touchend if it was a tap (not a drag)
+  bag.addEventListener("touchstart", (e) => {
+    const t = e.touches[0];
+    touchStartTime = Date.now();
+    startDrag(t.clientX, t.clientY);
+    // don't preventDefault here—only on move—so taps still work reliably
+  }, { passive: true });
+
+  bag.addEventListener("touchmove", (e) => {
+    const t = e.touches[0];
+    doDrag(t.clientX, t.clientY);
+    e.preventDefault(); // needed for dragging on mobile
+  }, { passive: false });
+
+  bag.addEventListener("touchend", () => {
+    endDrag();
+    const dt = Date.now() - touchStartTime;
+    if (!moved && dt < 400) {
+      togglePanel();
+    }
+    moved = false;
+  });
+
+  // Mouse: click toggles, drag moves
+  bag.addEventListener("mousedown", (e) => {
+    startDrag(e.clientX, e.clientY);
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => doDrag(e.clientX, e.clientY));
+  window.addEventListener("mouseup", () => endDrag());
+  bag.addEventListener("click", () => {
+    // If user dragged with mouse, ignore click toggle
+    if (moved) { moved = false; return; }
+    togglePanel();
+  });
+
+  // ================== APP UI ==================
   const tabsEl = panel.querySelector("#p7ds-tabs");
   const bodyEl = panel.querySelector("#p7ds-body");
   const subEl  = panel.querySelector("#p7ds-sub");
@@ -226,7 +270,10 @@
   let activeTab = "Employees";
   let state = null;
 
-  function setBadge(n){ if(n>0){ badge.style.display="flex"; badge.textContent=String(n);} else badge.style.display="none"; }
+  function setBadge(n){
+    if(n>0){ badge.style.display="flex"; badge.textContent=String(n); }
+    else { badge.style.display="none"; }
+  }
   function money(n){ try{return Number(n).toLocaleString();}catch{return String(n);} }
 
   function renderTabs(){
@@ -283,7 +330,7 @@
     const c=el("div",{className:"card"});
     c.appendChild(el("div",{className:"mini"},
       `<b>Recruit Leads</b> <span class="pill gold">${(state.recruit_leads||[]).length}</span>
-       <div class="mini" style="margin-top:6px">Finds HoF working-stat players who beat your weakest employee (floor). Stores top leads.</div>`
+       <div class="mini" style="margin-top:6px">Finds HoF working-stat players who beat your weakest employee (floor).</div>`
     ));
 
     const btnRow = el("div",{style:"display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"});
@@ -296,7 +343,7 @@
       const res = await apiPost(`${BASE_URL}/api/recruit/scan`, { company_id: state.selected_company_id }, token);
       scanBtn.textContent="Scan Now";
       await refresh(state.selected_company_id);
-      if(!res.ok){ alert("Recruit scan failed: "+(res.error||"unknown")); }
+      if(!res.ok) alert("Recruit scan failed: " + (res.error||"unknown"));
     });
 
     seenBtn2.addEventListener("click", async ()=>{
@@ -309,9 +356,7 @@
       await refresh(state.selected_company_id);
     });
 
-    btnRow.appendChild(scanBtn);
-    btnRow.appendChild(seenBtn2);
-    btnRow.appendChild(clearBtn);
+    btnRow.appendChild(scanBtn); btnRow.appendChild(seenBtn2); btnRow.appendChild(clearBtn);
     c.appendChild(btnRow);
 
     const leads = state.recruit_leads || [];
@@ -342,10 +387,6 @@
 
     return c;
   }
-
-  // (Trains / Contracts / Search / Broadcast / Settings can stay exactly as your previous version)
-  // To keep this message readable, those functions are shortened: we reuse the existing ones you already had.
-  // You are replacing the whole file with this file, so we include them below in full.
 
   function renderTrains(token){
     const c=el("div",{className:"card"});
@@ -607,6 +648,7 @@
     await refresh(state?.selected_company_id||"");
   });
 
+  // Start + polling
   refresh(getVal(K_SEL,""));
   setInterval(()=>refresh(state?.selected_company_id||getVal(K_SEL,"")), 15000);
 })();
