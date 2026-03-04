@@ -40,17 +40,12 @@ def hof_scan_workstats(
     max_pages: int = 10,
     page_size: int = 25,
 ) -> List[Dict[str, Any]]:
-    """
-    Scans HoF working stats pages and filters locally.
-    If Torn changes/denies the 'workingstats' cat, your server will return a clean error.
-    """
     out: List[Dict[str, Any]] = []
     offset = 0
 
     for _ in range(int(max_pages)):
         data = hof_page("workingstats", offset=offset, limit=page_size, api_key=api_key)
 
-        # v2 shapes vary; normalize
         entries = []
         if isinstance(data, dict):
             if isinstance(data.get("entries"), list):
