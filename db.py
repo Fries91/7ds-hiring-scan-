@@ -1,58 +1,61 @@
+import os
 import json
 import sqlite3
-import time
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+DB_PATH = os.getenv("DB_PATH", "hub.db")
 
-def _con(db_path: str):
-    con = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _con():
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
 
-def init_db(db_path: str):
-    con = _con(db_path)
+def init_db():
+    con = _con()
     cur = con.cursor()
 
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
-            name TEXT,
-            api_key TEXT,
-            token TEXT,
-            token_created_at TEXT,
-            last_seen_at TEXT,
-            company_ids TEXT DEFAULT ''
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS applications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            event_id INTEGER NOT NULL,
-            applicant_id TEXT,
-            raw_text TEXT,
-            status TEXT DEFAULT 'new',
+            name TEXT DEFAULT '',
+            api_key TEXT NOT NULL,
+            company_ids TEXT NOT NULL DEFAULT '[]',
             created_at TEXT,
-            UNIQUE(user_id, event_id)
+            last_seen_at TEXT
         )
         """
     )
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS train_entries (
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT,
+            last_seen_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trains (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
             company_id TEXT NOT NULL,
-            buyer TEXT NOT NULL,
-            trains INTEGER NOT NULL,
-            note TEXT,
+            buyer_name TEXT NOT NULL,
+            trains_bought INTEGER NOT NULL,
+            trains_used INTEGER NOT NULL DEFAULT 0,
+            note TEXT DEFAULT '',
             created_at TEXT
         )
         """
@@ -60,10 +63,29 @@ def init_db(db_path: str):
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS cache (
-            k TEXT PRIMARY KEY,
-            v TEXT,
-            created_at INTEGER
+        CREATE TABLE IF NOT EXISTS contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            company_id TEXT NOT NULL,
+            employee_id TEXT DEFAULT '',
+            employee_name TEXT DEFAULT '',
+            title TEXT NOT NULL,
+            expires_at TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            created_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT,
+            seen INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -72,130 +94,108 @@ def init_db(db_path: str):
     con.close()
 
 
-def _parse_iso(dt: str) -> Optional[datetime]:
-    try:
-        if not dt:
-            return None
-        # allow "Z"
-        dt = dt.replace("Z", "+00:00")
-        d = datetime.fromisoformat(dt)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-# ---------------- USERS ----------------
-def upsert_user(
-    db_path: str,
-    user_id: str,
-    name: str,
-    api_key: str,
-    token: str,
-    token_created_at: str,
-    last_seen_at: str,
-):
-    con = _con(db_path)
+# ---- users ----
+def upsert_user(user_id: str, name: str, api_key: str):
+    con = _con()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO users(user_id, name, api_key, token, token_created_at, last_seen_at)
+        INSERT INTO users(user_id, name, api_key, company_ids, created_at, last_seen_at)
         VALUES(?,?,?,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET
-            name=excluded.name,
-            api_key=excluded.api_key,
-            token=excluded.token,
-            token_created_at=excluded.token_created_at,
-            last_seen_at=excluded.last_seen_at
+          name=excluded.name,
+          api_key=excluded.api_key,
+          last_seen_at=excluded.last_seen_at
         """,
-        (user_id, name, api_key, token, token_created_at, last_seen_at),
+        (user_id, name or "", api_key, "[]", _utc_now(), _utc_now()),
     )
     con.commit()
     con.close()
 
 
-def get_user_by_token(db_path: str, token: str, ttl_seconds: int, now_iso: str) -> Optional[Dict[str, Any]]:
-    con = _con(db_path)
-    cur = con.cursor()
-    cur.execute("SELECT * FROM users WHERE token=?", (token,))
-    row = cur.fetchone()
-    if not row:
-        con.close()
-        return None
-
-    now = _parse_iso(now_iso) or datetime.now(timezone.utc)
-    created = _parse_iso(row["token_created_at"] or "") or _parse_iso(row["last_seen_at"] or "")
-    if not created:
-        # if missing timestamps, treat as invalid
-        con.close()
-        return None
-
-    age = (now - created).total_seconds()
-    if age > ttl_seconds:
-        # expire token
-        cur.execute("UPDATE users SET token='' WHERE user_id=?", (row["user_id"],))
-        con.commit()
-        con.close()
-        return None
-
-    # touch last_seen_at
-    cur.execute("UPDATE users SET last_seen_at=? WHERE user_id=?", (now_iso, row["user_id"]))
-    con.commit()
-    con.close()
-    return dict(row)
-
-
-def set_user_company_ids(db_path: str, user_id: str, ids: List[str]):
-    con = _con(db_path)
-    cur = con.cursor()
-    cur.execute("UPDATE users SET company_ids=? WHERE user_id=?", (",".join(ids), user_id))
-    con.commit()
-    con.close()
-
-
-def get_user_company_ids(db_path: str, user_id: str) -> List[str]:
-    con = _con(db_path)
-    cur = con.cursor()
-    cur.execute("SELECT company_ids FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return []
-    raw = (row["company_ids"] or "").strip()
-    if not raw:
-        return []
-    return [c.strip() for c in raw.split(",") if c.strip()]
-
-
-# ---------------- APPLICATIONS ----------------
-def upsert_application_rows(db_path: str, user_id: str, rows: List[Dict[str, Any]]):
-    con = _con(db_path)
-    cur = con.cursor()
-    for r in rows:
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO applications(user_id, event_id, applicant_id, raw_text, status, created_at)
-            VALUES(?,?,?,?,?,?)
-            """,
-            (
-                user_id,
-                int(r["event_id"]),
-                r.get("applicant_id"),
-                r.get("raw_text") or "",
-                "new",
-                r.get("created_at") or "",
-            ),
-        )
-    con.commit()
-    con.close()
-
-
-def list_applications(db_path: str, user_id: str, limit: int = 60) -> List[Dict[str, Any]]:
-    con = _con(db_path)
+def set_company_ids(user_id: str, company_ids: List[str]):
+    con = _con()
     cur = con.cursor()
     cur.execute(
-        "SELECT * FROM applications WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        "UPDATE users SET company_ids=?, last_seen_at=? WHERE user_id=?",
+        (json.dumps(company_ids), _utc_now(), user_id),
+    )
+    con.commit()
+    con.close()
+
+
+def get_user(user_id: str) -> Optional[Dict[str, Any]]:
+    con = _con()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["company_ids"] = json.loads(d.get("company_ids") or "[]")
+    except Exception:
+        d["company_ids"] = []
+    return d
+
+
+def touch_user(user_id: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute("UPDATE users SET last_seen_at=? WHERE user_id=?", (_utc_now(), user_id))
+    con.commit()
+    con.close()
+
+
+# ---- sessions ----
+def create_session(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO sessions(token, user_id, created_at, last_seen_at) VALUES(?,?,?,?)",
+        (token, user_id, _utc_now(), _utc_now()),
+    )
+    con.commit()
+    con.close()
+    return token
+
+
+def get_session(token: str) -> Optional[Dict[str, Any]]:
+    con = _con()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM sessions WHERE token=?", (token,))
+    row = cur.fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def touch_session(token: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute("UPDATE sessions SET last_seen_at=? WHERE token=?", (_utc_now(), token))
+    con.commit()
+    con.close()
+
+
+# ---- notifications ----
+def add_notification(user_id: str, kind: str, message: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO notifications(user_id, kind, message, created_at, seen) VALUES(?,?,?,?,0)",
+        (user_id, kind, message, _utc_now()),
+    )
+    con.commit()
+    con.close()
+
+
+def list_notifications(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, int(limit)),
     )
     rows = [dict(r) for r in cur.fetchall()]
@@ -203,89 +203,100 @@ def list_applications(db_path: str, user_id: str, limit: int = 60) -> List[Dict[
     return rows
 
 
-def update_application_status(db_path: str, user_id: str, app_id: int, status: str):
-    con = _con(db_path)
+def mark_notifications_seen(user_id: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute("UPDATE notifications SET seen=1 WHERE user_id=?", (user_id,))
+    con.commit()
+    con.close()
+
+
+# ---- trains ----
+def add_train(user_id: str, company_id: str, buyer_name: str, trains_bought: int, note: str = ""):
+    con = _con()
     cur = con.cursor()
     cur.execute(
-        "UPDATE applications SET status=? WHERE user_id=? AND id=?",
-        (status, user_id, int(app_id)),
+        """
+        INSERT INTO trains(user_id, company_id, buyer_name, trains_bought, trains_used, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (user_id, company_id, buyer_name, int(trains_bought), 0, note or "", _utc_now()),
     )
     con.commit()
     con.close()
 
 
-# ---------------- TRAINS ----------------
-def add_train_entry(db_path: str, user_id: str, company_id: str, buyer: str, trains: int, note: str, created_at: str):
-    con = _con(db_path)
+def list_trains(user_id: str, company_id: str) -> List[Dict[str, Any]]:
+    con = _con()
     cur = con.cursor()
     cur.execute(
-        """
-        INSERT INTO train_entries(user_id, company_id, buyer, trains, note, created_at)
-        VALUES(?,?,?,?,?,?)
-        """,
-        (user_id, company_id, buyer, int(trains), note, created_at),
+        "SELECT * FROM trains WHERE user_id=? AND company_id=? ORDER BY id DESC",
+        (user_id, company_id),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    for r in rows:
+        r["remaining"] = max(0, int(r["trains_bought"]) - int(r["trains_used"]))
+    return rows
+
+
+def set_trains_used(user_id: str, train_id: int, trains_used: int):
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE trains SET trains_used=? WHERE user_id=? AND id=?",
+        (int(trains_used), user_id, int(train_id)),
     )
     con.commit()
     con.close()
 
 
-def list_train_entries(db_path: str, user_id: str, company_id: str, limit: int = 80) -> List[Dict[str, Any]]:
-    con = _con(db_path)
+def delete_train(user_id: str, train_id: int):
+    con = _con()
+    cur = con.cursor()
+    cur.execute("DELETE FROM trains WHERE user_id=? AND id=?", (user_id, int(train_id)))
+    con.commit()
+    con.close()
+
+
+# ---- contracts ----
+def add_contract(
+    user_id: str,
+    company_id: str,
+    title: str,
+    employee_id: str = "",
+    employee_name: str = "",
+    expires_at: str = "",
+    note: str = "",
+):
+    con = _con()
     cur = con.cursor()
     cur.execute(
         """
-        SELECT id, company_id, buyer, trains, note, created_at
-        FROM train_entries
-        WHERE user_id=? AND company_id=?
-        ORDER BY id DESC
-        LIMIT ?
+        INSERT INTO contracts(user_id, company_id, employee_id, employee_name, title, expires_at, note, created_at)
+        VALUES(?,?,?,?,?,?,?,?)
         """,
-        (user_id, company_id, int(limit)),
+        (user_id, company_id, employee_id or "", employee_name or "", title, expires_at or "", note or "", _utc_now()),
+    )
+    con.commit()
+    con.close()
+
+
+def list_contracts(user_id: str, company_id: str) -> List[Dict[str, Any]]:
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM contracts WHERE user_id=? AND company_id=? ORDER BY id DESC",
+        (user_id, company_id),
     )
     rows = [dict(r) for r in cur.fetchall()]
     con.close()
     return rows
 
 
-def delete_train_entry(db_path: str, user_id: str, entry_id: int):
-    con = _con(db_path)
+def delete_contract(user_id: str, contract_id: int):
+    con = _con()
     cur = con.cursor()
-    cur.execute("DELETE FROM train_entries WHERE user_id=? AND id=?", (user_id, int(entry_id)))
+    cur.execute("DELETE FROM contracts WHERE user_id=? AND id=?", (user_id, int(contract_id)))
     con.commit()
     con.close()
-
-
-# ---------------- CACHE ----------------
-def cache_set(db_path: str, k: str, v: Dict[str, Any]):
-    con = _con(db_path)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO cache(k,v,created_at) VALUES(?,?,strftime('%s','now'))",
-        (k, json.dumps(v)),
-    )
-    con.commit()
-    con.close()
-
-
-def cache_get(db_path: str, k: str, ttl_seconds: int) -> Optional[Dict[str, Any]]:
-    con = _con(db_path)
-    cur = con.cursor()
-    cur.execute("SELECT v, created_at FROM cache WHERE k=?", (k,))
-    row = cur.fetchone()
-    if not row:
-        con.close()
-        return None
-
-    created_at = int(row["created_at"] or 0)
-    if (time.time() - created_at) > ttl_seconds:
-        # delete expired
-        cur.execute("DELETE FROM cache WHERE k=?", (k,))
-        con.commit()
-        con.close()
-        return None
-
-    con.close()
-    try:
-        return json.loads(row["v"])
-    except Exception:
-        return None
