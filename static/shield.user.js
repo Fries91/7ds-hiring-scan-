@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 
+// @name         Company Hub 💼
 // @namespace    fries91-7ds-wrath
-// @version      6.2.0
-// @description  Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value company theme. Briefcase always on top, smaller, no duplicates. Includes Bad-JSON preview.
+// @version      6.2.1
+// @description  Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value company theme. Briefcase always on top, smaller, no duplicates. Includes Bad-JSON preview. HoF Search = TOTAL only.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @run-at       document-idle
@@ -312,7 +312,7 @@
   document.documentElement.appendChild(panel);
 
   // Ensure the button stays visible even if Torn re-renders
-  const keepAlive = setInterval(() => {
+  setInterval(() => {
     if (!document.getElementById(EL_BTN)) {
       try { document.documentElement.appendChild(btn); } catch {}
     }
@@ -984,6 +984,7 @@
     return wrap;
   }
 
+  // ✅ UPDATED: HoF view now TOTAL ONLY
   function viewHof() {
     const wrap = document.createElement("div");
 
@@ -991,16 +992,12 @@
     c.className = "card";
     c.innerHTML = `
       <div style="font-weight:1000;">HoF Workstats Search</div>
-      <div class="muted">Server scans HoF using your saved API key.</div>
+      <div class="muted">TOTAL only (MAN + INT + END). Server scans HoF using your saved API key.</div>
     `;
     wrap.appendChild(c);
 
-    const minMan = document.createElement("input"); minMan.type="number"; minMan.placeholder="Min MAN";
-    const maxMan = document.createElement("input"); maxMan.type="number"; maxMan.placeholder="Max MAN";
-    const minInt = document.createElement("input"); minInt.type="number"; minInt.placeholder="Min INT";
-    const maxInt = document.createElement("input"); maxInt.type="number"; maxInt.placeholder="Max INT";
-    const minEnd = document.createElement("input"); minEnd.type="number"; minEnd.placeholder="Min END";
-    const maxEnd = document.createElement("input"); maxEnd.type="number"; maxEnd.placeholder="Max END";
+    const minTotal = document.createElement("input"); minTotal.type="number"; minTotal.placeholder="Min TOTAL (e.g. 150000)";
+    const maxTotal = document.createElement("input"); maxTotal.type="number"; maxTotal.placeholder="Max TOTAL (e.g. 350000)";
 
     const go = document.createElement("button");
     go.className = "btn";
@@ -1011,16 +1008,10 @@
     meta.style.marginTop = "10px";
     meta.textContent = "—";
 
-    const grid1 = document.createElement("div"); grid1.className="row"; grid1.append(minMan, maxMan);
-    const grid2 = document.createElement("div"); grid2.className="row"; grid2.append(minInt, maxInt);
-    const grid3 = document.createElement("div"); grid3.className="row"; grid3.append(minEnd, maxEnd);
+    const grid = document.createElement("div"); grid.className="row"; grid.append(minTotal, maxTotal);
 
     c.appendChild(document.createElement("div")).style.height="10px";
-    c.appendChild(grid1);
-    c.appendChild(document.createElement("div")).style.height="8px";
-    c.appendChild(grid2);
-    c.appendChild(document.createElement("div")).style.height="8px";
-    c.appendChild(grid3);
+    c.appendChild(grid);
     c.appendChild(document.createElement("div")).style.height="10px";
     c.appendChild(go);
     c.appendChild(meta);
@@ -1070,13 +1061,10 @@
         go.disabled = true;
         meta.textContent = "Searching…";
 
+        // ✅ TOTAL ONLY payload
         const filters = {
-          min_man: Number(minMan.value || 0),
-          max_man: Number(maxMan.value || 10 ** 12),
-          min_int: Number(minInt.value || 0),
-          max_int: Number(maxInt.value || 10 ** 12),
-          min_end: Number(minEnd.value || 0),
-          max_end: Number(maxEnd.value || 10 ** 12),
+          min_total: Number(minTotal.value || 0),
+          max_total: Number(maxTotal.value || 10 ** 12),
         };
 
         const res = await hofSearch(filters);
