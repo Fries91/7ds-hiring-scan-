@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         7DS*: Peace Hiring Hub 💼 (Multi-User Admin Key + User API Key)
 // @namespace    sevends-hiring-scan
-// @version      2.0.0
+// @version      2.0.2
 // @description  Multi-user Hiring Hub. You need an Admin Key (from Fries) + your own Torn API key. Session-token auth. Companies/Trains/Applications/HoF Search.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -9,32 +9,33 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
-// @connect      *
+// @connect      sevends-hiring-scan.onrender.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
+  // ✅ HARDCODED BASE URL (no prompt)
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com";
+
   // -----------------------
   // Storage keys
   // -----------------------
-  const K_BASE = "peace_hub_base_url";
   const K_ADMIN = "peace_hub_admin_key";
   const K_API = "peace_hub_user_api_key";
   const K_TOKEN = "peace_hub_session_token";
   const K_COMPANY_IDS = "peace_hub_company_ids";
+  const K_SETUP_CANCELLED = "peace_hub_setup_cancelled"; // ✅ If user cancels setup, don't ask again.
 
   // -----------------------
   // Helpers
   // -----------------------
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  function gmReq(method, url, dataObj) {
+  function gmReq(method, url, dataObj, extraHeaders = {}) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method,
         url,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...extraHeaders },
         data: dataObj ? JSON.stringify(dataObj) : null,
         onload: (res) => {
           try {
@@ -50,27 +51,8 @@
   }
 
   function gmReqAuthed(method, url, dataObj) {
-    return new Promise((resolve, reject) => {
-      const token = (GM_getValue(K_TOKEN, "") || "").trim();
-      GM_xmlhttpRequest({
-        method,
-        url,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Session-Token": token,
-        },
-        data: dataObj ? JSON.stringify(dataObj) : null,
-        onload: (res) => {
-          try {
-            const json = JSON.parse(res.responseText || "{}");
-            resolve({ status: res.status, json });
-          } catch (e) {
-            resolve({ status: res.status, json: { ok: false, error: "bad json" } });
-          }
-        },
-        onerror: () => reject(new Error("network error")),
-      });
-    });
+    const token = (GM_getValue(K_TOKEN, "") || "").trim();
+    return gmReq(method, url, dataObj, { "X-Session-Token": token });
   }
 
   function escapeHtml(s) {
@@ -82,44 +64,90 @@
       .replace(/'/g, "&#039;");
   }
 
-  function promptSetupIfNeeded() {
-    let base = (GM_getValue(K_BASE, "") || "").trim();
+  function promptMaybe(label, currentVal) {
+    // returns:
+    // - string (possibly empty) if user clicked OK
+    // - null if user hit Cancel
+    const out = prompt(label, currentVal || "");
+    if (out === null) return null;
+    return String(out).trim();
+  }
+
+  function promptSetupIfNeeded(force = false) {
+    // If user previously cancelled and we're not forcing (Settings button), don't ask again.
+    const cancelled = !!GM_getValue(K_SETUP_CANCELLED, false);
+    if (!force && cancelled) {
+      return {
+        admin: (GM_getValue(K_ADMIN, "") || "").trim(),
+        api: (GM_getValue(K_API, "") || "").trim(),
+        cids: (GM_getValue(K_COMPANY_IDS, "") || "").trim(),
+        cancelled: true,
+      };
+    }
+
     let admin = (GM_getValue(K_ADMIN, "") || "").trim();
     let api = (GM_getValue(K_API, "") || "").trim();
     let cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
 
-    if (!base) base = prompt("Peace Hub BASE_URL (your Render URL)\nExample: https://sevends-hiring-scan.onrender.com", "") || "";
-    if (!admin) admin = prompt("Admin Access Key (from Fries)", "") || "";
-    if (!api) api = prompt("Your Torn API Key (your own key)", "") || "";
-    if (!cids) cids = prompt("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", "") || "";
+    // Ask only what is missing (unless forced)
+    if (force || !admin) {
+      const v = promptMaybe("Admin Access Key (from Fries)", admin);
+      if (v === null) {
+        GM_setValue(K_SETUP_CANCELLED, true);
+        return { admin, api, cids, cancelled: true };
+      }
+      admin = v;
+    }
 
-    base = base.trim().replace(/\/+$/, "");
-    admin = admin.trim();
-    api = api.trim();
-    cids = cids.trim();
+    if (force || !api) {
+      const v = promptMaybe("Your Torn API Key (your own key)", api);
+      if (v === null) {
+        GM_setValue(K_SETUP_CANCELLED, true);
+        return { admin, api, cids, cancelled: true };
+      }
+      api = v;
+    }
 
-    GM_setValue(K_BASE, base);
+    if (force || !cids) {
+      const v = promptMaybe("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", cids);
+      if (v === null) {
+        // Company IDs are optional; cancel still means "stop asking"
+        GM_setValue(K_SETUP_CANCELLED, true);
+        return { admin, api, cids, cancelled: true };
+      }
+      cids = v;
+    }
+
+    // Save and clear cancelled flag if we successfully completed prompts
     GM_setValue(K_ADMIN, admin);
     GM_setValue(K_API, api);
     GM_setValue(K_COMPANY_IDS, cids);
-    return { base, admin, api, cids };
+    GM_setValue(K_SETUP_CANCELLED, false);
+
+    return { admin, api, cids, cancelled: false };
   }
 
   async function ensureAuth() {
-    const base = (GM_getValue(K_BASE, "") || "").trim().replace(/\/+$/, "");
+    // If cancelled, don't keep prompting
+    const cancelled = !!GM_getValue(K_SETUP_CANCELLED, false);
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
 
-    if (!base || !admin || !api) {
-      promptSetupIfNeeded();
+    if ((!admin || !api) && !cancelled) {
+      const r = promptSetupIfNeeded(false);
+      if (r.cancelled) throw new Error("Setup cancelled. Tap Settings to enter your keys.");
       return ensureAuth();
     }
 
+    if (!admin || !api) {
+      throw new Error("Setup not completed. Tap Settings to enter your keys.");
+    }
+
     // If token exists, trust it until server rejects
-    let tok = (GM_getValue(K_TOKEN, "") || "").trim();
+    const tok = (GM_getValue(K_TOKEN, "") || "").trim();
     if (tok) return true;
 
-    const { status, json } = await gmReq("POST", `${base}/api/auth`, {
+    const { status, json } = await gmReq("POST", `${BASE_URL}/api/auth`, {
       admin_key: admin,
       api_key: api,
     });
@@ -131,10 +159,10 @@
 
     GM_setValue(K_TOKEN, json.token);
 
-    // push company IDs right after auth (optional)
+    // Push company IDs right after auth (optional)
     const cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
     if (cids) {
-      await gmReqAuthed("POST", `${base}/api/user/companies`, { company_ids: cids });
+      await gmReqAuthed("POST", `${BASE_URL}/api/user/companies`, { company_ids: cids });
     }
 
     return true;
@@ -258,9 +286,17 @@
   badge.addEventListener("click", togglePanel);
   panel.querySelector("#p-close").addEventListener("click", togglePanel);
 
-  panel.querySelector("#p-settings").addEventListener("click", () => {
+  panel.querySelector("#p-settings").addEventListener("click", async () => {
+    // Clear token and force prompts again
     GM_setValue(K_TOKEN, "");
-    promptSetupIfNeeded();
+    GM_setValue(K_SETUP_CANCELLED, false);
+    promptSetupIfNeeded(true);
+
+    // Try to save companies immediately (optional)
+    try {
+      await ensureAuth();
+    } catch (_) {}
+
     renderActiveTab();
   });
 
@@ -282,20 +318,22 @@
     body.innerHTML = `<div class="muted">Loading…</div>`;
 
     try {
-      promptSetupIfNeeded();
+      // Only prompt if not cancelled
+      promptSetupIfNeeded(false);
       await ensureAuth();
     } catch (e) {
       body.innerHTML = `
         <div class="card">
-          <div style="font-weight:900;">Auth Error</div>
+          <div style="font-weight:900;">Setup Needed</div>
           <div class="muted" style="margin-top:6px;">${escapeHtml(e.message || String(e))}</div>
           <div class="p-row" style="margin-top:10px;">
-            <button class="p-btn" id="fix">Re-enter Settings</button>
+            <button class="p-btn" id="fix">Open Settings</button>
           </div>
         </div>`;
       body.querySelector("#fix").onclick = () => {
         GM_setValue(K_TOKEN, "");
-        promptSetupIfNeeded();
+        GM_setValue(K_SETUP_CANCELLED, false);
+        promptSetupIfNeeded(true);
         renderActiveTab();
       };
       return;
@@ -308,8 +346,7 @@
   }
 
   async function renderCompanies() {
-    const base = (GM_getValue(K_BASE, "") || "").trim().replace(/\/+$/, "");
-    const res = await gmReqAuthed("GET", `${base}/api/companies`, null);
+    const res = await gmReqAuthed("GET", `${BASE_URL}/api/companies`, null);
     if (!res.json || res.json.ok !== true) {
       body.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
       return;
@@ -319,7 +356,7 @@
       body.innerHTML = `
         <div class="card">
           <div style="font-weight:900;">No companies loaded</div>
-          <div class="muted" style="margin-top:6px;">Add company IDs in Settings (comma-separated), then reopen tab.</div>
+          <div class="muted" style="margin-top:6px;">Hit Settings and add company IDs (comma-separated), then reopen tab.</div>
         </div>`;
       return;
     }
@@ -342,7 +379,6 @@
   }
 
   async function renderTrains() {
-    const base = (GM_getValue(K_BASE, "") || "").trim().replace(/\/+$/, "");
     const companyIds = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
 
     if (!companyIds) {
@@ -372,7 +408,7 @@
 
     async function loadList() {
       const cid = body.querySelector("#cid").value;
-      const res = await gmReqAuthed("GET", `${base}/api/trains?company_id=${encodeURIComponent(cid)}`, null);
+      const res = await gmReqAuthed("GET", `${BASE_URL}/api/trains?company_id=${encodeURIComponent(cid)}`, null);
       const wrap = body.querySelector("#train-list");
       if (!res.json || res.json.ok !== true) {
         wrap.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
@@ -401,7 +437,7 @@
       wrap.querySelectorAll("[data-del]").forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute("data-del");
-          await gmReqAuthed("POST", `${base}/api/trains/delete`, { id: Number(id) });
+          await gmReqAuthed("POST", `${BASE_URL}/api/trains/delete`, { id: Number(id) });
           loadList();
         };
       });
@@ -415,7 +451,7 @@
       const trains = body.querySelector("#trains").value.trim();
       const note = body.querySelector("#note").value.trim();
 
-      const res = await gmReqAuthed("POST", `${base}/api/trains/add`, {
+      const res = await gmReqAuthed("POST", `${BASE_URL}/api/trains/add`, {
         company_id: cid,
         buyer,
         trains: Number(trains),
@@ -437,8 +473,7 @@
   }
 
   async function renderApps() {
-    const base = (GM_getValue(K_BASE, "") || "").trim().replace(/\/+$/, "");
-    const res = await gmReqAuthed("GET", `${base}/api/applications`, null);
+    const res = await gmReqAuthed("GET", `${BASE_URL}/api/applications`, null);
     if (!res.json || res.json.ok !== true) {
       body.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
       return;
@@ -479,7 +514,7 @@
     body.querySelectorAll("select[data-sel]").forEach((sel) => {
       sel.onchange = async () => {
         const id = Number(sel.getAttribute("data-sel"));
-        await gmReqAuthed("POST", `${base}/api/applications/status`, { id, status: sel.value });
+        await gmReqAuthed("POST", `${BASE_URL}/api/applications/status`, { id, status: sel.value });
       };
     });
 
@@ -492,7 +527,7 @@
         const out = card.querySelector(`#ws-${CSS.escape(String(id))}`);
         out.textContent = "Loading…";
 
-        const r = await gmReqAuthed("GET", `${base}/api/applicant?id=${encodeURIComponent(applicantId)}`, null);
+        const r = await gmReqAuthed("GET", `${BASE_URL}/api/applicant?id=${encodeURIComponent(applicantId)}`, null);
         if (!r.json || r.json.ok !== true) {
           out.textContent = r.json?.error || "Failed";
           return;
@@ -504,8 +539,6 @@
   }
 
   async function renderSearch() {
-    const base = (GM_getValue(K_BASE, "") || "").trim().replace(/\/+$/, "");
-
     body.innerHTML = `
       <div class="card">
         <div style="font-weight:900;">HoF Workstats Search</div>
@@ -527,7 +560,7 @@
 
       const r = await gmReqAuthed(
         "GET",
-        `${base}/api/search_workstats?min=${encodeURIComponent(min)}&max=${encodeURIComponent(max)}&limit=${encodeURIComponent(limit)}`,
+        `${BASE_URL}/api/search_workstats?min=${encodeURIComponent(min)}&max=${encodeURIComponent(max)}&limit=${encodeURIComponent(limit)}`,
         null
       );
 
@@ -561,7 +594,9 @@
     };
   }
 
-  // initial render
+  // -----------------------
+  // Start
+  // -----------------------
   panel.style.display = "none";
   renderActiveTab();
 })();
