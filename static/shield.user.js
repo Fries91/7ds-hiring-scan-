@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Company Hub 💼 (Multi-User + Disk + HoF Auto-Offset Search)
+// @name         Company Hub 💼
 // @namespace    sevends-hiring-scan
 // @version      3.1.0
 // @description  Works with sevends-hiring-scan.onrender.com multi-user backend. No duplicates. Badge click open/close. Draggable. Companies/Trains/Apps/Search. HoF Search includes Auto-Find Offset.
