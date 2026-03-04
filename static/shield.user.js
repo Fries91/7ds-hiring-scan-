@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         7DS*: Peace Hub 💼 (High-Value Theme + Draggable Briefcase + Click to Open/Close)
-// @namespace    7ds-peace-hub
+// @name          Company Hub 💼
+// @namespace    7ds-Company-hub
 // @version      1.1.0
 // @description  Company owner hub: employees, trains, contracts, HoF working stat scan. Briefcase stays on top, is draggable, and CLICK toggles open/close.
 // @match        https://www.torn.com/*
