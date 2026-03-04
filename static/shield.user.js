@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Company Hub 💼
 // @namespace    Fries-company-hub
-// @version      2.0.2
+// @version      2.0.3
 // @description  Company hub: employees, trains, contracts, recruit leads, HoF scan. Briefcase tap toggles overlay (mobile-safe).
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -18,6 +18,18 @@
   // ================= USER CONFIG =================
   const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // <-- CHANGE if needed
   // ==============================================
+
+  // ---------- Prevent duplication on Torn SPA navigation ----------
+  // Remove any previous injected UI + timers (if the script runs again)
+  try {
+    const oldBag = document.getElementById("p7ds-bag");
+    const oldPanel = document.getElementById("p7ds-panel");
+    if (oldBag) oldBag.remove();
+    if (oldPanel) oldPanel.remove();
+
+    if (window.__P7DS_HUB_INTERVAL__) clearInterval(window.__P7DS_HUB_INTERVAL__);
+    window.__P7DS_HUB_INTERVAL__ = null;
+  } catch {}
 
   const K_ADMIN = "hub_admin_key_v2";
   const K_API   = "hub_api_key_v2";
@@ -66,8 +78,8 @@
     #p7ds-bag{
       position:fixed; right:16px; bottom:118px;
       z-index:99999999;
-      width:56px; height:56px;
-      border-radius:18px;
+      width:46px; height:46px;          /* smaller */
+      border-radius:16px;
       background: radial-gradient(140% 140% at 15% 10%, rgba(230,195,106,.22) 0%, rgba(11,16,25,1) 60%);
       border:1px solid var(--hv-border2);
       display:flex; align-items:center; justify-content:center;
@@ -78,20 +90,21 @@
     }
     #p7ds-bag:active{cursor:grabbing}
     #p7ds-bag .icon{
-      font-size:24px; /* smaller icon */
+      font-size:18px;                   /* smaller icon */
+      line-height:1;
       filter: drop-shadow(0 2px 8px rgba(0,0,0,.5));
     }
     #p7ds-bag .badge{
       position:absolute; top:-7px; right:-7px;
-      min-width:22px; height:22px; padding:0 6px;
+      min-width:20px; height:20px; padding:0 6px;
       border-radius:999px; background:var(--hv-danger);
-      color:#fff; font-weight:800; font-size:12px;
+      color:#fff; font-weight:800; font-size:11px;
       display:none; align-items:center; justify-content:center;
       border:2px solid var(--hv-bg);
     }
 
     #p7ds-panel{
-      position:fixed; right:16px; bottom:188px;
+      position:fixed;
       z-index:9999990;
       width:360px; max-height:72vh; overflow:auto;
       border-radius:18px;
@@ -124,6 +137,7 @@
       padding:6px 8px;
       font-size:11px;
       cursor:pointer;
+      pointer-events:auto;
     }
     .p7btn.on{ border-color: rgba(230,195,106,.9); box-shadow: 0 0 0 2px rgba(230,195,106,.12) inset; }
     .p7btn.gold{ border-color: rgba(230,195,106,.9); background: linear-gradient(180deg, rgba(230,195,106,.18), rgba(6,10,15,.92)); }
@@ -186,10 +200,12 @@
     }
   }
 
-  // Keep taps inside panel from bubbling to Torn/PDA handlers that may close overlays
-  panel.addEventListener("click", (e) => { e.stopPropagation(); }, true);
-  panel.addEventListener("touchstart", (e) => { e.stopPropagation(); }, { passive: true, capture: true });
-  panel.addEventListener("touchend", (e) => { e.stopPropagation(); }, { passive: true, capture: true });
+  // IMPORTANT FIX:
+  // DO NOT use capture=true here (it blocks buttons/tabs/login).
+  // Bubble-phase stopPropagation keeps Torn/PDA handlers from hijacking clicks.
+  panel.addEventListener("click", (e) => e.stopPropagation());
+  panel.addEventListener("touchstart", (e) => e.stopPropagation(), { passive: true });
+  panel.addEventListener("touchend", (e) => e.stopPropagation(), { passive: true });
 
   // ---------- DRAG + TAP (mobile safe) ----------
   let dragging = false;
@@ -256,14 +272,12 @@
     if (!moved && dt < 400) {
       togglePanel();
 
-      // IMPORTANT: iOS will fire a click after touchend — block it
+      // iOS will fire a click after touchend — block it
       suppressNextClick = true;
       setTimeout(() => { suppressNextClick = false; }, 500);
     }
 
     moved = false;
-
-    // extra safety
     if (e && e.preventDefault) e.preventDefault();
   }, { passive: false });
 
@@ -276,16 +290,12 @@
   window.addEventListener("mouseup", () => endDrag());
 
   bag.addEventListener("click", (e) => {
-    // Block the ghost click that follows touchend on iOS
     if (suppressNextClick) {
       e.preventDefault();
       e.stopPropagation();
       return;
     }
-
-    // If user dragged with mouse, ignore click toggle
     if (moved) { moved = false; return; }
-
     togglePanel();
   });
 
@@ -308,9 +318,9 @@
   function renderTabs(){
     tabsEl.innerHTML="";
     TABS.forEach(t=>{
-      const b=el("button",{className:"p7btn"},t);
+      const b=el("button",{className:"p7btn", type:"button"},t);
       if(t===activeTab) b.classList.add("on");
-      b.addEventListener("click",(e)=>{ e.stopPropagation(); activeTab=t; render(); });
+      b.addEventListener("click",()=>{ activeTab=t; render(); });
       tabsEl.appendChild(b);
     });
   }
@@ -325,7 +335,7 @@
     const cur=state.selected_company_id || (state.company_ids||[])[0] || "";
     sel.value = (saved && (state.company_ids||[]).includes(saved)) ? saved : cur;
 
-    sel.addEventListener("change",async(e)=>{ e.stopPropagation(); setVal(K_SEL,sel.value); await refresh(sel.value); });
+    sel.addEventListener("change",async()=>{ setVal(K_SEL,sel.value); await refresh(sel.value); });
     c.appendChild(el("div",{className:"mini"},`<b>Selected Company</b> <span class="pill gold">${sel.value||""}</span>`));
     c.appendChild(sel);
     return c;
@@ -363,12 +373,11 @@
     ));
 
     const btnRow = el("div",{style:"display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"});
-    const scanBtn = el("button",{className:"p7btn gold"},"Scan Now");
-    const seenBtn2= el("button",{className:"p7btn"},"Mark Seen");
-    const clearBtn= el("button",{className:"p7btn"},"Clear");
+    const scanBtn = el("button",{className:"p7btn gold", type:"button"},"Scan Now");
+    const seenBtn2= el("button",{className:"p7btn", type:"button"},"Mark Seen");
+    const clearBtn= el("button",{className:"p7btn", type:"button"},"Clear");
 
-    scanBtn.addEventListener("click", async (e)=>{
-      e.stopPropagation();
+    scanBtn.addEventListener("click", async ()=>{
       scanBtn.textContent="Scanning...";
       const res = await apiPost(`${BASE_URL}/api/recruit/scan`, { company_id: state.selected_company_id }, token);
       scanBtn.textContent="Scan Now";
@@ -376,14 +385,12 @@
       if(!res.ok) alert("Recruit scan failed: " + (res.error||"unknown"));
     });
 
-    seenBtn2.addEventListener("click", async (e)=>{
-      e.stopPropagation();
+    seenBtn2.addEventListener("click", async ()=>{
       await apiPost(`${BASE_URL}/api/recruit/seen`, { company_id: state.selected_company_id }, token);
       await refresh(state.selected_company_id);
     });
 
-    clearBtn.addEventListener("click", async (e)=>{
-      e.stopPropagation();
+    clearBtn.addEventListener("click", async ()=>{
       await apiPost(`${BASE_URL}/api/recruit/clear`, { company_id: state.selected_company_id }, token);
       await refresh(state.selected_company_id);
     });
@@ -406,10 +413,9 @@
           <span class="pill gold">+${money(r.delta_vs_floor)} vs floor</span>
         </div>
         <div class="mini">MAN ${money(r.man)} • INT ${money(r.intel)} • END ${money(r.endu)} • <b>Total ${money(r.total)}</b></div>
-        <button class="p7btn" data-msg="${encodeURIComponent(msg)}" style="margin-top:8px">Copy Recruit Msg</button>
+        <button class="p7btn" type="button" data-msg="${encodeURIComponent(msg)}" style="margin-top:8px">Copy Recruit Msg</button>
       `;
       card.querySelector("button[data-msg]").addEventListener("click", async (e)=>{
-        e.stopPropagation();
         const txt = decodeURIComponent(e.currentTarget.getAttribute("data-msg"));
         await navigator.clipboard.writeText(txt);
         e.currentTarget.textContent = "Copied!";
@@ -429,10 +435,9 @@
     const buyer=el("input",{placeholder:"Buyer name"});
     const amt=el("input",{placeholder:"Trains bought",type:"number"});
     const note=el("input",{placeholder:"Note (optional)"});
-    const addBtn=el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Add Train Record");
+    const addBtn=el("button",{className:"p7btn gold", type:"button", style:"grid-column:1/-1"},"Add Train Record");
 
-    addBtn.addEventListener("click",async(e)=>{
-      e.stopPropagation();
+    addBtn.addEventListener("click",async()=>{
       await apiPost(`${BASE_URL}/api/trains/add`,{
         company_id: state.selected_company_id,
         buyer_name: buyer.value.trim(),
@@ -456,16 +461,14 @@
       `;
       const row=el("div",{className:"row",style:"margin-top:8px"});
       const used=el("input",{type:"number",value:String(t.trains_used||0),placeholder:"Used"});
-      const save=el("button",{className:"p7btn"},"Save Used");
-      const del=el("button",{className:"p7btn"},"Delete");
+      const save=el("button",{className:"p7btn", type:"button"},"Save Used");
+      const del=el("button",{className:"p7btn", type:"button"},"Delete");
 
-      save.addEventListener("click",async(e)=>{
-        e.stopPropagation();
+      save.addEventListener("click",async()=>{
         await apiPost(`${BASE_URL}/api/trains/set_used`,{id:t.id,trains_used:Number(used.value||0)},token);
         await refresh(state.selected_company_id);
       });
-      del.addEventListener("click",async(e)=>{
-        e.stopPropagation();
+      del.addEventListener("click",async()=>{
         await apiPost(`${BASE_URL}/api/trains/delete`,{id:t.id},token);
         await refresh(state.selected_company_id);
       });
@@ -487,10 +490,9 @@
     const empI=el("input",{placeholder:"Employee id (optional)"});
     const exp=el("input",{placeholder:"Expires ISO (optional) e.g. 2026-03-10T00:00:00+00:00"});
     const note=el("input",{placeholder:"Note (optional)"});
-    const add=el("button",{className:"p7btn gold",style:"margin-top:8px"},"Add Contract");
+    const add=el("button",{className:"p7btn gold", type:"button", style:"margin-top:8px"},"Add Contract");
 
-    add.addEventListener("click",async(e)=>{
-      e.stopPropagation();
+    add.addEventListener("click",async()=>{
       await apiPost(`${BASE_URL}/api/contracts/add`,{
         company_id: state.selected_company_id,
         title: title.value.trim(),
@@ -514,9 +516,8 @@
         <div class="mini">${k.employee_name||""} ${k.employee_id?`(#${k.employee_id})`:""}</div>
         <div class="mini">${k.note||""}</div>
       `;
-      const del=el("button",{className:"p7btn",style:"margin-top:8px"},"Delete");
-      del.addEventListener("click",async(e)=>{
-        e.stopPropagation();
+      const del=el("button",{className:"p7btn", type:"button", style:"margin-top:8px"},"Delete");
+      del.addEventListener("click",async()=>{
         await apiPost(`${BASE_URL}/api/contracts/delete`,{id:k.id},token);
         await refresh(state.selected_company_id);
       });
@@ -537,11 +538,10 @@
     const maxInt=el("input",{type:"number",placeholder:"Max INT"});
     const minEnd=el("input",{type:"number",placeholder:"Min END"});
     const maxEnd=el("input",{type:"number",placeholder:"Max END"});
-    const go=el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Scan");
+    const go=el("button",{className:"p7btn gold", type:"button", style:"grid-column:1/-1"},"Scan");
     const out=el("div",{className:"mini",style:"margin-top:10px"},"");
 
-    go.addEventListener("click",async(e)=>{
-      e.stopPropagation();
+    go.addEventListener("click",async()=>{
       out.textContent="Scanning...";
       const res=await apiPost(`${BASE_URL}/api/search/hof`,{
         min_man:Number(minMan.value||0),
@@ -574,11 +574,10 @@
     c.appendChild(el("div",{className:"mini"},"<b>Broadcast</b> (copy/paste)"));
     const ta=el("textarea",{rows:5,placeholder:"Write message..."});
     ta.value="Reminder: contracts renewing soon. Please stay active and reply if you need anything.";
-    const copy=el("button",{className:"p7btn gold",style:"margin-top:8px"},"Copy");
-    copy.addEventListener("click",async(e)=>{
-      e.stopPropagation();
+    const copy=el("button",{className:"p7btn gold", type:"button", style:"margin-top:8px"},"Copy");
+    copy.addEventListener("click",async()=>{
       await navigator.clipboard.writeText(ta.value);
-      copy.textContent = "Copied!";
+      copy.textContent="Copied!";
       setTimeout(()=>copy.textContent="Copy",900);
     });
     c.appendChild(ta); c.appendChild(copy);
@@ -596,11 +595,10 @@
     api.value=getVal(K_API,"");
     comps.value=getVal(K_COMP,"");
 
-    const save=el("button",{className:"p7btn gold",style:"margin-top:8px"},"Login / Save");
+    const save=el("button",{className:"p7btn gold", type:"button", style:"margin-top:8px"},"Login / Save");
     const info=el("div",{className:"mini",style:"margin-top:8px"},"");
 
-    save.addEventListener("click",async(e)=>{
-      e.stopPropagation();
+    save.addEventListener("click",async()=>{
       setVal(K_ADMIN,admin.value.trim());
       setVal(K_API,api.value.trim());
       setVal(K_COMP,comps.value.trim());
@@ -682,8 +680,7 @@
     if(activeTab==="Settings") bodyEl.appendChild(renderSettings(token));
   }
 
-  seenBtn.addEventListener("click", async (e)=>{
-    e.stopPropagation();
+  seenBtn.addEventListener("click", async ()=>{
     const token=getVal(K_TOK,"");
     if(!token) return;
     await apiPost(`${BASE_URL}/api/notifications/seen`,{},token);
@@ -692,5 +689,8 @@
 
   // Start + polling
   refresh(getVal(K_SEL,""));
-  setInterval(()=>refresh(state?.selected_company_id||getVal(K_SEL,"")), 15000);
+  window.__P7DS_HUB_INTERVAL__ = setInterval(
+    ()=>refresh(state?.selected_company_id||getVal(K_SEL,"")),
+    15000
+  );
 })();
