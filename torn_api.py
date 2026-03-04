@@ -19,7 +19,6 @@ def _get(url: str, params: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
 
 
 def get_user_basic(key: str) -> Dict[str, Any]:
-    # Works for validating the key and extracting player_id + name
     url = f"{API_V1_BASE}/user/"
     return _get(url, {"selections": "basic", "key": key})
 
@@ -33,7 +32,6 @@ def get_company_employees(company_id: str, key: str) -> Dict[str, Any]:
     url = f"{API_V1_BASE}/company/{company_id}"
     payload = _get(url, {"selections": "employees,profile", "key": key})
 
-    # Normalize employee list into array for UI
     company = payload.get("company", payload) if isinstance(payload, dict) else {}
     employees_obj = company.get("employees") or company.get("employee") or {}
     employees = []
@@ -68,7 +66,6 @@ def get_company_employees(company_id: str, key: str) -> Dict[str, Any]:
             )
 
     employees.sort(key=lambda x: (x.get("position") or "", x.get("name") or ""))
-
     return {
         "company_id": str(company_id),
         "company_name": company.get("name") or company.get("company_name") or f"Company {company_id}",
@@ -101,7 +98,6 @@ def normalize_workstats(user_payload: Dict[str, Any]) -> Dict[str, Optional[int]
             total = int(man) + int(inte) + int(end)
     except Exception:
         total = None
-
     return {"man": _to_int(man), "int": _to_int(inte), "end": _to_int(end), "total": total}
 
 
@@ -148,11 +144,7 @@ def search_hof_workstats_v2(key: str, min_val: int, max_val: int, limit_results:
             uid = str(e.get("user_id") or e.get("id") or e.get("userid") or "")
             name = e.get("name") or e.get("username") or ""
             rank = e.get("rank") or e.get("position") or e.get("place") or None
-            raw_val = e.get("value")
-            if raw_val is None:
-                raw_val = e.get("score")
-            if raw_val is None:
-                raw_val = e.get("workstats")
+            raw_val = e.get("value") if e.get("value") is not None else (e.get("score") if e.get("score") is not None else e.get("workstats"))
 
             try:
                 val = int(raw_val)
@@ -165,7 +157,7 @@ def search_hof_workstats_v2(key: str, min_val: int, max_val: int, limit_results:
                 if len(found) >= limit_results:
                     return found, scanned_pages
 
-        # Early stop if HoF is descending and we fell below min_val
+        # Early stop if descending and we fell below min
         if vals and max(vals) < min_val:
             break
 
