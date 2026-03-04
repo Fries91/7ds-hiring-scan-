@@ -3,11 +3,10 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request, send_from_directory, render_template_string
 from dotenv import load_dotenv
-from werkzeug.exceptions import HTTPException
 
 from db import (
     init_db,
@@ -34,7 +33,6 @@ from db import (
     mark_leads_seen,
     count_unseen_leads,
 )
-
 from torn_api import me_basic, company_profile, hof_scan_workstats
 
 load_dotenv()
@@ -77,30 +75,9 @@ def _require_session() -> Optional[Dict[str, Any]]:
     return s
 
 
-@app.errorhandler(Exception)
-def handle_any_error(e):
-    wants_json = request.path.startswith("/api/") or request.path == "/state"
-    if isinstance(e, HTTPException):
-        code = e.code or 500
-        msg = e.description or str(e)
-    else:
-        code = 500
-        msg = str(e)
-
-    if wants_json:
-        return jsonify({"ok": False, "error": msg, "status": code}), code
-
-    return f"Error: {msg}", code
-
-
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "time": _utc_now()})
-
-
-@app.get("/api/ping")
-def api_ping():
-    return jsonify({"ok": True, "time": _utc_now()})
 
 
 @app.get("/static/<path:path>")
@@ -135,6 +112,10 @@ def home():
       In the script, change BASE_URL + @connect to this service domain.
     </div>
   </div>
+  <div class="card muted">
+    <b>Premium recruiter leads</b><br>
+    The hub can scan HoF working stats and store “better than your floor employee” leads per company.
+  </div>
 </div>
 </body>
 </html>
@@ -146,7 +127,7 @@ def home():
 # ---------- AUTH ----------
 @app.post("/api/auth")
 def api_auth():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(force=True) or {}
     admin_key = (data.get("admin_key") or "").strip()
     api_key = (data.get("api_key") or "").strip()
 
@@ -178,7 +159,7 @@ def api_user_companies():
     if not s:
         return _bad("Missing/invalid session token", 403)
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(force=True) or {}
     company_ids = data.get("company_ids") or []
     if not isinstance(company_ids, list) or not company_ids:
         return _bad("company_ids must be a non-empty list")
@@ -202,7 +183,7 @@ def api_notifs_seen():
     return jsonify({"ok": True})
 
 
-# ---------- STATE ----------
+# ---------- STATE (CSP-SAFE) ----------
 @app.get("/state")
 def state():
     s = _require_session()
@@ -240,9 +221,7 @@ def state():
         "contracts": [],
         "recruit_leads": [],
         "notifications": notifs,
-        "unseen_count": unseen_notifs + unseen_leads,
-        "unseen_notifs": unseen_notifs,
-        "unseen_leads": unseen_leads,
+        "unseen_count": unseen_notifs + unseen_leads,  # badge covers both
         "updated_at": _utc_now(),
     }
 
@@ -306,8 +285,10 @@ def state():
 
             out["employees"] = norm
             out["stats"] = {"employee_count": len(norm), "inactive_3d_plus": inactive_3d}
+
             out["trains"] = list_trains(user_id, selected_company_id)
             out["contracts"] = list_contracts(user_id, selected_company_id)
+
             out["recruit_leads"] = list_leads(user_id, selected_company_id, limit=25)
 
         except Exception as e:
@@ -316,18 +297,125 @@ def state():
     return jsonify(out)
 
 
-# ---------- HOF SEARCH (TOTAL RANGE WORKS) ----------
+# ---------- TRAINS ----------
+@app.post("/api/trains/add")
+def trains_add():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    buyer_name = (data.get("buyer_name") or "").strip()
+    trains_bought = int(data.get("trains_bought") or 0)
+    note = (data.get("note") or "").strip()
+
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+    if not buyer_name or trains_bought <= 0:
+        return _bad("buyer_name and trains_bought required")
+
+    add_train(user_id, company_id, buyer_name, trains_bought, note)
+    add_notification(user_id, "trains", f"Added: {buyer_name} bought {trains_bought} trains.")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/trains/set_used")
+def trains_set_used():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+
+    data = request.get_json(force=True) or {}
+    train_id = int(data.get("id") or 0)
+    used = int(data.get("trains_used") or 0)
+    if train_id <= 0 or used < 0:
+        return _bad("bad id/used")
+
+    set_trains_used(user_id, train_id, used)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/trains/delete")
+def trains_delete():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+
+    data = request.get_json(force=True) or {}
+    train_id = int(data.get("id") or 0)
+    if train_id <= 0:
+        return _bad("bad id")
+
+    delete_train(user_id, train_id)
+    add_notification(user_id, "trains", f"Deleted train record #{train_id}.")
+    return jsonify({"ok": True})
+
+
+# ---------- CONTRACTS ----------
+@app.post("/api/contracts/add")
+def contracts_add():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    title = (data.get("title") or "").strip()
+    employee_id = (data.get("employee_id") or "").strip()
+    employee_name = (data.get("employee_name") or "").strip()
+    expires_at = (data.get("expires_at") or "").strip()
+    note = (data.get("note") or "").strip()
+
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+    if not title:
+        return _bad("title required")
+
+    add_contract(user_id, company_id, title, employee_id, employee_name, expires_at, note)
+    add_notification(user_id, "contract", f"Added contract: {title}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/contracts/delete")
+def contracts_delete():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+
+    data = request.get_json(force=True) or {}
+    contract_id = int(data.get("id") or 0)
+    if contract_id <= 0:
+        return _bad("bad id")
+
+    delete_contract(user_id, contract_id)
+    add_notification(user_id, "contract", f"Deleted contract #{contract_id}.")
+    return jsonify({"ok": True})
+
+
+# ---------- HOF SEARCH ----------
 @app.post("/api/search/hof")
 def search_hof():
     s = _require_session()
     if not s:
         return _bad("Missing/invalid session token", 403)
-
-    u = get_user(s["user_id"])
+    user_id = s["user_id"]
+    u = get_user(user_id)
     if not u:
         return _bad("User missing", 403)
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(force=True) or {}
 
     def _i(k: str, default: int) -> int:
         try:
@@ -335,16 +423,19 @@ def search_hof():
         except Exception:
             return int(default)
 
-    min_total = _i("min_total", 0)
-    max_total = _i("max_total", 10**12)
-    if max_total < min_total:
-        min_total, max_total = max_total, min_total
+    min_man = _i("min_man", 0)
+    max_man = _i("max_man", 10**12)
+    min_int = _i("min_int", 0)
+    max_int = _i("max_int", 10**12)
+    min_end = _i("min_end", 0)
+    max_end = _i("max_end", 10**12)
 
     try:
         rows = hof_scan_workstats(
             api_key=u["api_key"],
-            min_total=min_total,
-            max_total=max_total,
+            min_man=min_man, max_man=max_man,
+            min_int=min_int, max_int=max_int,
+            min_end=min_end, max_end=max_end,
             max_pages=MAX_HOF_PAGES,
             page_size=25,
         )
@@ -353,28 +444,195 @@ def search_hof():
         return _bad(f"HoF scan failed: {e}")
 
 
-# ---------- OPTIONAL AUTO SCAN LOOP (unchanged) ----------
-def _auto_scan_loop():
-    while True:
+# ===================== PREMIUM: RECRUITER LEADS =====================
+
+def _company_floor_total(company_payload: Dict[str, Any]) -> Optional[int]:
+    """
+    Finds the weakest employee total (MAN+INT+END) if those fields exist.
+    If Torn doesn't provide these fields in company employees, returns None.
+    """
+    employees = company_payload.get("company_employees") or company_payload.get("employees") or {}
+    rows = []
+    if isinstance(employees, dict):
+        for _, e in employees.items():
+            if isinstance(e, dict):
+                rows.append(e)
+    elif isinstance(employees, list):
+        rows = employees
+
+    totals = []
+    for e in rows:
+        man = e.get("manual_labor") or e.get("man")
+        inte = e.get("intelligence") or e.get("int")
+        end = e.get("endurance") or e.get("end")
         try:
-            import sqlite3
-            from db import DB_PATH
-            import json
-
-            con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            cur.execute("SELECT user_id, api_key, company_ids FROM users")
-            users = [dict(r) for r in cur.fetchall()]
-            con.close()
-
-            # (If you later want: run recruiter scan here)
-            _ = users
+            man = int(man) if man is not None else None
+            inte = int(inte) if inte is not None else None
+            end = int(end) if end is not None else None
         except Exception:
-            pass
+            man = inte = end = None
 
-        time.sleep(max(60, AUTO_SCAN_MINUTES * 60))
+        if man is None or inte is None or end is None:
+            continue
+        totals.append(man + inte + end)
+
+    if not totals:
+        return None
+    return min(totals)
 
 
-if AUTO_SCAN:
-    threading.Thread(target=_auto_scan_loop, daemon=True).start()
+def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -> Dict[str, Any]:
+    """
+    Scan HoF working stats for players that beat your weakest employee total (floor).
+    Stores top leads in DB.
+    """
+    # fetch company to compute floor
+    comp = company_profile(company_id, api_key)
+    floor = _company_floor_total(comp)
+
+    if floor is None:
+        return {"ok": False, "error": "Company employee working stats not available from API for comparison."}
+
+    # scan candidates a bit above floor (reduce noise)
+    # (we still do broad scan because HoF returns highest first)
+    candidates = hof_scan_workstats(
+        api_key=api_key,
+        min_man=0, max_man=10**12,
+        min_int=0, max_int=10**12,
+        min_end=0, max_end=10**12,
+        max_pages=MAX_HOF_PAGES,
+        page_size=25,
+    )
+
+    saved = 0
+    best_delta = 0
+
+    for r in candidates[:250]:
+        total = int(r.get("total") or 0)
+        if total <= floor:
+            continue
+
+        delta = total - floor
+        best_delta = max(best_delta, delta)
+
+        upsert_lead(
+            user_id=user_id,
+            company_id=company_id,
+            player_id=str(r["id"]),
+            name=str(r["name"]),
+            man=int(r["man"]),
+            intel=int(r["int"]),
+            endu=int(r["end"]),
+            total=total,
+            delta_vs_floor=delta,
+        )
+        saved += 1
+        # don't spam too many leads per scan
+        if saved >= 40:
+            break
+
+    if saved > 0:
+        add_notification(user_id, "recruit", f"Recruiter scan: {saved} lead(s) found for Company #{company_id} (best +{best_delta:,}).")
+
+    return {"ok": True, "company_id": company_id, "floor_total": floor, "saved": saved, "best_delta": best_delta}
+
+
+@app.post("/api/recruit/scan")
+def recruit_scan():
+    """
+    Manual trigger from overlay.
+    Body: { company_id?: "123" } or empty to scan all registered companies.
+    """
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    cid = (data.get("company_id") or "").strip()
+
+    company_ids: List[str] = u.get("company_ids") or []
+    if cid:
+        if cid not in company_ids:
+            return _bad("company_id not registered", 403)
+        targets = [cid]
+    else:
+        targets = company_ids
+
+    results = []
+    for company_id in targets:
+        try:
+            results.append(_run_recruit_scan_for_company(user_id, company_id, u["api_key"]))
+        except Exception as e:
+            results.append({"ok": False, "company_id": company_id, "error": str(e)})
+
+    return jsonify({"ok": True, "results": results})
+
+
+@app.get("/api/recruit/leads")
+def recruit_leads():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    company_id = (request.args.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    leads = list_leads(user_id, company_id, limit=50)
+    return jsonify({"ok": True, "company_id": company_id, "rows": leads})
+
+
+@app.post("/api/recruit/seen")
+def recruit_seen():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    mark_leads_seen(user_id, company_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/recruit/clear")
+def recruit_clear():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    clear_leads(user_id, company_id)
+    add_notification(user_id, "recruit", f"Cleared recruiter leads for Company #{company_id}.")
+    return jsonify({"ok": True})
+
+
+# ---------- OPTIONAL AUTO SCAN LOO
