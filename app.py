@@ -1,7 +1,9 @@
 import os
 import re
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request, send_from_directory, render_template_string
 from dotenv import load_dotenv
@@ -25,6 +27,11 @@ from db import (
     add_contract,
     list_contracts,
     delete_contract,
+    upsert_lead,
+    list_leads,
+    clear_leads,
+    mark_leads_seen,
+    count_unseen_leads,
 )
 from torn_api import me_basic, company_profile, hof_scan_workstats
 
@@ -34,8 +41,11 @@ app = Flask(__name__)
 init_db()
 
 ADMIN_KEYS = [x.strip() for x in (os.getenv("ADMIN_KEYS") or "").split(",") if x.strip()]
-DB_MAX_HOF_PAGES = int(os.getenv("MAX_HOF_PAGES", "10"))
-SERVICE_NAME = os.getenv("SERVICE_NAME", "7DS*: Peace Hiring/Company Hub")
+MAX_HOF_PAGES = int(os.getenv("MAX_HOF_PAGES", "10"))
+SERVICE_NAME = os.getenv("SERVICE_NAME", "7DS*: Peace Company Hub")
+
+AUTO_SCAN = (os.getenv("AUTO_SCAN", "0").strip() == "1")
+AUTO_SCAN_MINUTES = int(os.getenv("AUTO_SCAN_MINUTES", "10"))
 
 
 def _utc_now() -> str:
@@ -98,14 +108,13 @@ def home():
   <div class="card">
     <b>Install overlay</b>
     <div class="muted" style="margin-top:8px">
-      Use: <code>/static/shield.user.js</code><br>
-      In the script, change BASE_URL to this service domain.
+      Open: <code>/static/shield.user.js</code> then Install in Tampermonkey.<br>
+      In the script, change BASE_URL + @connect to this service domain.
     </div>
   </div>
   <div class="card muted">
-    <b>Key handling</b><br>
-    Users enter their own Torn API key in the overlay. This service stores it to fetch company + HoF scan data.
-    Only share admin keys with people you trust.
+    <b>Premium recruiter leads</b><br>
+    The hub can scan HoF working stats and store “better than your floor employee” leads per company.
   </div>
 </div>
 </body>
@@ -115,7 +124,7 @@ def home():
     )
 
 
-# -------- AUTH ----------
+# ---------- AUTH ----------
 @app.post("/api/auth")
 def api_auth():
     data = request.get_json(force=True) or {}
@@ -127,7 +136,6 @@ def api_auth():
     if not api_key or len(api_key) < 8:
         return _bad("Missing/invalid api_key")
 
-    # Validate key and identify user
     try:
         me = me_basic(api_key)
     except Exception as e:
@@ -135,7 +143,7 @@ def api_auth():
 
     user_id = str(me.get("player_id") or me.get("user_id") or me.get("playerid") or "")
     name = (me.get("name") or "").strip()
-    if not user_id or not re.fullmatch(r"\\d+", user_id):
+    if not user_id or not re.fullmatch(r"\d+", user_id):
         return _bad("Could not read user id from Torn response")
 
     upsert_user(user_id=user_id, name=name, api_key=api_key)
@@ -144,7 +152,7 @@ def api_auth():
     return jsonify({"ok": True, "token": token, "user_id": user_id, "name": name})
 
 
-# -------- USER SETTINGS ----------
+# ---------- USER SETTINGS ----------
 @app.post("/api/user/companies")
 def api_user_companies():
     s = _require_session()
@@ -153,12 +161,11 @@ def api_user_companies():
 
     data = request.get_json(force=True) or {}
     company_ids = data.get("company_ids") or []
-
     if not isinstance(company_ids, list) or not company_ids:
         return _bad("company_ids must be a non-empty list")
 
     company_ids = [str(x).strip() for x in company_ids if str(x).strip()]
-    if not all(re.fullmatch(r"\\d+", cid) for cid in company_ids):
+    if not all(re.fullmatch(r"\d+", cid) for cid in company_ids):
         return _bad("All company_ids must be numeric")
 
     user_id = s["user_id"]
@@ -176,7 +183,7 @@ def api_notifs_seen():
     return jsonify({"ok": True})
 
 
-# -------- STATE (CSP-SAFE) ----------
+# ---------- STATE (CSP-SAFE) ----------
 @app.get("/state")
 def state():
     s = _require_session()
@@ -198,7 +205,8 @@ def state():
         selected_company_id = company_ids[0] if company_ids else ""
 
     notifs = list_notifications(user_id, limit=10)
-    unseen = sum(1 for n in notifs if int(n.get("seen") or 0) == 0)
+    unseen_notifs = sum(1 for n in notifs if int(n.get("seen") or 0) == 0)
+    unseen_leads = count_unseen_leads(user_id)
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -211,8 +219,9 @@ def state():
         "stats": {},
         "trains": [],
         "contracts": [],
+        "recruit_leads": [],
         "notifications": notifs,
-        "unseen_count": unseen,
+        "unseen_count": unseen_notifs + unseen_leads,  # badge covers both
         "updated_at": _utc_now(),
     }
 
@@ -234,7 +243,6 @@ def state():
             elif isinstance(employees, list):
                 rows = employees
 
-            # Normalize
             now = datetime.now(timezone.utc)
             norm = []
             inactive_3d = 0
@@ -281,13 +289,15 @@ def state():
             out["trains"] = list_trains(user_id, selected_company_id)
             out["contracts"] = list_contracts(user_id, selected_company_id)
 
+            out["recruit_leads"] = list_leads(user_id, selected_company_id, limit=25)
+
         except Exception as e:
             out["company_error"] = str(e)
 
     return jsonify(out)
 
 
-# -------- TRAINS ----------
+# ---------- TRAINS ----------
 @app.post("/api/trains/add")
 def trains_add():
     s = _require_session()
@@ -348,7 +358,7 @@ def trains_delete():
     return jsonify({"ok": True})
 
 
-# -------- CONTRACTS ----------
+# ---------- CONTRACTS ----------
 @app.post("/api/contracts/add")
 def contracts_add():
     s = _require_session()
@@ -394,7 +404,7 @@ def contracts_delete():
     return jsonify({"ok": True})
 
 
-# -------- HOF SEARCH ----------
+# ---------- HOF SEARCH ----------
 @app.post("/api/search/hof")
 def search_hof():
     s = _require_session()
@@ -426,9 +436,238 @@ def search_hof():
             min_man=min_man, max_man=max_man,
             min_int=min_int, max_int=max_int,
             min_end=min_end, max_end=max_end,
-            max_pages=DB_MAX_HOF_PAGES,
+            max_pages=MAX_HOF_PAGES,
             page_size=25,
         )
         return jsonify({"ok": True, "count": len(rows), "rows": rows[:200]})
     except Exception as e:
         return _bad(f"HoF scan failed: {e}")
+
+
+# ===================== PREMIUM: RECRUITER LEADS =====================
+
+def _company_floor_total(company_payload: Dict[str, Any]) -> Optional[int]:
+    """
+    Finds the weakest employee total (MAN+INT+END) if those fields exist.
+    If Torn doesn't provide these fields in company employees, returns None.
+    """
+    employees = company_payload.get("company_employees") or company_payload.get("employees") or {}
+    rows = []
+    if isinstance(employees, dict):
+        for _, e in employees.items():
+            if isinstance(e, dict):
+                rows.append(e)
+    elif isinstance(employees, list):
+        rows = employees
+
+    totals = []
+    for e in rows:
+        man = e.get("manual_labor") or e.get("man")
+        inte = e.get("intelligence") or e.get("int")
+        end = e.get("endurance") or e.get("end")
+        try:
+            man = int(man) if man is not None else None
+            inte = int(inte) if inte is not None else None
+            end = int(end) if end is not None else None
+        except Exception:
+            man = inte = end = None
+
+        if man is None or inte is None or end is None:
+            continue
+        totals.append(man + inte + end)
+
+    if not totals:
+        return None
+    return min(totals)
+
+
+def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -> Dict[str, Any]:
+    """
+    Scan HoF working stats for players that beat your weakest employee total (floor).
+    Stores top leads in DB.
+    """
+    # fetch company to compute floor
+    comp = company_profile(company_id, api_key)
+    floor = _company_floor_total(comp)
+
+    if floor is None:
+        return {"ok": False, "error": "Company employee working stats not available from API for comparison."}
+
+    # scan candidates a bit above floor (reduce noise)
+    # (we still do broad scan because HoF returns highest first)
+    candidates = hof_scan_workstats(
+        api_key=api_key,
+        min_man=0, max_man=10**12,
+        min_int=0, max_int=10**12,
+        min_end=0, max_end=10**12,
+        max_pages=MAX_HOF_PAGES,
+        page_size=25,
+    )
+
+    saved = 0
+    best_delta = 0
+
+    for r in candidates[:250]:
+        total = int(r.get("total") or 0)
+        if total <= floor:
+            continue
+
+        delta = total - floor
+        best_delta = max(best_delta, delta)
+
+        upsert_lead(
+            user_id=user_id,
+            company_id=company_id,
+            player_id=str(r["id"]),
+            name=str(r["name"]),
+            man=int(r["man"]),
+            intel=int(r["int"]),
+            endu=int(r["end"]),
+            total=total,
+            delta_vs_floor=delta,
+        )
+        saved += 1
+        # don't spam too many leads per scan
+        if saved >= 40:
+            break
+
+    if saved > 0:
+        add_notification(user_id, "recruit", f"Recruiter scan: {saved} lead(s) found for Company #{company_id} (best +{best_delta:,}).")
+
+    return {"ok": True, "company_id": company_id, "floor_total": floor, "saved": saved, "best_delta": best_delta}
+
+
+@app.post("/api/recruit/scan")
+def recruit_scan():
+    """
+    Manual trigger from overlay.
+    Body: { company_id?: "123" } or empty to scan all registered companies.
+    """
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    cid = (data.get("company_id") or "").strip()
+
+    company_ids: List[str] = u.get("company_ids") or []
+    if cid:
+        if cid not in company_ids:
+            return _bad("company_id not registered", 403)
+        targets = [cid]
+    else:
+        targets = company_ids
+
+    results = []
+    for company_id in targets:
+        try:
+            results.append(_run_recruit_scan_for_company(user_id, company_id, u["api_key"]))
+        except Exception as e:
+            results.append({"ok": False, "company_id": company_id, "error": str(e)})
+
+    return jsonify({"ok": True, "results": results})
+
+
+@app.get("/api/recruit/leads")
+def recruit_leads():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    company_id = (request.args.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    leads = list_leads(user_id, company_id, limit=50)
+    return jsonify({"ok": True, "company_id": company_id, "rows": leads})
+
+
+@app.post("/api/recruit/seen")
+def recruit_seen():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    mark_leads_seen(user_id, company_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/recruit/clear")
+def recruit_clear():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    if not company_id:
+        return _bad("company_id required")
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+
+    clear_leads(user_id, company_id)
+    add_notification(user_id, "recruit", f"Cleared recruiter leads for Company #{company_id}.")
+    return jsonify({"ok": True})
+
+
+# ---------- OPTIONAL AUTO SCAN LOOP ----------
+def _auto_scan_loop():
+    # NOTE: Render free may sleep; this works best when service stays warm.
+    while True:
+        try:
+            # scan for all users that exist
+            # (simple approach: read users table via sqlite directly)
+            import sqlite3
+            from db import DB_PATH
+
+            con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute("SELECT user_id, api_key, company_ids FROM users")
+            users = [dict(r) for r in cur.fetchall()]
+            con.close()
+
+            for u in users:
+                user_id = u["user_id"]
+                api_key = u["api_key"]
+                try:
+                    company_ids = []
+                    import json
+                    company_ids = json.loads(u.get("company_ids") or "[]")
+                    for cid in company_ids[:10]:  # safety limit
+                        _run_recruit_scan_for_company(user_id, str(cid), api_key)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        time.sleep(max(60, AUTO_SCAN_MINUTES * 60))
+
+
+if AUTO_SCAN:
+    threading.Thread(target=_auto_scan_loop, daemon=True).start()
