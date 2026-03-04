@@ -81,7 +81,6 @@ def _require_session() -> Optional[Dict[str, Any]]:
 @app.errorhandler(Exception)
 def handle_any_error(e):
     wants_json = request.path.startswith("/api/") or request.path == "/state"
-
     if isinstance(e, HTTPException):
         code = e.code or 500
         msg = e.description or str(e)
@@ -92,13 +91,17 @@ def handle_any_error(e):
     if wants_json:
         return jsonify({"ok": False, "error": msg, "status": code}), code
 
-    # Keep a simple text response for non-api routes
     return f"Error: {msg}", code
 
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "time": _utc_now()})
+
+
+@app.get("/api/ping")
+def api_ping():
+    return jsonify({"ok": True, "time": _utc_now()})
 
 
 @app.get("/static/<path:path>")
@@ -148,7 +151,6 @@ def home():
 # ---------- AUTH ----------
 @app.post("/api/auth")
 def api_auth():
-    # ✅ silent=True prevents Flask from throwing an HTML 400 page (bad json)
     data = request.get_json(silent=True) or {}
 
     admin_key = (data.get("admin_key") or "").strip()
@@ -245,6 +247,8 @@ def state():
         "recruit_leads": [],
         "notifications": notifs,
         "unseen_count": unseen_notifs + unseen_leads,
+        "unseen_notifs": unseen_notifs,
+        "unseen_leads": unseen_leads,
         "updated_at": _utc_now(),
     }
 
@@ -426,7 +430,7 @@ def contracts_delete():
     return jsonify({"ok": True})
 
 
-# ---------- HOF SEARCH ----------
+# ---------- HOF SEARCH (TOTAL ONLY) ----------
 @app.post("/api/search/hof")
 def search_hof():
     s = _require_session()
@@ -445,23 +449,32 @@ def search_hof():
         except Exception:
             return int(default)
 
-    min_man = _i("min_man", 0)
-    max_man = _i("max_man", 10**12)
-    min_int = _i("min_int", 0)
-    max_int = _i("max_int", 10**12)
-    min_end = _i("min_end", 0)
-    max_end = _i("max_end", 10**12)
+    # ✅ NEW: total only
+    min_total = _i("min_total", 0)
+    max_total = _i("max_total", 10**12)
+    if max_total < min_total:
+        min_total, max_total = max_total, min_total
 
+    # (Back-compat) If someone still sends min_man/min_int/min_end, we ignore them on purpose.
     try:
         rows = hof_scan_workstats(
             api_key=u["api_key"],
-            min_man=min_man, max_man=max_man,
-            min_int=min_int, max_int=max_int,
-            min_end=min_end, max_end=max_end,
             max_pages=MAX_HOF_PAGES,
             page_size=25,
         )
-        return jsonify({"ok": True, "count": len(rows), "rows": rows[:200]})
+
+        # ✅ Filter ONLY by TOTAL
+        filtered = []
+        for r in rows:
+            try:
+                t = int(r.get("total") or 0)
+            except Exception:
+                t = 0
+            if t < min_total or t > max_total:
+                continue
+            filtered.append(r)
+
+        return jsonify({"ok": True, "count": len(filtered), "rows": filtered[:200]})
     except Exception as e:
         return _bad(f"HoF scan failed: {e}")
 
@@ -508,9 +521,6 @@ def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -
 
     candidates = hof_scan_workstats(
         api_key=api_key,
-        min_man=0, max_man=10**12,
-        min_int=0, max_int=10**12,
-        min_end=0, max_end=10**12,
         max_pages=MAX_HOF_PAGES,
         page_size=25,
     )
