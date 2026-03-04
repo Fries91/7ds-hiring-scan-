@@ -1,7 +1,5 @@
 import os
 import re
-import threading
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -35,7 +33,7 @@ from db import (
     count_unseen_leads,
 )
 
-from torn_api import me_basic, company_profile, hof_scan_workstats
+from torn_api import me_basic, company_profile, hof_scan_workstats, hof_search_workstats_total_range
 
 load_dotenv()
 app = Flask(__name__)
@@ -43,11 +41,16 @@ app = Flask(__name__)
 init_db()
 
 ADMIN_KEYS = [x.strip() for x in (os.getenv("ADMIN_KEYS") or "").split(",") if x.strip()]
-MAX_HOF_PAGES = int(os.getenv("MAX_HOF_PAGES", "10"))
-SERVICE_NAME = os.getenv("SERVICE_NAME", "7DS*: Peace Company Hub")
 
-AUTO_SCAN = (os.getenv("AUTO_SCAN", "0").strip() == "1")
-AUTO_SCAN_MINUTES = int(os.getenv("AUTO_SCAN_MINUTES", "10"))
+# For top-of-HoF scans (recruit scan)
+MAX_HOF_PAGES = int(os.getenv("MAX_HOF_PAGES", "10"))
+
+# For range searches (500 -> 120000 etc.)
+HOF_SEARCH_HARD_MAX_PAGES = int(os.getenv("HOF_SEARCH_HARD_MAX_PAGES", "400"))
+HOF_SEARCH_PAGE_SIZE = int(os.getenv("HOF_SEARCH_PAGE_SIZE", "25"))
+HOF_SEARCH_HARD_MAX_ROWS = int(os.getenv("HOF_SEARCH_HARD_MAX_ROWS", "500"))
+
+SERVICE_NAME = os.getenv("SERVICE_NAME", "7DS*: Peace Company Hub")
 
 
 def _utc_now() -> str:
@@ -77,7 +80,6 @@ def _require_session() -> Optional[Dict[str, Any]]:
     return s
 
 
-# ✅ Always return JSON (never HTML) for /api/* and /state
 @app.errorhandler(Exception)
 def handle_any_error(e):
     wants_json = request.path.startswith("/api/") or request.path == "/state"
@@ -208,7 +210,7 @@ def api_notifs_seen():
     return jsonify({"ok": True})
 
 
-# ---------- STATE (CSP-SAFE) ----------
+# ---------- STATE ----------
 @app.get("/state")
 def state():
     s = _require_session()
@@ -430,7 +432,7 @@ def contracts_delete():
     return jsonify({"ok": True})
 
 
-# ---------- HOF SEARCH (TOTAL ONLY) ----------
+# ---------- HOF SEARCH (TOTAL RANGE) ----------
 @app.post("/api/search/hof")
 def search_hof():
     s = _require_session()
@@ -445,38 +447,36 @@ def search_hof():
 
     def _i(k: str, default: int) -> int:
         try:
-            return int(data.get(k) or default)
+            return int(data.get(k) if data.get(k) is not None else default)
         except Exception:
             return int(default)
 
-    # ✅ NEW: total only
     min_total = _i("min_total", 0)
     max_total = _i("max_total", 10**12)
-    if max_total < min_total:
-        min_total, max_total = max_total, min_total
 
-    # (Back-compat) If someone still sends min_man/min_int/min_end, we ignore them on purpose.
-    try:
-        rows = hof_scan_workstats(
-            api_key=u["api_key"],
-            max_pages=MAX_HOF_PAGES,
-            page_size=25,
-        )
+    # ✅ RANGE-AWARE scan so 500 -> 120000 works
+    rows, meta = hof_search_workstats_total_range(
+        api_key=u["api_key"],
+        min_total=min_total,
+        max_total=max_total,
+        page_size=HOF_SEARCH_PAGE_SIZE,
+        hard_max_pages=HOF_SEARCH_HARD_MAX_PAGES,
+        hard_max_rows=HOF_SEARCH_HARD_MAX_ROWS,
+    )
 
-        # ✅ Filter ONLY by TOTAL
-        filtered = []
-        for r in rows:
-            try:
-                t = int(r.get("total") or 0)
-            except Exception:
-                t = 0
-            if t < min_total or t > max_total:
-                continue
-            filtered.append(r)
+    # Sort for user-friendly output (highest in range first)
+    rows.sort(key=lambda r: int(r.get("total") or 0), reverse=True)
 
-        return jsonify({"ok": True, "count": len(filtered), "rows": filtered[:200]})
-    except Exception as e:
-        return _bad(f"HoF scan failed: {e}")
+    return jsonify(
+        {
+            "ok": True,
+            "min_total": min_total,
+            "max_total": max_total,
+            "count": len(rows),
+            "rows": rows[:500],
+            "meta": meta,
+        }
+    )
 
 
 # ===================== PREMIUM: RECRUITER LEADS =====================
@@ -519,6 +519,7 @@ def _run_recruit_scan_for_company(user_id: str, company_id: str, api_key: str) -
     if floor is None:
         return {"ok": False, "error": "Company employee working stats not available from API for comparison."}
 
+    # Recruit scan wants top talent, so top pages are fine
     candidates = hof_scan_workstats(
         api_key=api_key,
         max_pages=MAX_HOF_PAGES,
@@ -648,4 +649,8 @@ def recruit_clear():
     if not company_id:
         return _bad("company_id required")
     if company_id not in (u.get("company_ids") or []):
-        ret
+        return _bad("company_id not registered", 403)
+
+    clear_leads(user_id, company_id)
+    add_notification(user_id, "recruit", f"Cleared recruiter leads for Company #{company_id}.")
+    return jsonify({"ok": True})
