@@ -1,14 +1,13 @@
 // ==UserScript==
-// @name         Company Hub 💼
-// @namespace    sevends-hiring-scan
-// @version      3.1.0
-// @description  Works with sevends-hiring-scan.onrender.com multi-user backend. No duplicates. Badge click open/close. Draggable. Companies/Trains/Apps/Search. HoF Search includes Auto-Find Offset.
+// @name         7DS*: Peace Hub 💼 (Company + Hiring Scan)
+// @namespace    7ds-peace-hub
+// @version      1.0.0
+// @description  Company owner hub: employees, trains, contracts, HoF working stat scan. Uses /state (CSP-safe).
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @connect      sevends-hiring-scan.onrender.com
 // ==/UserScript==
@@ -16,1183 +15,516 @@
 (function () {
   "use strict";
 
-  // ✅ LOCKED BASE URL
-  const BASE_URL = "https://sevends-hiring-scan.onrender.com";
+  // ================= USER CONFIG =================
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // <-- CHANGE to your Render URL
+  // ==============================================
 
-  // ✅ Element IDs
-  const BADGE_ID = "companyhub-badge";
-  const PANEL_ID = "companyhub-panel";
-  const STYLE_ID = "companyhub-style";
-
-  // ✅ Strong de-dupe: global flag + remove any existing nodes
-  if (window.__COMPANY_HUB_V31__) return;
-  window.__COMPANY_HUB_V31__ = true;
-
-  // Remove any leftover elements from older script runs/versions
-  const oldBadge = document.getElementById(BADGE_ID);
-  const oldPanel = document.getElementById(PANEL_ID);
-  if (oldBadge) oldBadge.remove();
-  if (oldPanel) oldPanel.remove();
-
-  // -----------------------
   // Storage keys
-  // -----------------------
-  const K_ADMIN = "company_hub_admin_key_v3";
-  const K_API = "company_hub_api_key_v3";
-  const K_TOKEN = "company_hub_session_token_v3";
-  const K_COMPANY_IDS = "company_hub_company_ids_v3";
-  const K_BADGE_POS = "company_hub_badge_pos_v3";
-  const K_PANEL_POS = "company_hub_panel_pos_v3";
+  const K_ADMIN = "hub_admin_key_v1";
+  const K_API   = "hub_api_key_v1";
+  const K_TOK   = "hub_session_token_v1";
+  const K_COMP  = "hub_company_ids_v1";
+  const K_SEL   = "hub_selected_company_v1";
 
-  // -----------------------
-  // Helpers
-  // -----------------------
-  function escapeHtml(s) {
-    return String(s || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
+  const el = (tag, attrs = {}, html = "") => {
+    const n = document.createElement(tag);
+    Object.entries(attrs).forEach(([k, v]) => (n[k] = v));
+    if (html) n.innerHTML = html;
+    return n;
+  };
 
-  function clamp(v, min, max) {
-    return Math.max(min, Math.min(max, v));
-  }
+  const getVal = (k, d = "") => {
+    try { return GM_getValue(k, d); } catch { return d; }
+  };
+  const setVal = (k, v) => {
+    try { GM_setValue(k, v); } catch {}
+  };
 
-  function safeParseJSON(str, fallback) {
-    try {
-      const v = JSON.parse(str);
-      return v && typeof v === "object" ? v : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
-  function getSavedPos(key, fallback) {
-    const raw = GM_getValue(key, "");
-    if (!raw) return fallback;
-    const obj = safeParseJSON(raw, null);
-    if (!obj) return fallback;
-    const x = Number(obj.x);
-    const y = Number(obj.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return fallback;
-    return { x, y };
-  }
-
-  function savePos(key, x, y) {
-    GM_setValue(key, JSON.stringify({ x, y }));
-  }
-
-  function gmReq(method, url, dataObj, extraHeaders = {}) {
+  function apiReq(method, url, body, token) {
     return new Promise((resolve, reject) => {
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["X-Session-Token"] = token;
+
       GM_xmlhttpRequest({
         method,
         url,
-        headers: { "Content-Type": "application/json", ...extraHeaders },
-        data: dataObj ? JSON.stringify(dataObj) : null,
-        onload: (res) => {
-          let json = {};
-          try {
-            json = JSON.parse(res.responseText || "{}");
-          } catch {}
-          resolve({ status: res.status, json, raw: res.responseText || "" });
+        headers,
+        data: body ? JSON.stringify(body) : null,
+        onload: (r) => {
+          try { resolve(JSON.parse(r.responseText)); }
+          catch (e) { reject(e); }
         },
-        onerror: () => reject(new Error("network error")),
+        onerror: reject,
       });
     });
   }
 
-  function tokenHeader() {
-    const tok = (GM_getValue(K_TOKEN, "") || "").trim();
-    return tok ? { "X-Session-Token": tok } : {};
-  }
+  const apiGet  = (url, token) => apiReq("GET",  url, null, token);
+  const apiPost = (url, body, token) => apiReq("POST", url, body, token);
 
-  async function authed(method, path, dataObj) {
-    return gmReq(method, `${BASE_URL}${path}`, dataObj, tokenHeader());
-  }
+  GM_addStyle(`
+    #p7ds-bag { position:fixed; right:14px; bottom:110px; z-index:9999999; width:44px; height:44px;
+      border-radius:14px; background:#132033; border:1px solid #2b4a66; display:flex; align-items:center; justify-content:center;
+      box-shadow:0 10px 30px rgba(0,0,0,.45); cursor:grab; user-select:none; }
+    #p7ds-bag:active{cursor:grabbing}
+    #p7ds-bag .badge{ position:absolute; top:-7px; right:-7px; min-width:20px; height:20px; padding:0 6px;
+      border-radius:999px; background:#ff3b3b; color:#fff; font-weight:700; font-size:12px; display:none; align-items:center; justify-content:center; border:2px solid #0b0f14;}
+    #p7ds-panel { position:fixed; right:14px; bottom:160px; z-index:9999998; width:340px; max-height:70vh; overflow:auto;
+      border-radius:18px; background:#0f1722; border:1px solid #203042; box-shadow:0 12px 42px rgba(0,0,0,.55); display:none; }
+    #p7ds-panel * { box-sizing:border-box; font-family:system-ui; }
+    #p7ds-head { padding:10px 12px; border-bottom:1px solid #203042; display:flex; gap:10px; align-items:center; }
+    #p7ds-title { font-weight:800; font-size:14px; letter-spacing:.2px; }
+    #p7ds-sub { opacity:.8; font-size:12px; }
+    #p7ds-tabs { display:flex; gap:6px; padding:10px 12px; flex-wrap:wrap; border-bottom:1px solid #203042; }
+    .p7btn { background:#0b0f14; border:1px solid #2a3d53; color:#e9eef6; border-radius:12px; padding:8px 10px; font-size:12px; cursor:pointer; }
+    .p7btn.on { border-color:#8bd0ff; }
+    #p7ds-body { padding:12px; }
+    .card { background:#0b0f14; border:1px solid #203042; border-radius:14px; padding:10px; margin:10px 0; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    input,select,textarea{ width:100%; padding:9px; border-radius:12px; border:1px solid #2a3d53; background:#060a0f; color:#e9eef6; }
+    .mini{ font-size:12px; opacity:.85; }
+    .pill{ display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #2a3d53; font-size:11px; opacity:.9; margin-left:6px; }
+    .emp { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px dashed rgba(255,255,255,.08); }
+    .emp:last-child{border-bottom:none}
+    .bad{ color:#ff8b8b; }
+    .warn{ color:#ffcc66; }
+    a{ color:#8bd0ff; text-decoration:none; }
+  `);
 
-  function promptMaybe(label, currentVal) {
-    const out = prompt(label, currentVal || "");
-    if (out === null) return null;
-    return String(out).trim();
-  }
+  const bag = el("div", { id: "p7ds-bag" }, "💼");
+  const badge = el("div", { className: "badge" }, "0");
+  bag.appendChild(badge);
 
-  function toInt(val, fallback) {
-    const n = parseInt(String(val || "").trim(), 10);
-    return Number.isFinite(n) ? n : fallback;
-  }
-
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-  }
-
-  // -----------------------
-  // Auth
-  // -----------------------
-  async function login(force = false) {
-    const admin_key = (GM_getValue(K_ADMIN, "") || "").trim();
-    const api_key = (GM_getValue(K_API, "") || "").trim();
-    const existing = (GM_getValue(K_TOKEN, "") || "").trim();
-
-    if (!admin_key || !api_key) return { ok: false, error: "Missing admin key / api key. Click Settings." };
-    if (existing && !force) return { ok: true, token: existing };
-
-    const res = await gmReq("POST", `${BASE_URL}/api/auth`, { admin_key, api_key });
-    if (res.status !== 200 || !res.json || res.json.ok !== true || !res.json.token) {
-      GM_setValue(K_TOKEN, "");
-      return { ok: false, error: res.json?.error || `Auth failed (HTTP ${res.status})` };
-    }
-
-    GM_setValue(K_TOKEN, res.json.token);
-    return { ok: true, token: res.json.token, user: res.json.user };
-  }
-
-  async function openSettings() {
-    const curAdmin = (GM_getValue(K_ADMIN, "") || "").trim();
-    const curApi = (GM_getValue(K_API, "") || "").trim();
-    const curCids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-
-    const a = promptMaybe("Admin Key (must be in Render ADMIN_KEYS list)", curAdmin);
-    if (a === null) return { ok: false, error: "Cancelled" };
-
-    const k = promptMaybe("Your Torn API Key (your own key)", curApi);
-    if (k === null) return { ok: false, error: "Cancelled" };
-
-    const c = promptMaybe("Your Company IDs (comma-separated) (optional)\nExample: 12345,67890", curCids);
-    if (c === null) return { ok: false, error: "Cancelled" };
-
-    GM_setValue(K_ADMIN, a);
-    GM_setValue(K_API, k);
-    GM_setValue(K_COMPANY_IDS, c || "");
-    GM_setValue(K_TOKEN, ""); // force refresh token
-
-    const auth = await login(true);
-    if (!auth.ok) return { ok: false, error: auth.error || "Auth failed" };
-
-    const ids = (c || "").trim();
-    if (ids) {
-      await authed("POST", "/api/user/companies", { company_ids: ids });
-    }
-
-    return { ok: true };
-  }
-
-  // -----------------------
-  // CSS
-  // -----------------------
-  if (!document.getElementById(STYLE_ID)) {
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-      :root{ --hv-text:#e5e7eb; --hv-muted:rgba(229,231,235,0.72); }
-      #${BADGE_ID}, #${PANEL_ID} { all: initial; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial; }
-
-      #${BADGE_ID}{
-        position:fixed; right:14px; bottom:110px;
-        z-index:1000001;
-        width:44px; height:44px; border-radius:14px;
-        background:
-          radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
-          linear-gradient(135deg, rgba(18,22,32,0.95), rgba(7,9,13,0.95));
-        border:1px solid rgba(212,175,55,0.35);
-        box-shadow:0 14px 34px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.06) inset;
-        display:grid; place-items:center; cursor:pointer;
-        user-select:none; touch-action:none;
-      }
-      #${BADGE_ID}::after{
-        content:""; position:absolute; inset:5px; border-radius:11px;
-        border:1px solid rgba(247,231,169,0.18); pointer-events:none;
-      }
-      #${BADGE_ID} span{ font-size:22px; line-height:1; filter:drop-shadow(0 2px 6px rgba(0,0,0,0.55)); }
-
-      #${PANEL_ID}{
-        position:fixed; right:14px; bottom:170px;
-        z-index:1000000;
-        width:min(92vw, 380px);
-        background:
-          radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.10), transparent 40%),
-          radial-gradient(120% 120% at 100% 0%, rgba(99,102,241,0.08), transparent 45%),
-          linear-gradient(180deg, rgba(14,18,28,0.96), rgba(8,10,14,0.96));
-        border:1px solid rgba(255,255,255,0.10);
-        border-radius:16px;
-        box-shadow:0 18px 52px rgba(0,0,0,0.65);
-        overflow:hidden;
-        display:none;
-        backdrop-filter:blur(8px);
-        touch-action:none;
-      }
-
-      #companyhub-head{
-        padding:10px 12px;
-        display:flex; align-items:center; justify-content:space-between;
-        border-bottom:1px solid rgba(255,255,255,0.10);
-        color:var(--hv-text);
-        font-weight:950;
-        cursor:move;
-        user-select:none;
-      }
-
-      #companyhub-title{ display:flex; align-items:center; gap:8px; min-width:0; }
-      #companyhub-title .crest{
-        width:18px; height:18px; border-radius:6px;
-        background: radial-gradient(110% 110% at 30% 20%, rgba(247,231,169,0.35), transparent 55%),
-                    linear-gradient(135deg, rgba(212,175,55,0.32), rgba(212,175,55,0.10));
-        border:1px solid rgba(212,175,55,0.35);
-        box-shadow:0 0 0 1px rgba(255,255,255,0.06) inset;
-        flex:0 0 auto;
-      }
-      #companyhub-title .text{ display:flex; flex-direction:column; min-width:0; }
-      #companyhub-title .main{ font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      #companyhub-title .sub{ font-size:11px; color:rgba(247,231,169,0.70); font-weight:800; margin-top:2px; }
-
-      #companyhub-tabs{
-        display:flex; gap:6px; padding:8px 10px;
-        border-bottom:1px solid rgba(255,255,255,0.08);
-        flex-wrap:wrap;
-      }
-      .ch-tab{
-        background:rgba(255,255,255,0.06);
-        border:1px solid rgba(255,255,255,0.08);
-        color:var(--hv-text);
-        font-weight:900;
-        border-radius:10px;
-        padding:6px 8px;
-        font-size:12px;
-        cursor:pointer;
-        user-select:none;
-      }
-      .ch-tab.active{
-        background:linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
-        border-color:rgba(212,175,55,0.28);
-      }
-
-      #companyhub-body{ padding:10px; color:var(--hv-text); }
-      .muted{ color:var(--hv-muted); font-size:12px; }
-
-      .ch-btn{
-        background:rgba(255,255,255,0.06);
-        border:1px solid rgba(255,255,255,0.10);
-        color:var(--hv-text);
-        border-radius:10px;
-        padding:8px 10px;
-        font-weight:950;
-        cursor:pointer;
-        font-size:12px;
-        white-space:nowrap;
-        user-select:none;
-      }
-      .ch-btn.primary{ background:rgba(16,185,129,0.16); border-color:rgba(16,185,129,0.25); }
-      .ch-btn.red{ background:rgba(239,68,68,0.16); border-color:rgba(239,68,68,0.25); }
-      .ch-btn.gold{ background:rgba(212,175,55,0.16); border-color:rgba(212,175,55,0.28); color:rgba(247,231,169,0.95); }
-
-      .card{
-        background: radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.07), transparent 45%),
-                    rgba(255,255,255,0.05);
-        border:1px solid rgba(255,255,255,0.10);
-        border-radius:12px;
-        padding:10px;
-        margin:8px 0;
-        box-shadow:0 6px 20px rgba(0,0,0,0.35);
-      }
-      .headline{ font-weight:950; letter-spacing:0.1px; }
-      .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
-
-      input.ch-in, select.ch-sel{
-        all: initial;
-        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;
-        background:rgba(255,255,255,0.06);
-        border:1px solid rgba(255,255,255,0.12);
-        color:var(--hv-text);
-        border-radius:10px;
-        padding:8px 10px;
-        font-size:12px;
-        width: 100%;
-        box-sizing:border-box;
-      }
-
-      .mini{ font-size:11px; color:rgba(247,231,169,0.70); font-weight:800; }
-      .line{ height:1px; background:rgba(255,255,255,0.08); margin:10px 0; }
-
-      .listrow{
-        display:flex; justify-content:space-between; gap:10px; align-items:center;
-        padding:8px 8px; border-radius:10px;
-        background:rgba(255,255,255,0.04);
-        border:1px solid rgba(255,255,255,0.08);
-        margin-top:6px;
-      }
-      .listrow .left{ min-width:0; }
-      .listrow .left .t{ font-weight:950; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      .listrow .left .s{ font-size:11px; color:var(--hv-muted); margin-top:2px; }
-      .hint{
-        font-size:11px;
-        color:rgba(247,231,169,0.85);
-        font-weight:800;
-        margin-top:6px;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  // -----------------------
-  // DOM
-  // -----------------------
-  const badge = document.createElement("div");
-  badge.id = BADGE_ID;
-  badge.innerHTML = `<span>💼</span>`;
-  document.body.appendChild(badge);
-
-  const panel = document.createElement("div");
-  panel.id = PANEL_ID;
+  const panel = el("div", { id: "p7ds-panel" });
   panel.innerHTML = `
-    <div id="companyhub-head">
-      <div id="companyhub-title">
-        <div class="crest"></div>
-        <div class="text">
-          <div class="main">Company Hub</div>
-          <div class="sub">High-Value Suite</div>
-        </div>
+    <div id="p7ds-head">
+      <div style="font-size:18px">💼</div>
+      <div style="flex:1">
+        <div id="p7ds-title">Company Hub</div>
+        <div id="p7ds-sub">Loading...</div>
       </div>
-      <div class="row" style="margin:0;">
-        <button class="ch-btn primary" id="ch-settings">Settings</button>
-        <button class="ch-btn red" id="ch-close">X</button>
-      </div>
+      <button class="p7btn" id="p7ds-seen" title="Mark notifications seen">Seen</button>
     </div>
-    <div id="companyhub-tabs">
-      <button class="ch-tab active" data-tab="companies">Companies</button>
-      <button class="ch-tab" data-tab="trains">Trains</button>
-      <button class="ch-tab" data-tab="apps">Applications</button>
-      <button class="ch-tab" data-tab="search">Search</button>
-    </div>
-    <div id="companyhub-body"></div>
+    <div id="p7ds-tabs"></div>
+    <div id="p7ds-body"></div>
   `;
-  document.body.appendChild(panel);
 
-  // Restore positions
-  (function restorePositions() {
-    const b = getSavedPos(K_BADGE_POS, null);
-    if (b) {
-      badge.style.left = b.x + "px";
-      badge.style.top = b.y + "px";
-      badge.style.right = "auto";
-      badge.style.bottom = "auto";
-    }
-    const p = getSavedPos(K_PANEL_POS, null);
-    if (p) {
-      panel.style.left = p.x + "px";
-      panel.style.top = p.y + "px";
-      panel.style.right = "auto";
-      panel.style.bottom = "auto";
-    }
+  document.body.appendChild(panel);
+  document.body.appendChild(bag);
+
+  // drag bag
+  (function () {
+    let dragging = false, sx=0, sy=0, ox=0, oy=0;
+    bag.addEventListener("touchstart", (e) => {
+      dragging = true;
+      const t = e.touches[0];
+      sx = t.clientX; sy = t.clientY;
+      const r = bag.getBoundingClientRect();
+      ox = r.left; oy = r.top;
+      e.preventDefault();
+    }, {passive:false});
+    bag.addEventListener("touchmove", (e) => {
+      if(!dragging) return;
+      const t = e.touches[0];
+      const nx = ox + (t.clientX - sx);
+      const ny = oy + (t.clientY - sy);
+      bag.style.left = nx + "px";
+      bag.style.top  = ny + "px";
+      bag.style.right = "auto";
+      bag.style.bottom = "auto";
+      e.preventDefault();
+    }, {passive:false});
+    bag.addEventListener("touchend", () => dragging = false);
+
+    bag.addEventListener("mousedown", (e) => {
+      dragging = true;
+      sx = e.clientX; sy = e.clientY;
+      const r = bag.getBoundingClientRect();
+      ox = r.left; oy = r.top;
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+      if(!dragging) return;
+      const nx = ox + (e.clientX - sx);
+      const ny = oy + (e.clientY - sy);
+      bag.style.left = nx + "px";
+      bag.style.top  = ny + "px";
+      bag.style.right = "auto";
+      bag.style.bottom = "auto";
+    });
+    window.addEventListener("mouseup", () => dragging = false);
   })();
 
-  function togglePanel() {
-    panel.style.display = panel.style.display === "none" ? "block" : "none";
-    if (panel.style.display !== "none") renderActiveTab();
-  }
-
-  function makeBadgeDraggableAndToggle(el, storeKey) {
-    const threshold = 8;
-    let down = false, moved = false;
-    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
-
-    function onDown(ev) {
-      const pt = ev.touches ? ev.touches[0] : ev;
-      down = true; moved = false;
-
-      const r = el.getBoundingClientRect();
-      startX = pt.clientX; startY = pt.clientY;
-      startLeft = r.left; startTop = r.top;
-
-      el.style.left = startLeft + "px";
-      el.style.top = startTop + "px";
-      el.style.right = "auto";
-      el.style.bottom = "auto";
-
-      window.addEventListener("mousemove", onMove, { passive: false });
-      window.addEventListener("mouseup", onUp, { passive: false });
-      window.addEventListener("touchmove", onMove, { passive: false });
-      window.addEventListener("touchend", onUp, { passive: false });
-      window.addEventListener("touchcancel", onUp, { passive: false });
-    }
-
-    function onMove(ev) {
-      if (!down) return;
-      const pt = ev.touches ? ev.touches[0] : ev;
-      const dx = pt.clientX - startX;
-      const dy = pt.clientY - startY;
-
-      if (Math.abs(dx) + Math.abs(dy) > threshold) moved = true;
-
-      const rect = el.getBoundingClientRect();
-      let x = startLeft + dx;
-      let y = startTop + dy;
-
-      x = clamp(x, 6, window.innerWidth - rect.width - 6);
-      y = clamp(y, 6, window.innerHeight - rect.height - 6);
-
-      el.style.left = x + "px";
-      el.style.top = y + "px";
-
-      if (moved) { ev.preventDefault(); ev.stopPropagation(); }
-    }
-
-    function onUp(ev) {
-      if (!down) return;
-      down = false;
-
-      const rect = el.getBoundingClientRect();
-      savePos(storeKey, Math.round(rect.left), Math.round(rect.top));
-
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("touchmove", onMove);
-      window.removeEventListener("touchend", onUp);
-      window.removeEventListener("touchcancel", onUp);
-
-      if (!moved) togglePanel();
-      ev?.preventDefault?.(); ev?.stopPropagation?.();
-    }
-
-    el.addEventListener("mousedown", onDown, { passive: false });
-    el.addEventListener("touchstart", onDown, { passive: false });
-  }
-
-  function makePanelDraggable(handleEl, moveEl, storeKey) {
-    let dragging = false;
-    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
-
-    function onDown(ev) {
-      const t = ev.target;
-      if (t && (t.tagName === "BUTTON" || t.closest("button") || t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "A")) return;
-
-      dragging = true;
-      const pt = ev.touches ? ev.touches[0] : ev;
-
-      const r = moveEl.getBoundingClientRect();
-      startX = pt.clientX; startY = pt.clientY;
-      startLeft = r.left; startTop = r.top;
-
-      moveEl.style.left = startLeft + "px";
-      moveEl.style.top = startTop + "px";
-      moveEl.style.right = "auto";
-      moveEl.style.bottom = "auto";
-
-      ev.preventDefault(); ev.stopPropagation();
-
-      window.addEventListener("mousemove", onMove, { passive: false });
-      window.addEventListener("mouseup", onUp, { passive: false });
-      window.addEventListener("touchmove", onMove, { passive: false });
-      window.addEventListener("touchend", onUp, { passive: false });
-      window.addEventListener("touchcancel", onUp, { passive: false });
-    }
-
-    function onMove(ev) {
-      if (!dragging) return;
-      const pt = ev.touches ? ev.touches[0] : ev;
-      const dx = pt.clientX - startX;
-      const dy = pt.clientY - startY;
-
-      const rect = moveEl.getBoundingClientRect();
-      let x = startLeft + dx;
-      let y = startTop + dy;
-
-      x = clamp(x, 6, window.innerWidth - rect.width - 6);
-      y = clamp(y, 6, window.innerHeight - rect.height - 6);
-
-      moveEl.style.left = x + "px";
-      moveEl.style.top = y + "px";
-
-      ev.preventDefault(); ev.stopPropagation();
-    }
-
-    function onUp(ev) {
-      if (!dragging) return;
-      dragging = false;
-
-      const rect = moveEl.getBoundingClientRect();
-      savePos(storeKey, Math.round(rect.left), Math.round(rect.top));
-
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("touchmove", onMove);
-      window.removeEventListener("touchend", onUp);
-      window.removeEventListener("touchcancel", onUp);
-
-      ev?.preventDefault?.(); ev?.stopPropagation?.();
-    }
-
-    handleEl.addEventListener("mousedown", onDown, { passive: false });
-    handleEl.addEventListener("touchstart", onDown, { passive: false });
-  }
-
-  makeBadgeDraggableAndToggle(badge, K_BADGE_POS);
-  makePanelDraggable(panel.querySelector("#companyhub-head"), panel, K_PANEL_POS);
-
-  // Tabs
-  const body = panel.querySelector("#companyhub-body");
-  const tabs = Array.from(panel.querySelectorAll(".ch-tab"));
-  let active = "companies";
-
-  function setActive(tab) {
-    active = tab;
-    tabs.forEach((t) => t.classList.toggle("active", t.getAttribute("data-tab") === tab));
-    renderActiveTab();
-  }
-
-  tabs.forEach((t) =>
-    t.addEventListener("click", (e) => {
-      e.preventDefault(); e.stopPropagation();
-      setActive(t.getAttribute("data-tab"));
-    })
-  );
-
-  panel.querySelector("#ch-close").addEventListener("click", (e) => {
-    e.preventDefault(); e.stopPropagation();
-    togglePanel();
+  bag.addEventListener("click", () => {
+    panel.style.display = (panel.style.display === "none" || !panel.style.display) ? "block" : "none";
   });
 
-  panel.querySelector("#ch-settings").addEventListener("click", async (e) => {
-    e.preventDefault(); e.stopPropagation();
-    body.innerHTML = `<div class="card"><div class="muted">Opening settings…</div></div>`;
-    const res = await openSettings();
-    if (!res.ok) {
-      body.innerHTML = `<div class="card"><div class="headline">Settings</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.error || "Cancelled")}</div></div>`;
-      return;
-    }
-    renderActiveTab();
-  });
+  const tabsEl = panel.querySelector("#p7ds-tabs");
+  const bodyEl = panel.querySelector("#p7ds-body");
+  const subEl  = panel.querySelector("#p7ds-sub");
+  const seenBtn= panel.querySelector("#p7ds-seen");
 
-  async function ensureLoggedIn() {
-    const tok = (GM_getValue(K_TOKEN, "") || "").trim();
-    if (tok) return { ok: true };
-    const res = await login(false);
-    return res.ok ? { ok: true } : { ok: false, error: res.error || "Auth failed" };
+  const TABS = ["Employees","Trains","Contracts","Search","Broadcast","Settings"];
+  let activeTab = "Employees";
+  let state = null;
+
+  function setBadge(n){
+    if(n>0){ badge.style.display="flex"; badge.textContent=String(n); }
+    else { badge.style.display="none"; }
   }
 
-  async function renderActiveTab() {
-    const admin = (GM_getValue(K_ADMIN, "") || "").trim();
-    const api = (GM_getValue(K_API, "") || "").trim();
+  function money(n){ try{return Number(n).toLocaleString();}catch{return String(n);} }
 
-    if (!admin || !api) {
-      body.innerHTML = `
-        <div class="card">
-          <div class="headline">Setup needed</div>
-          <div class="muted" style="margin-top:6px;">
-            Click <b>Settings</b> and enter:
-            <br/>• your <b>Admin Key</b>
-            <br/>• your <b>Torn API key</b>
-            <br/>• your company IDs (optional)
-          </div>
-        </div>`;
-      return;
-    }
-
-    body.innerHTML = `<div class="card"><div class="muted">Loading…</div></div>`;
-
-    const auth = await ensureLoggedIn();
-    if (!auth.ok) {
-      body.innerHTML = `
-        <div class="card">
-          <div class="headline">Auth error</div>
-          <div class="muted" style="margin-top:6px;">${escapeHtml(auth.error)}</div>
-          <div class="row">
-            <button class="ch-btn primary" id="btn-retry">Retry Login</button>
-            <button class="ch-btn" id="btn-reset">Reset Token</button>
-          </div>
-        </div>`;
-      body.querySelector("#btn-retry").onclick = async () => { await login(true); renderActiveTab(); };
-      body.querySelector("#btn-reset").onclick = () => { GM_setValue(K_TOKEN, ""); renderActiveTab(); };
-      return;
-    }
-
-    if (active === "companies") return renderCompanies();
-    if (active === "trains") return renderTrains();
-    if (active === "apps") return renderApplications();
-    if (active === "search") return renderSearch();
-  }
-
-  // ---------------- Companies ----------------
-  async function renderCompanies() {
-    const savedCids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-
-    const res = await authed("GET", "/api/companies", null);
-    if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-    if (!res.json || res.json.ok !== true) {
-      body.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-      return;
-    }
-
-    const rows = res.json.rows || [];
-    let html = `
-      <div class="card">
-        <div class="headline">Companies</div>
-        <div class="muted" style="margin-top:6px;">Set IDs → Save → then your employees load.</div>
-        <div class="line"></div>
-        <div class="mini">Company IDs (comma separated)</div>
-        <div class="row" style="margin-top:6px;">
-          <input class="ch-in" id="cids" placeholder="12345,67890" value="${escapeHtml(savedCids)}" />
-        </div>
-        <div class="row">
-          <button class="ch-btn primary" id="saveCids">Save</button>
-          <button class="ch-btn" id="refreshCompanies">Refresh</button>
-        </div>
-      </div>
-    `;
-
-    if (!rows.length) {
-      html += `<div class="card"><div class="muted">No companies returned yet.</div></div>`;
-      body.innerHTML = html;
-      wireCompaniesButtons();
-      return;
-    }
-
-    for (const c of rows) {
-      const emps = Array.isArray(c.employees) ? c.employees : [];
-      html += `
-        <div class="card">
-          <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
-          <div class="muted" style="margin-top:6px;">ID: ${escapeHtml(c.company_id)} • Employees: ${escapeHtml(String(emps.length))}</div>
-          ${c.error ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>` : ""}
-          <div class="line"></div>
-          ${emps.slice(0, 25).map((e) => {
-            const nm = e.name || "Employee";
-            const id = e.id || "";
-            return `
-              <div class="listrow">
-                <div class="left">
-                  <div class="t">${escapeHtml(nm)} ${id ? `<span class="muted">[${escapeHtml(id)}]</span>` : ""}</div>
-                  <div class="s">${escapeHtml(e.position || "")}</div>
-                </div>
-              </div>`;
-          }).join("")}
-          ${emps.length > 25 ? `<div class="muted" style="margin-top:8px;">Showing first 25 employees.</div>` : ""}
-        </div>
-      `;
-    }
-
-    body.innerHTML = html;
-    wireCompaniesButtons();
-  }
-
-  function wireCompaniesButtons() {
-    const saveBtn = body.querySelector("#saveCids");
-    const refBtn = body.querySelector("#refreshCompanies");
-    const cidsEl = body.querySelector("#cids");
-
-    if (saveBtn) {
-      saveBtn.onclick = async () => {
-        const ids = (cidsEl?.value || "").trim();
-        GM_setValue(K_COMPANY_IDS, ids);
-        const r = await authed("POST", "/api/user/companies", { company_ids: ids });
-        if (r.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-        renderCompanies();
-      };
-    }
-    if (refBtn) refBtn.onclick = () => renderCompanies();
-  }
-
-  // ---------------- Trains ----------------
-  async function renderTrains() {
-    const saved = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
-    const list = saved ? saved.split(",").map((s) => s.trim()).filter(Boolean) : [];
-
-    body.innerHTML = `
-      <div class="card">
-        <div class="headline">Train Tracker</div>
-        <div class="muted" style="margin-top:6px;">Per-user train records (saved on server DB).</div>
-        <div class="line"></div>
-        <div class="mini">Company</div>
-        <div class="row" style="margin-top:6px;">
-          <select class="ch-sel" id="trainCompany">
-            ${list.length ? list.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("") : `<option value="">(set company IDs in Companies tab)</option>`}
-          </select>
-        </div>
-        <div class="row"><button class="ch-btn primary" id="loadTrains">Load</button></div>
-      </div>
-      <div id="trainArea"></div>
-    `;
-
-    const loadBtn = body.querySelector("#loadTrains");
-    if (loadBtn) loadBtn.onclick = () => loadTrains();
-    if (list.length) loadTrains();
-  }
-
-  async function loadTrains() {
-    const area = body.querySelector("#trainArea");
-    const companyId = (body.querySelector("#trainCompany")?.value || "").trim();
-    if (!companyId) {
-      area.innerHTML = `<div class="card"><div class="muted">Set company IDs first (Companies tab).</div></div>`;
-      return;
-    }
-
-    area.innerHTML = `<div class="card"><div class="muted">Loading trains…</div></div>`;
-    const res = await authed("GET", `/api/trains?company_id=${encodeURIComponent(companyId)}`, null);
-    if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-    if (!res.json || res.json.ok !== true) {
-      area.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-      return;
-    }
-
-    const rows = res.json.rows || [];
-    let html = `
-      <div class="card">
-        <div class="headline">Add Train Entry</div>
-        <div class="row"><input class="ch-in" id="trBuyer" placeholder="Buyer name" /></div>
-        <div class="row"><input class="ch-in" id="trCount" placeholder="Trains (number)" inputmode="numeric" /></div>
-        <div class="row"><input class="ch-in" id="trNote" placeholder="Note (optional)" /></div>
-        <div class="row">
-          <button class="ch-btn primary" id="trAdd">Add</button>
-          <button class="ch-btn" id="trReload">Reload</button>
-        </div>
-      </div>
-    `;
-
-    if (!rows.length) {
-      html += `<div class="card"><div class="muted">No train entries yet.</div></div>`;
-      area.innerHTML = html;
-      wireTrainButtons(companyId);
-      return;
-    }
-
-    html += `<div class="card"><div class="headline">Recent Entries</div>`;
-    for (const r of rows) {
-      html += `
-        <div class="listrow">
-          <div class="left">
-            <div class="t">${escapeHtml(r.buyer || "Buyer")} • ${escapeHtml(String(r.trains || 0))} trains</div>
-            <div class="s">${escapeHtml(r.note || "")}${r.created_at ? ` • ${escapeHtml(r.created_at)}` : ""}</div>
-          </div>
-          <div><button class="ch-btn red" data-del="${escapeHtml(String(r.id))}">Del</button></div>
-        </div>
-      `;
-    }
-    html += `</div>`;
-
-    area.innerHTML = html;
-    wireTrainButtons(companyId);
-  }
-
-  function wireTrainButtons(companyId) {
-    const area = body.querySelector("#trainArea");
-    area.querySelector("#trReload").onclick = () => loadTrains();
-
-    area.querySelector("#trAdd").onclick = async () => {
-      const buyer = (area.querySelector("#trBuyer")?.value || "").trim();
-      const trains = (area.querySelector("#trCount")?.value || "").trim();
-      const note = (area.querySelector("#trNote")?.value || "").trim();
-
-      const res = await authed("POST", "/api/trains/add", { company_id: companyId, buyer, trains, note });
-      if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-      if (!res.json || res.json.ok !== true) { alert(res.json?.error || "Failed to add"); return; }
-      loadTrains();
-    };
-
-    area.querySelectorAll("button[data-del]").forEach((btn) => {
-      btn.onclick = async () => {
-        const id = btn.getAttribute("data-del");
-        const res = await authed("POST", "/api/trains/delete", { id });
-        if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-        loadTrains();
-      };
+  function renderTabs(){
+    tabsEl.innerHTML = "";
+    TABS.forEach(t=>{
+      const b = el("button",{className:"p7btn"},t);
+      if(t===activeTab) b.classList.add("on");
+      b.addEventListener("click",()=>{ activeTab=t; render(); });
+      tabsEl.appendChild(b);
     });
   }
 
-  // ---------------- Applications ----------------
-  async function renderApplications() {
-    body.innerHTML = `<div class="card"><div class="muted">Loading applications…</div></div>`;
-    const res = await authed("GET", "/api/applications", null);
-    if (res.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-    if (!res.json || res.json.ok !== true) {
-      body.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
-      return;
-    }
-
-    const rows = res.json.rows || [];
-    let html = `
-      <div class="card">
-        <div class="headline">Applications</div>
-        <div class="muted" style="margin-top:6px;">Pulled from your Torn events (per-user).</div>
-        <div class="row"><button class="ch-btn primary" id="appRefresh">Refresh</button></div>
-      </div>
-    `;
-
-    if (!rows.length) {
-      html += `<div class="card"><div class="muted">No application events found yet.</div></div>`;
-      body.innerHTML = html;
-      body.querySelector("#appRefresh").onclick = () => renderApplications();
-      return;
-    }
-
-    html += `<div class="card"><div class="headline">Recent</div>`;
-    for (const r of rows) {
-      html += `
-        <div class="listrow">
-          <div class="left">
-            <div class="t">${escapeHtml(r.applicant_id || "Applicant")} <span class="muted">• ${escapeHtml(r.status || "new")}</span></div>
-            <div class="s">${escapeHtml(r.raw_text || "")}</div>
-          </div>
-          <div class="row" style="margin:0;">
-            <button class="ch-btn" data-status="review" data-id="${escapeHtml(String(r.id))}">Review</button>
-            <button class="ch-btn" data-status="reject" data-id="${escapeHtml(String(r.id))}">Reject</button>
-            <button class="ch-btn primary" data-status="accept" data-id="${escapeHtml(String(r.id))}">Accept</button>
-          </div>
-        </div>
-      `;
-    }
-    html += `</div>`;
-
-    body.innerHTML = html;
-    body.querySelector("#appRefresh").onclick = () => renderApplications();
-    body.querySelectorAll("button[data-status][data-id]").forEach((btn) => {
-      btn.onclick = async () => {
-        const id = btn.getAttribute("data-id");
-        const status = btn.getAttribute("data-status");
-        const rr = await authed("POST", "/api/applications/status", { id, status });
-        if (rr.status === 401) { GM_setValue(K_TOKEN, ""); return renderActiveTab(); }
-        renderApplications();
-      };
+  function companyPicker(){
+    const c = el("div",{className:"card"});
+    const sel = el("select");
+    (state.company_ids||[]).forEach(cid=>{
+      const o = el("option");
+      o.value = cid;
+      o.textContent = `Company #${cid}`;
+      sel.appendChild(o);
     });
+
+    const saved = getVal(K_SEL,"");
+    const cur = state.selected_company_id || (state.company_ids||[])[0] || "";
+    sel.value = saved && (state.company_ids||[]).includes(saved) ? saved : cur;
+
+    sel.addEventListener("change", async ()=>{
+      setVal(K_SEL, sel.value);
+      await refresh(sel.value);
+    });
+
+    c.appendChild(el("div",{className:"mini"}, "<b>Selected Company</b>"));
+    c.appendChild(sel);
+    return c;
   }
 
-  // ---------------- Search (HoF) with AUTO OFFSET ----------------
-  async function hofSearch(minv, maxv, lim, off, pg) {
-    return authed(
-      "GET",
-      `/api/search_workstats?min=${encodeURIComponent(minv)}&max=${encodeURIComponent(maxv)}&limit=${encodeURIComponent(lim)}&offset=${encodeURIComponent(off)}&pages=${encodeURIComponent(pg)}`,
-      null
-    );
-  }
+  function renderEmployees(){
+    const c = el("div",{className:"card"});
+    const stats = state.stats||{};
+    c.appendChild(el("div",{className:"mini"},
+      `<b>Employees</b> <span class="pill">${stats.employee_count||0}</span>
+       <span class="pill ${(stats.inactive_3d_plus||0)>0?"bad":""}">Inactive 3d+: ${stats.inactive_3d_plus||0}</span>`
+    ));
 
-  function summarizeRange(resJson) {
-    const rows = resJson?.rows || [];
-    let minVal = null, maxVal = null;
-    for (const r of rows) {
-      const v = Number(r?.value);
-      if (!Number.isFinite(v)) continue;
-      if (minVal === null || v < minVal) minVal = v;
-      if (maxVal === null || v > maxVal) maxVal = v;
-    }
-    return { rowsCount: rows.length, minVal, maxVal };
-  }
-
-  async function autoFindOffset(minWanted, maxWanted, limitWanted, outEl, opts) {
-    // Strategy: probe offsets progressively until we find a page-range that overlaps [minWanted..maxWanted],
-    // then run a proper scan starting from that offset with user pages value.
-    const step = opts.step;
-    const maxOffset = opts.maxOffset;
-    const probePages = opts.probePages;
-    const tries = Math.ceil(maxOffset / step);
-
-    // Start with a few good common guesses first
-    const seed = [0, 20000, 50000, 80000, 120000, 160000, 220000, 300000].filter((x) => x <= maxOffset);
-    const visited = new Set();
-
-    function log(msg) {
-      outEl.innerHTML = `
-        <div class="card">
-          <div class="headline">Auto-Find Offset</div>
-          <div class="muted" style="margin-top:6px;">${escapeHtml(msg)}</div>
-        </div>
-      ` + outEl.innerHTML;
-    }
-
-    let bestCandidate = null;
-
-    async function probe(offset) {
-      visited.add(offset);
-      outEl.innerHTML = `
-        <div class="card">
-          <div class="headline">Auto-Find Offset</div>
-          <div class="muted" style="margin-top:6px;">
-            Probing offset <b>${escapeHtml(String(offset))}</b> (pages=${escapeHtml(String(probePages))})…
-          </div>
-        </div>
+    const list = el("div");
+    (state.employees||[]).forEach(e=>{
+      const row = el("div",{className:"emp"});
+      const left = el("div",{},`<div><b>${e.name||"Unknown"}</b></div>
+        <div class="mini">${e.position||""} ${e.inactive_days!=null?`• inactive ${e.inactive_days}d`:""}</div>`);
+      const right = el("div",{style:"text-align:right"});
+      const warn = (e.inactive_days!=null && e.inactive_days>=3) ? "bad":"";
+      right.innerHTML = `
+        <div class="mini ${warn}">MAN ${e.man!=null?money(e.man):"-"}</div>
+        <div class="mini ${warn}">INT ${e.int!=null?money(e.int):"-"}</div>
+        <div class="mini ${warn}">END ${e.end!=null?money(e.end):"-"}</div>
       `;
-
-      const res = await hofSearch(minWanted, maxWanted, Math.min(limitWanted, 50), offset, probePages);
-
-      if (res.status === 401) {
-        GM_setValue(K_TOKEN, "");
-        return { ok: false, fatal: true, error: "Session expired. Re-login." };
-      }
-
-      if (!res.json || res.json.ok !== true) {
-        return { ok: false, fatal: false, error: res.json?.error || "Probe failed" };
-      }
-
-      const summary = summarizeRange(res.json);
-      const overlap =
-        summary.maxVal !== null &&
-        summary.minVal !== null &&
-        !(summary.maxVal < minWanted || summary.minVal > maxWanted);
-
-      return { ok: true, res, summary, overlap };
-    }
-
-    // 1) Seed probes
-    for (const off of seed) {
-      if (visited.has(off)) continue;
-      const p = await probe(off);
-      if (!p.ok) {
-        if (p.fatal) return { ok: false, error: p.error, fatal: true };
-        // keep going on non-fatal
-        log(`Probe failed at offset ${off}: ${p.error}`);
-        await sleep(250);
-        continue;
-      }
-
-      if (p.summary.rowsCount > 0) {
-        // If it already found matches, we’re done: use this offset
-        return { ok: true, foundOffset: off, note: "Matches already found in probe." };
-      }
-
-      // no matches, but we can still use page min/max as guidance if present
-      if (p.summary.minVal !== null && p.summary.maxVal !== null) {
-        // bestCandidate: closest page range to target window
-        const dist =
-          (p.summary.maxVal < minWanted) ? (minWanted - p.summary.maxVal) :
-          (p.summary.minVal > maxWanted) ? (p.summary.minVal - maxWanted) :
-          0;
-
-        if (!bestCandidate || dist < bestCandidate.dist) {
-          bestCandidate = { off, dist, range: [p.summary.minVal, p.summary.maxVal] };
-        }
-
-        if (p.overlap) {
-          // Page range overlaps but no exact matches; still a great starting point
-          return { ok: true, foundOffset: off, note: "Probe range overlaps target window." };
-        }
-      }
-
-      await sleep(250);
-    }
-
-    // 2) Progressive stepping (coarse scan)
-    for (let i = 0; i < tries; i++) {
-      const off = i * step;
-      if (visited.has(off)) continue;
-
-      const p = await probe(off);
-      if (!p.ok) {
-        if (p.fatal) return { ok: false, error: p.error, fatal: true };
-        log(`Probe failed at offset ${off}: ${p.error}`);
-        await sleep(250);
-        continue;
-      }
-
-      if (p.summary.rowsCount > 0) {
-        return { ok: true, foundOffset: off, note: "Matches found during step scan." };
-      }
-
-      if (p.summary.minVal !== null && p.summary.maxVal !== null) {
-        const dist =
-          (p.summary.maxVal < minWanted) ? (minWanted - p.summary.maxVal) :
-          (p.summary.minVal > maxWanted) ? (p.summary.minVal - maxWanted) :
-          0;
-
-        if (!bestCandidate || dist < bestCandidate.dist) {
-          bestCandidate = { off, dist, range: [p.summary.minVal, p.summary.maxVal] };
-        }
-
-        if (p.overlap) {
-          return { ok: true, foundOffset: off, note: "Overlapping range discovered during step scan." };
-        }
-
-        // If the entire page is already below minWanted, further offsets likely even lower -> stop early
-        if (p.summary.maxVal < minWanted) {
-          return {
-            ok: true,
-            foundOffset: off,
-            note: "Values dropped below your min — using this offset as last best (try lowering min or offset).",
-          };
-        }
-      }
-
-      await sleep(250);
-    }
-
-    // fallback: bestCandidate or 0
-    if (bestCandidate) {
-      return { ok: true, foundOffset: bestCandidate.off, note: `Best nearby range was ~${bestCandidate.range[0]}-${bestCandidate.range[1]}` };
-    }
-    return { ok: true, foundOffset: 0, note: "Could not infer offset; defaulting to 0." };
+      row.appendChild(left); row.appendChild(right);
+      list.appendChild(row);
+    });
+    c.appendChild(list);
+    return c;
   }
 
-  async function renderSearch() {
-    body.innerHTML = `
-      <div class="card">
-        <div class="headline">HoF Workstats Search</div>
-        <div class="muted" style="margin-top:6px;">
-          If you get 0 results, HoF is huge — use <b>Offset</b> or hit <b>Auto-Find Offset</b>.
+  function renderTrains(token){
+    const c = el("div",{className:"card"});
+    c.appendChild(el("div",{className:"mini"},"<b>Train Tracker</b>"));
+
+    const grid = el("div",{className:"row",style:"margin-top:8px"});
+    const buyer = el("input",{placeholder:"Buyer name"});
+    const amt   = el("input",{placeholder:"Trains bought",type:"number"});
+    const note  = el("input",{placeholder:"Note (optional)"});
+    const addBtn= el("button",{className:"p7btn",style:"grid-column:1/-1"},"Add Train Record");
+
+    addBtn.addEventListener("click", async ()=>{
+      await apiPost(`${BASE_URL}/api/trains/add`,{
+        company_id: state.selected_company_id,
+        buyer_name: buyer.value.trim(),
+        trains_bought: Number(amt.value||0),
+        note: note.value.trim()
+      }, token);
+      await refresh(state.selected_company_id);
+    });
+
+    [buyer,amt,note,addBtn].forEach(x=>grid.appendChild(x));
+    c.appendChild(grid);
+
+    (state.trains||[]).forEach(t=>{
+      const r = el("div",{className:"card"});
+      r.innerHTML = `
+        <div><b>${t.buyer_name}</b>
+          <span class="pill">Bought: ${t.trains_bought}</span>
+          <span class="pill ${t.remaining===0?"warn":""}">Remaining: ${t.remaining}</span>
         </div>
-        <div class="hint">
-          Tips: Try Offset 20000 / 50000 / 80000 if you don’t want Auto.
-        </div>
-        <div class="line"></div>
-
-        <div class="mini">Min Total Workstats</div>
-        <div class="row"><input class="ch-in" id="minv" placeholder="e.g. 50000" inputmode="numeric"></div>
-
-        <div class="mini" style="margin-top:10px;">Max Total Workstats</div>
-        <div class="row"><input class="ch-in" id="maxv" placeholder="e.g. 120000" inputmode="numeric"></div>
-
-        <div class="mini" style="margin-top:10px;">Limit (1-300)</div>
-        <div class="row"><input class="ch-in" id="lim" placeholder="100" inputmode="numeric" value="100"></div>
-
-        <div class="mini" style="margin-top:10px;">Offset (rank position)</div>
-        <div class="row"><input class="ch-in" id="off" placeholder="0 (top) • try 20000 / 50000 / 80000" inputmode="numeric" value="0"></div>
-
-        <div class="mini" style="margin-top:10px;">Pages to scan (1-300)</div>
-        <div class="row"><input class="ch-in" id="pg" placeholder="50" inputmode="numeric" value="50"></div>
-
-        <div class="row">
-          <button class="ch-btn primary" id="runSearch">Search</button>
-          <button class="ch-btn gold" id="autoOffset">Auto-Find Offset</button>
-        </div>
-      </div>
-      <div id="searchOut"></div>
-    `;
-
-    const out = body.querySelector("#searchOut");
-
-    async function run(minv, maxv, lim, off, pg, label) {
-      out.innerHTML = `<div class="card"><div class="muted">${escapeHtml(label || "Searching…")}</div></div>`;
-
-      const res = await hofSearch(minv, maxv, lim, off, pg);
-
-      if (res.status === 401) {
-        GM_setValue(K_TOKEN, "");
-        return renderActiveTab();
-      }
-
-      if (!res.json || res.json.ok !== true) {
-        out.innerHTML = `
-          <div class="card">
-            <div class="headline">Error</div>
-            <div class="muted" style="margin-top:6px;">
-              ${escapeHtml(res.json?.error || "Failed")}
-            </div>
-            <div class="muted" style="margin-top:8px;">
-              If it says missing offset/pages, update your backend /api/search_workstats to accept them.
-            </div>
-          </div>
-        `;
-        return;
-      }
-
-      const rows = res.json.rows || [];
-      let html = `
-        <div class="card">
-          <div class="headline">Results</div>
-          <div class="muted" style="margin-top:6px;">
-            Count: ${escapeHtml(String(res.json.count || rows.length))}
-            • Offset: ${escapeHtml(String(res.json.offset ?? off))}
-            • Pages scanned: ${escapeHtml(String(res.json.scanned_pages || "?"))}
-            ${res.json.cached ? " • cached" : ""}
-          </div>
-        </div>
+        <div class="mini">${t.note||""}</div>
       `;
+      const row = el("div",{className:"row",style:"margin-top:8px"});
+      const used = el("input",{type:"number",value:String(t.trains_used||0),placeholder:"Used"});
+      const save = el("button",{className:"p7btn"},"Save Used");
+      const del  = el("button",{className:"p7btn"},"Delete");
 
-      if (!rows.length) {
-        html += `
-          <div class="card">
-            <div class="headline">No matches</div>
-            <div class="muted" style="margin-top:6px;">
-              Try Auto-Find Offset or use offsets like 20000 / 50000 / 80000.
-            </div>
-          </div>
-        `;
-        out.innerHTML = html;
-        return;
-      }
+      save.addEventListener("click", async ()=>{
+        await apiPost(`${BASE_URL}/api/trains/set_used`,{id:t.id,trains_used:Number(used.value||0)}, token);
+        await refresh(state.selected_company_id);
+      });
+      del.addEventListener("click", async ()=>{
+        await apiPost(`${BASE_URL}/api/trains/delete`,{id:t.id}, token);
+        await refresh(state.selected_company_id);
+      });
 
-      html += `<div class="card"><div class="headline">Players</div>`;
-      for (const r of rows.slice(0, 100)) {
-        const name = r.name || "Player";
-        const id = r.id || "";
-        const total = r.value ?? "";
-        html += `
-          <div class="listrow">
-            <div class="left">
-              <div class="t">${escapeHtml(name)} ${id ? `<span class="muted">[${escapeHtml(id)}]</span>` : ""}</div>
-              <div class="s">Workstats: ${escapeHtml(String(total))}</div>
-            </div>
-            <div>
-              ${id ? `<a href="https://www.torn.com/profiles.php?XID=${encodeURIComponent(id)}" target="_blank" class="ch-btn" style="text-decoration:none; display:inline-block;">Open</a>` : ""}
-            </div>
-          </div>
-        `;
-      }
-      html += `</div>`;
-      out.innerHTML = html;
-    }
+      [used,save,del].forEach(x=>row.appendChild(x));
+      r.appendChild(row);
+      c.appendChild(r);
+    });
 
-    body.querySelector("#runSearch").onclick = async () => {
-      const minv = (body.querySelector("#minv").value || "").trim();
-      const maxv = (body.querySelector("#maxv").value || "").trim();
-      const lim  = (body.querySelector("#lim").value || "100").trim();
-      const off  = (body.querySelector("#off").value || "0").trim();
-      const pg   = (body.querySelector("#pg").value || "50").trim();
-      await run(minv, maxv, lim, off, pg, "Searching…");
-    };
-
-    body.querySelector("#autoOffset").onclick = async () => {
-      const minWanted = toInt(body.querySelector("#minv").value, NaN);
-      const maxWanted = toInt(body.querySelector("#maxv").value, NaN);
-      const lim = toInt(body.querySelector("#lim").value, 100);
-      const pg = toInt(body.querySelector("#pg").value, 50);
-
-      if (!Number.isFinite(minWanted) || !Number.isFinite(maxWanted)) {
-        out.innerHTML = `<div class="card"><div class="headline">Need min/max</div><div class="muted" style="margin-top:6px;">Enter min and max first, then Auto-Find Offset.</div></div>`;
-        return;
-      }
-
-      out.innerHTML = `<div class="card"><div class="muted">Auto-Find Offset running…</div></div>`;
-
-      const auto = await autoFindOffset(
-        minWanted,
-        maxWanted,
-        lim,
-        out,
-        {
-          step: 20000,
-          maxOffset: 300000,
-          probePages: 1,
-        }
-      );
-
-      if (!auto.ok) {
-        if (auto.fatal) {
-          out.innerHTML = `<div class="card"><div class="headline">Session</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.error || "Session expired")}</div></div>`;
-          return;
-        }
-        out.innerHTML = `<div class="card"><div class="headline">Auto-Find failed</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.error || "Failed")}</div></div>`;
-        return;
-      }
-
-      const foundOffset = auto.foundOffset ?? 0;
-      body.querySelector("#off").value = String(foundOffset);
-
-      // run full search starting from found offset using user pages
-      await run(
-        String(minWanted),
-        String(maxWanted),
-        String(lim),
-        String(foundOffset),
-        String(pg),
-        `Auto-Find picked offset ${foundOffset}. Searching with pages=${pg}…`
-      );
-
-      // add a tiny note at the top (keeps results)
-      if (auto.note) {
-        out.innerHTML =
-          `<div class="card"><div class="headline">Auto-Find Note</div><div class="muted" style="margin-top:6px;">${escapeHtml(auto.note)}</div></div>` +
-          out.innerHTML;
-      }
-    };
+    return c;
   }
 
-  // Start hidden
-  panel.style.display = "none";
+  function renderContracts(token){
+    const c = el("div",{className:"card"});
+    c.appendChild(el("div",{className:"mini"},"<b>Contracts</b>"));
+
+    const title = el("input",{placeholder:"Title (ex: 50 trains / 10 days)"});
+    const empN  = el("input",{placeholder:"Employee name (optional)"});
+    const empI  = el("input",{placeholder:"Employee id (optional)"});
+    const exp   = el("input",{placeholder:"Expires ISO (optional) e.g. 2026-03-10T00:00:00+00:00"});
+    const note  = el("input",{placeholder:"Note (optional)"});
+    const add   = el("button",{className:"p7btn",style:"margin-top:8px"},"Add Contract");
+
+    add.addEventListener("click", async ()=>{
+      await apiPost(`${BASE_URL}/api/contracts/add`,{
+        company_id: state.selected_company_id,
+        title: title.value.trim(),
+        employee_name: empN.value.trim(),
+        employee_id: empI.value.trim(),
+        expires_at: exp.value.trim(),
+        note: note.value.trim()
+      }, token);
+      await refresh(state.selected_company_id);
+    });
+
+    const grid = el("div",{className:"row",style:"margin-top:8px"});
+    [title,empN,empI,exp,note].forEach(x=>grid.appendChild(x));
+    c.appendChild(grid);
+    c.appendChild(add);
+
+    (state.contracts||[]).forEach(k=>{
+      const r = el("div",{className:"card"});
+      r.innerHTML = `
+        <div><b>${k.title}</b> ${k.expires_at?`<span class="pill">${k.expires_at}</span>`:""}</div>
+        <div class="mini">${k.employee_name||""} ${k.employee_id?`(#${k.employee_id})`:""}</div>
+        <div class="mini">${k.note||""}</div>
+      `;
+      const del = el("button",{className:"p7btn",style:"margin-top:8px"},"Delete");
+      del.addEventListener("click", async ()=>{
+        await apiPost(`${BASE_URL}/api/contracts/delete`,{id:k.id}, token);
+        await refresh(state.selected_company_id);
+      });
+      r.appendChild(del);
+      c.appendChild(r);
+    });
+
+    return c;
+  }
+
+  function renderSearch(token){
+    const c = el("div",{className:"card"});
+    c.appendChild(el("div",{className:"mini"},"<b>HoF Working Stats Scan</b>"));
+
+    const minMan = el("input",{type:"number",placeholder:"Min MAN"});
+    const maxMan = el("input",{type:"number",placeholder:"Max MAN"});
+    const minInt = el("input",{type:"number",placeholder:"Min INT"});
+    const maxInt = el("input",{type:"number",placeholder:"Max INT"});
+    const minEnd = el("input",{type:"number",placeholder:"Min END"});
+    const maxEnd = el("input",{type:"number",placeholder:"Max END"});
+    const go     = el("button",{className:"p7btn",style:"grid-column:1/-1"},"Scan");
+
+    const out = el("div",{className:"mini",style:"margin-top:10px"},"");
+
+    go.addEventListener("click", async ()=>{
+      out.textContent = "Scanning...";
+      const res = await apiPost(`${BASE_URL}/api/search/hof`,{
+        min_man:Number(minMan.value||0),
+        max_man:Number(maxMan.value||999999999999),
+        min_int:Number(minInt.value||0),
+        max_int:Number(maxInt.value||999999999999),
+        min_end:Number(minEnd.value||0),
+        max_end:Number(maxEnd.value||999999999999),
+      }, token);
+
+      if(!res.ok){ out.textContent = "Error: " + (res.error||"unknown"); return; }
+      const rows = res.rows || [];
+      out.innerHTML =
+        `<div><b>Found ${rows.length}</b></div>` +
+        rows.slice(0,50).map(r=>{
+          const prof = `https://www.torn.com/profiles.php?XID=${r.id}`;
+          const msg = `Hey ${r.name}, I saw your working stats and wanted to invite you to apply to our company. We offer trains + active leadership. If interested, message me back!`;
+          return `<div style="margin-top:8px">
+            <a href="${prof}" target="_blank"><b>${r.name}</b> (#${r.id})</a>
+            <div>MAN ${money(r.man)} • INT ${money(r.int)} • END ${money(r.end)} • <b>Total ${money(r.total)}</b></div>
+            <button class="p7btn" data-msg="${encodeURIComponent(msg)}">Copy Recruit Msg</button>
+          </div>`;
+        }).join("");
+
+      out.querySelectorAll("button[data-msg]").forEach(btn=>{
+        btn.addEventListener("click", async ()=>{
+          const txt = decodeURIComponent(btn.getAttribute("data-msg"));
+          await navigator.clipboard.writeText(txt);
+          btn.textContent = "Copied!";
+          setTimeout(()=>btn.textContent="Copy Recruit Msg", 900);
+        });
+      });
+    });
+
+    const grid = el("div",{className:"row",style:"margin-top:8px"});
+    [minMan,maxMan,minInt,maxInt,minEnd,maxEnd,go].forEach(x=>grid.appendChild(x));
+    c.appendChild(grid);
+    c.appendChild(out);
+    return c;
+  }
+
+  function renderBroadcast(){
+    const c = el("div",{className:"card"});
+    c.appendChild(el("div",{className:"mini"},"<b>Broadcast</b> (copy/paste)"));
+    const ta = el("textarea",{rows:5,placeholder:"Write message..."});
+    ta.value = "Reminder: contracts renewing soon. Please stay active and reply if you need anything.";
+    const copy = el("button",{className:"p7btn",style:"margin-top:8px"},"Copy");
+    copy.addEventListener("click", async ()=>{
+      await navigator.clipboard.writeText(ta.value);
+      copy.textContent="Copied!";
+      setTimeout(()=>copy.textContent="Copy",900);
+    });
+    c.appendChild(ta); c.appendChild(copy);
+    return c;
+  }
+
+  function renderSettings(token){
+    const c = el("div",{className:"card"});
+    c.appendChild(el("div",{className:"mini"},"<b>Settings</b>"));
+
+    const admin = el("input",{placeholder:"Admin Key"});
+    const api   = el("input",{placeholder:"Torn API Key"});
+    const comps = el("input",{placeholder:"Company IDs (comma separated) e.g. 123,456"});
+    admin.value = getVal(K_ADMIN,"");
+    api.value   = getVal(K_API,"");
+    comps.value = getVal(K_COMP,"");
+
+    const save = el("button",{className:"p7btn",style:"margin-top:8px"},"Login / Save");
+    const info = el("div",{className:"mini",style:"margin-top:8px"},"");
+
+    save.addEventListener("click", async ()=>{
+      setVal(K_ADMIN, admin.value.trim());
+      setVal(K_API, api.value.trim());
+      setVal(K_COMP, comps.value.trim());
+
+      info.textContent = "Authenticating...";
+      const res = await apiPost(`${BASE_URL}/api/auth`,{
+        admin_key: admin.value.trim(),
+        api_key: api.value.trim()
+      }, null);
+
+      if(!res.ok){ info.textContent = "Auth failed: " + (res.error||"unknown"); return; }
+      setVal(K_TOK, res.token);
+
+      // save companies if provided
+      const ids = comps.value.split(",").map(s=>s.trim()).filter(Boolean);
+      if(ids.length){
+        const r2 = await apiPost(`${BASE_URL}/api/user/companies`, { company_ids: ids }, res.token);
+        if(!r2.ok){ info.textContent = "Saved token, but company ids failed: " + (r2.error||"unknown"); return; }
+      }
+
+      info.textContent = "Saved. Reloading...";
+      await refresh(getVal(K_SEL,""));
+      activeTab = "Employees";
+      render();
+    });
+
+    c.appendChild(admin);
+    c.appendChild(api);
+    c.appendChild(comps);
+    c.appendChild(save);
+    c.appendChild(info);
+
+    c.appendChild(el("div",{className:"mini",style:"margin-top:10px"},
+      `BASE_URL: <b>${BASE_URL}</b><br>Token saved: <b>${token ? "YES" : "NO"}</b>`
+    ));
+    return c;
+  }
+
+  async function refresh(companyId){
+    const token = getVal(K_TOK,"");
+    if(!token){
+      subEl.textContent = "Not logged in";
+      state = {ok:false};
+      setBadge(0);
+      render();
+      return;
+    }
+
+    const sel = companyId || getVal(K_SEL,"");
+    const url = `${BASE_URL}/state${sel?`?company_id=${encodeURIComponent(sel)}`:""}`;
+
+    try{
+      state = await apiGet(url, token);
+      if(!state.ok){
+        subEl.textContent = "Session invalid";
+        setBadge(0);
+        render();
+        return;
+      }
+      subEl.textContent = `${state.user?.name||""} • ${state.selected_company_id?("Company #"+state.selected_company_id):"No company"}`;
+      setBadge(state.unseen_count||0);
+      render();
+    }catch{
+      subEl.textContent = "Load error";
+      state = {ok:false};
+      render();
+    }
+  }
+
+  async function render(){
+    renderTabs();
+    bodyEl.innerHTML = "";
+
+    const token = getVal(K_TOK,"");
+
+    if(!state || !state.ok){
+      bodyEl.appendChild(renderSettings(token));
+      return;
+    }
+
+    if((state.company_ids||[]).length){
+      bodyEl.appendChild(companyPicker());
+    } else {
+      bodyEl.appendChild(el("div",{className:"card"}, "No company IDs saved. Go to Settings and add them."));
+    }
+
+    if(activeTab==="Employees") bodyEl.appendChild(renderEmployees());
+    if(activeTab==="Trains") bodyEl.appendChild(renderTrains(token));
+    if(activeTab==="Contracts") bodyEl.appendChild(renderContracts(token));
+    if(activeTab==="Search") bodyEl.appendChild(renderSearch(token));
+    if(activeTab==="Broadcast") bodyEl.appendChild(renderBroadcast());
+    if(activeTab==="Settings") bodyEl.appendChild(renderSettings(token));
+  }
+
+  seenBtn.addEventListener("click", async ()=>{
+    const token = getVal(K_TOK,"");
+    if(!token) return;
+    await apiPost(`${BASE_URL}/api/notifications/seen`,{}, token);
+    await refresh(state?.selected_company_id||"");
+  });
+
+  // start
+  refresh(getVal(K_SEL,""));
+  setInterval(()=>refresh(state?.selected_company_id||getVal(K_SEL,"")), 15000);
 })();
