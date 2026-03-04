@@ -2,7 +2,7 @@
 // @name         Company Hub 💼 
 // @namespace    fries91-7ds-wrath
 // @version      6.2.0
-// @description  Peace Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value company theme. Briefcase always on top, smaller, no duplicates. Includes Bad-JSON preview.
+// @description  Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value company theme. Briefcase always on top, smaller, no duplicates. Includes Bad-JSON preview.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @run-at       document-idle
