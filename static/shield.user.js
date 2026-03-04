@@ -1,480 +1,470 @@
 // ==UserScript==
-// @name         7DS*: Peace Hub 💼 (High-Value Theme + Recruit Leads)
-// @namespace    7ds-peace-hub
-// @version      2.0.0
-// @description  Company hub: employees, trains, contracts, HoF scan + PREMIUM Recruit Leads (beats your floor employee).
+// @name         7DS*: Peace Company Hub 💼 (PDA Friendly + TOTAL HoF Search)
+// @namespace    Fries-company-hub
+// @version      3.1.0
+// @description  Company Hub: Companies/Employees, Trains, Contracts, HoF Search (TOTAL only), Recruit Leads, Notifications. Draggable 💼, tap toggles overlay, CSP-safe via /state.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
-// @connect      YOUR-SERVICE.onrender.com
+// @connect      sevends-hiring-scan.onrender.com
 // ==/UserScript==
 
 (function () {
   "use strict";
 
   // ================= USER CONFIG =================
-  const BASE_URL = "https://YOUR-SERVICE.onrender.com"; // <-- CHANGE
+  const BASE_URL = "https://sevends-hiring-scan.onrender.com"; // <-- CHANGE to your Render domain
   // ==============================================
 
-  const K_ADMIN = "hub_admin_key_v2";
-  const K_API   = "hub_api_key_v2";
-  const K_TOK   = "hub_session_token_v2";
-  const K_COMP  = "hub_company_ids_v2";
-  const K_SEL   = "hub_selected_company_v2";
+  const K_ADMIN = "hub_admin_key_v3";
+  const K_API   = "hub_api_key_v3";
+  const K_TOKEN = "hub_session_token_v3";
+  const K_CIDS  = "hub_company_ids_v3";
+  const K_ICONP = "hub_icon_pos_v3";
+  const ICON_ID = "hub-briefcase";
+  const WRAP_ID = "hub-overlay";
 
-  const el = (tag, attrs = {}, html = "") => {
-    const n = document.createElement(tag);
-    Object.entries(attrs).forEach(([k, v]) => (n[k] = v));
-    if (html) n.innerHTML = html;
-    return n;
-  };
-  const getVal = (k, d = "") => { try { return GM_getValue(k, d); } catch { return d; } };
-  const setVal = (k, v) => { try { GM_setValue(k, v); } catch {} };
+  const $ = (s, r=document) => r.querySelector(s);
+  const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
 
-  function apiReq(method, url, body, token) {
-    return new Promise((resolve, reject) => {
-      const headers = { "Content-Type": "application/json" };
-      if (token) headers["X-Session-Token"] = token;
+  function safeJSON(t){ try { return JSON.parse(t); } catch { return null; } }
+  function fmt(n){ try { return Intl.NumberFormat().format(Number(n||0)); } catch { return String(n||0); } }
+  function gmGet(k, d=""){ const v = GM_getValue(k); return (v===undefined||v===null||v==="") ? d : v; }
+  function gmSet(k, v){ GM_setValue(k, v); }
+  function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
 
+  function toast(msg, ms=2200){
+    const el = document.createElement("div");
+    el.className = "hub-toast";
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(()=>el.classList.add("show"), 10);
+    setTimeout(()=>{ el.classList.remove("show"); setTimeout(()=>el.remove(), 300); }, ms);
+  }
+
+  function apiReq(method, path, body=null){
+    const url = BASE_URL.replace(/\/+$/,"") + path;
+    const token = gmGet(K_TOKEN,"");
+    return new Promise((resolve, reject)=>{
       GM_xmlhttpRequest({
         method,
         url,
-        headers,
-        data: body ? JSON.stringify(body) : null,
-        onload: (r) => {
-          try { resolve(JSON.parse(r.responseText)); }
-          catch (e) { reject(e); }
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? {"X-Session-Token": token} : {})
         },
-        onerror: reject,
+        data: body ? JSON.stringify(body) : null,
+        timeout: 25000,
+        onload: (res)=>{
+          const data = safeJSON(res.responseText);
+          if (!data) return reject(new Error(`Bad JSON (${res.status})`));
+          if (res.status >= 400 || data.ok === false) return reject(new Error(data.error || `HTTP ${res.status}`));
+          resolve(data);
+        },
+        onerror: ()=>reject(new Error("Network error")),
+        ontimeout: ()=>reject(new Error("Timeout")),
       });
     });
   }
-  const apiGet  = (url, token) => apiReq("GET",  url, null, token);
-  const apiPost = (url, body, token) => apiReq("POST", url, body, token);
 
-  // ================== High Value Theme ==================
-  GM_addStyle(`
-    :root{
-      --hv-bg:#070A0F; --hv-panel:#0B1019; --hv-card:#0A0F16;
-      --hv-border:#263548; --hv-border2:#364C67;
-      --hv-text:#E9EEF6; --hv-muted:rgba(233,238,246,.72);
-      --hv-gold:#E6C36A; --hv-danger:#ff5b5b; --hv-warn:#ffcc66; --hv-blue:#8BD0FF;
-      --hv-shadow:0 18px 55px rgba(0,0,0,.62);
-    }
+  function ensureUI(){
+    if (document.getElementById(ICON_ID) || document.getElementById(WRAP_ID)) return;
 
-    #p7ds-bag{
-      position:fixed; right:16px; bottom:118px;
-      z-index:99999999;
-      width:60px; height:60px;
-      border-radius:18px;
-      background: radial-gradient(140% 140% at 15% 10%, rgba(230,195,106,.25) 0%, rgba(11,16,25,1) 60%);
-      border:1px solid var(--hv-border2);
-      display:flex; align-items:center; justify-content:center;
-      box-shadow: var(--hv-shadow);
-      cursor:grab; user-select:none; -webkit-tap-highlight-color: transparent;
-    }
-    #p7ds-bag:active{cursor:grabbing}
-    #p7ds-bag .icon{ font-size:28px; filter: drop-shadow(0 2px 8px rgba(0,0,0,.5)); }
-    #p7ds-bag .badge{
-      position:absolute; top:-7px; right:-7px;
-      min-width:22px; height:22px; padding:0 6px;
-      border-radius:999px;
-      background: var(--hv-danger);
-      color:#fff; font-weight:800; font-size:12px;
-      display:none; align-items:center; justify-content:center;
-      border:2px solid var(--hv-bg);
-    }
+    const icon = document.createElement("div");
+    icon.id = ICON_ID;
+    icon.innerHTML = `
+      <div class="hub-icon-inner">💼</div>
+      <div class="hub-badge" style="display:none">0</div>
+    `;
+    document.body.appendChild(icon);
 
-    #p7ds-panel{
-      position:fixed; right:16px; bottom:188px;
-      z-index:9999990;
-      width:360px; max-height:72vh; overflow:auto;
-      border-radius:18px;
-      background: linear-gradient(180deg, rgba(15,22,34,.98) 0%, rgba(8,11,16,.98) 100%);
-      border:1px solid var(--hv-border2);
-      box-shadow: var(--hv-shadow);
-      display:none;
-      backdrop-filter: blur(8px);
-    }
-    #p7ds-panel *{ box-sizing:border-box; font-family:system-ui; }
+    const wrap = document.createElement("div");
+    wrap.id = WRAP_ID;
+    wrap.innerHTML = `
+      <div class="hub-card">
+        <div class="hub-topbar">
+          <div class="hub-title">
+            <div class="hub-title-main">Company Hub</div>
+            <div class="hub-title-sub">7DS*: Peace — High Value Dashboard</div>
+          </div>
+          <div class="hub-top-actions">
+            <button class="hub-btn ghost" data-act="refresh">Refresh</button>
+            <button class="hub-btn ghost" data-act="close">Close</button>
+          </div>
+        </div>
 
-    #p7ds-head{
-      padding:10px 12px;
-      border-bottom:1px solid rgba(54,76,103,.55);
-      display:flex; gap:10px; align-items:center;
-      background: linear-gradient(90deg, rgba(230,195,106,.12) 0%, rgba(11,16,25,.2) 60%);
-    }
-    #p7ds-title{ font-weight:900; font-size:13px; letter-spacing:.35px; text-transform:uppercase; }
-    #p7ds-sub{ color:var(--hv-muted); font-size:12px; }
+        <div class="hub-tabs">
+          <button class="hub-tab active" data-tab="dash">Dashboard</button>
+          <button class="hub-tab" data-tab="companies">Companies</button>
+          <button class="hub-tab" data-tab="trains">Trains</button>
+          <button class="hub-tab" data-tab="contracts">Contracts</button>
+          <button class="hub-tab" data-tab="search">HoF Search</button>
+          <button class="hub-tab" data-tab="leads">Leads</button>
+          <button class="hub-tab" data-tab="notifs">Notifications</button>
+          <button class="hub-tab" data-tab="settings">Settings</button>
+        </div>
 
-    #p7ds-tabs{
-      display:flex; gap:6px; padding:10px 12px; flex-wrap:wrap;
-      border-bottom:1px solid rgba(54,76,103,.35);
-    }
+        <div class="hub-body">
+          <section class="hub-pane active" data-pane="dash">
+            <div class="hub-grid">
+              <div class="hub-panel">
+                <div class="hub-panel-h">Status</div>
+                <div class="hub-panel-b">
+                  <div class="hub-row"><span>Service</span><span id="hub-service">—</span></div>
+                  <div class="hub-row"><span>User</span><span id="hub-user">—</span></div>
+                  <div class="hub-row"><span>Unseen</span><span id="hub-unseen">0</span></div>
+                  <div class="hub-row"><span>Selected company</span><span id="hub-selco">—</span></div>
+                  <div class="hub-muted" style="margin-top:8px">Tap 💼 to open/close. Drag 💼 anywhere.</div>
+                </div>
+              </div>
 
-    .p7btn{
-      background: rgba(6,10,15,.92);
-      border:1px solid rgba(38,53,72,.95);
-      color: var(--hv-text);
-      border-radius:12px;
-      padding:6px 8px;
-      font-size:11px;
-      cursor:pointer;
-    }
-    .p7btn.on{ border-color: rgba(230,195,106,.9); box-shadow: 0 0 0 2px rgba(230,195,106,.12) inset; }
-    .p7btn.gold{ border-color: rgba(230,195,106,.9); background: linear-gradient(180deg, rgba(230,195,106,.18), rgba(6,10,15,.92)); }
+              <div class="hub-panel">
+                <div class="hub-panel-h">Quick Actions</div>
+                <div class="hub-panel-b">
+                  <button class="hub-btn" data-act="goto-search">HoF Search</button>
+                  <button class="hub-btn" data-act="goto-leads">Recruit Leads</button>
+                  <button class="hub-btn ghost" data-act="run-recruit-scan">Run Recruit Scan (All Companies)</button>
+                </div>
+              </div>
+            </div>
+          </section>
 
-    #p7ds-body{ padding:12px; }
+          <section class="hub-pane" data-pane="companies">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Companies & Employees</div>
+              <div class="hub-panel-b">
+                <div class="hub-inline">
+                  <select id="hub-company" class="hub-input"></select>
+                  <button class="hub-btn" data-act="load-company">Load</button>
+                </div>
+                <div id="hub-company-info" class="hub-muted" style="margin-top:10px"></div>
+                <div id="hub-employee-list" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
 
-    .card{ background: rgba(6,10,15,.88); border:1px solid rgba(38,53,72,.9); border-radius:14px; padding:10px; margin:10px 0; }
-    .row{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+          <section class="hub-pane" data-pane="trains">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Train Tracking</div>
+              <div class="hub-panel-b">
+                <div class="hub-inline">
+                  <input id="hub-train-buyer" class="hub-input" placeholder="Buyer name" />
+                  <input id="hub-train-qty" class="hub-input" placeholder="Trains bought" inputmode="numeric" />
+                </div>
+                <div class="hub-inline">
+                  <input id="hub-train-note" class="hub-input" placeholder="Note (optional)" />
+                  <button class="hub-btn" data-act="add-train">Add</button>
+                  <button class="hub-btn ghost" data-act="reload-state">Reload</button>
+                </div>
+                <div id="hub-train-list" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
 
-    input,select,textarea{
-      width:100%; padding:8px; border-radius:12px;
-      border:1px solid rgba(38,53,72,.9);
-      background: rgba(4,7,12,.95);
-      color: var(--hv-text);
-    }
+          <section class="hub-pane" data-pane="contracts">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Contracts</div>
+              <div class="hub-panel-b">
+                <div class="hub-inline">
+                  <input id="hub-contract-title" class="hub-input" placeholder="Contract title" />
+                  <input id="hub-contract-expires" class="hub-input" placeholder="Expires (YYYY-MM-DD)" />
+                </div>
+                <div class="hub-inline">
+                  <input id="hub-contract-emp" class="hub-input" placeholder="Employee name (optional)" />
+                  <input id="hub-contract-note" class="hub-input" placeholder="Note (optional)" />
+                </div>
+                <div class="hub-inline">
+                  <button class="hub-btn" data-act="add-contract">Add</button>
+                  <button class="hub-btn ghost" data-act="reload-state">Reload</button>
+                </div>
+                <div id="hub-contract-list" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
 
-    .mini{ font-size:12px; color: var(--hv-muted); }
-    .pill{ display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid rgba(38,53,72,.95); font-size:11px; color: var(--hv-muted); margin-left:6px; }
-    .pill.gold{ border-color: rgba(230,195,106,.55); color: rgba(230,195,106,.95); }
-    .emp{ display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px dashed rgba(233,238,246,.08); }
-    .emp:last-child{border-bottom:none}
-    .bad{ color: var(--hv-danger); }
-    .warn{ color: var(--hv-warn); }
-    a{ color: var(--hv-blue); text-decoration:none; }
-  `);
+          <section class="hub-pane" data-pane="search">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Hall of Fame Search (TOTAL only)</div>
+              <div class="hub-panel-b">
+                <div class="hub-muted">Filters ONLY by TOTAL (MAN + INT + END). Backend returns top matches.</div>
+                <div class="hub-inline" style="margin-top:10px">
+                  <input id="hub-min-total" class="hub-input" placeholder="Min total (e.g. 150000)" inputmode="numeric" />
+                  <input id="hub-max-total" class="hub-input" placeholder="Max total (e.g. 350000)" inputmode="numeric" />
+                </div>
+                <div class="hub-inline">
+                  <button class="hub-btn" data-act="hof-search">Search HoF</button>
+                </div>
+                <div id="hub-hof-results" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
 
-  const bag = el("div", { id: "p7ds-bag", title: "Company Hub" });
-  const icon = el("div", { className: "icon" }, "💼");
-  const badge = el("div", { className: "badge" }, "0");
-  bag.appendChild(icon);
-  bag.appendChild(badge);
+          <section class="hub-pane" data-pane="leads">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Recruit Leads</div>
+              <div class="hub-panel-b">
+                <div class="hub-inline">
+                  <button class="hub-btn" data-act="run-recruit-scan">Run Recruit Scan (Selected)</button>
+                  <button class="hub-btn ghost" data-act="reload-leads">Reload Leads</button>
+                </div>
+                <div class="hub-inline">
+                  <button class="hub-btn ghost" data-act="mark-leads-seen">Mark Seen</button>
+                  <button class="hub-btn ghost" data-act="clear-leads">Clear Leads</button>
+                </div>
+                <div id="hub-leads-list" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
 
-  const panel = el("div", { id: "p7ds-panel" });
-  panel.innerHTML = `
-    <div id="p7ds-head">
-      <div style="font-size:18px;filter:drop-shadow(0 2px 8px rgba(0,0,0,.45))">💼</div>
-      <div style="flex:1">
-        <div id="p7ds-title">Company Hub</div>
-        <div id="p7ds-sub">Loading...</div>
+          <section class="hub-pane" data-pane="notifs">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Notifications</div>
+              <div class="hub-panel-b">
+                <div class="hub-inline">
+                  <button class="hub-btn ghost" data-act="reload-state">Reload</button>
+                  <button class="hub-btn ghost" data-act="notifs-seen">Mark Seen</button>
+                </div>
+                <div id="hub-notifs" class="hub-list" style="margin-top:10px"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="hub-pane" data-pane="settings">
+            <div class="hub-panel">
+              <div class="hub-panel-h">Login & Setup</div>
+              <div class="hub-panel-b">
+                <div class="hub-muted">Admin key is provided by the service owner. You use your own Torn API key.</div>
+                <div class="hub-inline" style="margin-top:10px">
+                  <input id="hub-admin" class="hub-input" placeholder="Admin key" />
+                  <input id="hub-api" class="hub-input" placeholder="Your Torn API key" />
+                </div>
+                <div class="hub-inline">
+                  <input id="hub-company-ids" class="hub-input" placeholder="Company IDs (comma separated)" />
+                </div>
+                <div class="hub-inline">
+                  <button class="hub-btn" data-act="login">Login</button>
+                  <button class="hub-btn ghost" data-act="save-companies">Save Companies</button>
+                  <button class="hub-btn ghost" data-act="logout">Logout</button>
+                </div>
+
+                <div class="hub-divider"></div>
+                <div class="hub-muted">
+                  After login, open “Companies” tab and hit Load.
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
       </div>
-      <button class="p7btn" id="p7ds-seen" title="Mark notifications seen">Seen</button>
-    </div>
-    <div id="p7ds-tabs"></div>
-    <div id="p7ds-body"></div>
-  `;
-  document.body.appendChild(panel);
-  document.body.appendChild(bag);
+    `;
+    document.body.appendChild(wrap);
 
-  // ---- draggable + click toggle (ignore click if dragged) ----
-  let dragging = false, moved = false, sx=0, sy=0, ox=0, oy=0;
-
-  function startDrag(x,y){
-    dragging = true; moved = false;
-    sx=x; sy=y;
-    const r = bag.getBoundingClientRect();
-    ox=r.left; oy=r.top;
-  }
-  function doDrag(x,y){
-    if(!dragging) return;
-    const dx=x-sx, dy=y-sy;
-    if (Math.abs(dx)>4 || Math.abs(dy)>4) moved = true;
-
-    const nx = ox + dx, ny = oy + dy;
-    bag.style.left = nx+"px";
-    bag.style.top  = ny+"px";
-    bag.style.right="auto"; bag.style.bottom="auto";
-
-    if(panel.style.display==="block"){
-      panel.style.left = Math.max(10, nx-320) + "px";
-      panel.style.top  = Math.max(10, ny-10) + "px";
-      panel.style.right="auto"; panel.style.bottom="auto";
-    }
-  }
-  function endDrag(){ dragging=false; }
-
-  bag.addEventListener("touchstart",(e)=>{ const t=e.touches[0]; startDrag(t.clientX,t.clientY); e.preventDefault(); },{passive:false});
-  bag.addEventListener("touchmove",(e)=>{ const t=e.touches[0]; doDrag(t.clientX,t.clientY); e.preventDefault(); },{passive:false});
-  bag.addEventListener("touchend",()=>endDrag());
-  bag.addEventListener("mousedown",(e)=>{ startDrag(e.clientX,e.clientY); e.preventDefault(); });
-  window.addEventListener("mousemove",(e)=>doDrag(e.clientX,e.clientY));
-  window.addEventListener("mouseup",()=>endDrag());
-
-  function togglePanel(){
-    const open = (panel.style.display==="block");
-    panel.style.display = open ? "none" : "block";
-    if(!open){
-      const r = bag.getBoundingClientRect();
-      panel.style.left = Math.max(10, r.left-320) + "px";
-      panel.style.top  = Math.max(10, r.top-10) + "px";
-      panel.style.right="auto"; panel.style.bottom="auto";
-    }
-  }
-  bag.addEventListener("click",()=>{ if(moved){ moved=false; return; } togglePanel(); });
-
-  const tabsEl = panel.querySelector("#p7ds-tabs");
-  const bodyEl = panel.querySelector("#p7ds-body");
-  const subEl  = panel.querySelector("#p7ds-sub");
-  const seenBtn= panel.querySelector("#p7ds-seen");
-
-  const TABS = ["Employees","Trains","Contracts","Recruit","Search","Broadcast","Settings"];
-  let activeTab = "Employees";
-  let state = null;
-
-  function setBadge(n){ if(n>0){ badge.style.display="flex"; badge.textContent=String(n);} else badge.style.display="none"; }
-  function money(n){ try{return Number(n).toLocaleString();}catch{return String(n);} }
-
-  function renderTabs(){
-    tabsEl.innerHTML="";
-    TABS.forEach(t=>{
-      const b=el("button",{className:"p7btn"},t);
-      if(t===activeTab) b.classList.add("on");
-      b.addEventListener("click",()=>{ activeTab=t; render(); });
-      tabsEl.appendChild(b);
-    });
-  }
-
-  function companyPicker(){
-    const c=el("div",{className:"card"});
-    const sel=el("select");
-    (state.company_ids||[]).forEach(cid=>{
-      const o=el("option"); o.value=cid; o.textContent=`Company #${cid}`; sel.appendChild(o);
-    });
-    const saved=getVal(K_SEL,"");
-    const cur=state.selected_company_id || (state.company_ids||[])[0] || "";
-    sel.value = (saved && (state.company_ids||[]).includes(saved)) ? saved : cur;
-
-    sel.addEventListener("change",async()=>{ setVal(K_SEL,sel.value); await refresh(sel.value); });
-    c.appendChild(el("div",{className:"mini"},`<b>Selected Company</b> <span class="pill gold">${sel.value||""}</span>`));
-    c.appendChild(sel);
-    return c;
-  }
-
-  function renderEmployees(){
-    const c=el("div",{className:"card"});
-    const stats=state.stats||{};
-    c.appendChild(el("div",{className:"mini"},
-      `<b>Employees</b>
-       <span class="pill gold">${stats.employee_count||0}</span>
-       <span class="pill ${(stats.inactive_3d_plus||0)>0?"bad":""}">Inactive 3d+: ${stats.inactive_3d_plus||0}</span>`
-    ));
-    const list=el("div");
-    (state.employees||[]).forEach(e=>{
-      const row=el("div",{className:"emp"});
-      const left=el("div",{},`<div><b>${e.name||"Unknown"}</b></div><div class="mini">${e.position||""} ${e.inactive_days!=null?`• inactive ${e.inactive_days}d`:""}</div>`);
-      const right=el("div",{style:"text-align:right"});
-      const warn=(e.inactive_days!=null && e.inactive_days>=3)?"bad":"";
-      right.innerHTML = `<div class="mini ${warn}">MAN ${e.man!=null?money(e.man):"-"}</div>
-                         <div class="mini ${warn}">INT ${e.int!=null?money(e.int):"-"}</div>
-                         <div class="mini ${warn}">END ${e.end!=null?money(e.end):"-"}</div>`;
-      row.appendChild(left); row.appendChild(right);
-      list.appendChild(row);
-    });
-    c.appendChild(list);
-    return c;
-  }
-
-  function renderRecruit(token){
-    const c=el("div",{className:"card"});
-    c.appendChild(el("div",{className:"mini"},
-      `<b>Recruit Leads</b> <span class="pill gold">${(state.recruit_leads||[]).length}</span>
-       <div class="mini" style="margin-top:6px">Finds HoF working-stat players who beat your weakest employee (floor). Stores top leads.</div>`
-    ));
-
-    const btnRow = el("div",{style:"display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"});
-    const scanBtn = el("button",{className:"p7btn gold"},"Scan Now");
-    const seenBtn2= el("button",{className:"p7btn"},"Mark Seen");
-    const clearBtn= el("button",{className:"p7btn"},"Clear");
-
-    scanBtn.addEventListener("click", async ()=>{
-      scanBtn.textContent="Scanning...";
-      const res = await apiPost(`${BASE_URL}/api/recruit/scan`, { company_id: state.selected_company_id }, token);
-      scanBtn.textContent="Scan Now";
-      await refresh(state.selected_company_id);
-      if(!res.ok){ alert("Recruit scan failed: "+(res.error||"unknown")); }
-    });
-
-    seenBtn2.addEventListener("click", async ()=>{
-      await apiPost(`${BASE_URL}/api/recruit/seen`, { company_id: state.selected_company_id }, token);
-      await refresh(state.selected_company_id);
-    });
-
-    clearBtn.addEventListener("click", async ()=>{
-      await apiPost(`${BASE_URL}/api/recruit/clear`, { company_id: state.selected_company_id }, token);
-      await refresh(state.selected_company_id);
-    });
-
-    btnRow.appendChild(scanBtn);
-    btnRow.appendChild(seenBtn2);
-    btnRow.appendChild(clearBtn);
-    c.appendChild(btnRow);
-
-    const leads = state.recruit_leads || [];
-    if(!leads.length){
-      c.appendChild(el("div",{className:"mini",style:"margin-top:10px"}, "No leads saved yet. Tap Scan Now."));
-      return c;
+    // restore icon position
+    const p = safeJSON(gmGet(K_ICONP,""));
+    if (p && typeof p.x==="number" && typeof p.y==="number"){
+      icon.style.left = `${p.x}px`;
+      icon.style.top  = `${p.y}px`;
+    } else {
+      icon.style.left = "14px";
+      icon.style.top  = "140px";
     }
 
-    leads.slice(0,25).forEach(r=>{
-      const prof = `https://www.torn.com/profiles.php?XID=${r.player_id}`;
-      const msg = `Hey ${r.name}, I noticed your working stats and wanted to invite you to apply to our company. We offer trains + active leadership. If interested, message me back!`;
-      const card = el("div",{className:"card"});
-      card.innerHTML = `
-        <div><a href="${prof}" target="_blank"><b>${r.name}</b> (#${r.player_id})</a>
-          <span class="pill gold">+${money(r.delta_vs_floor)} vs floor</span>
+    // dragging icon (mobile safe)
+    let dragging=false, startX=0, startY=0, baseX=0, baseY=0;
+    const startDrag = (clientX, clientY)=>{
+      dragging=true;
+      startX=clientX; startY=clientY;
+      baseX=parseInt(icon.style.left||"14",10);
+      baseY=parseInt(icon.style.top||"140",10);
+      icon.classList.add("drag");
+    };
+    const moveDrag = (clientX, clientY)=>{
+      if(!dragging) return;
+      const dx=clientX-startX, dy=clientY-startY;
+      const x=clamp(baseX+dx, 6, window.innerWidth-58);
+      const y=clamp(baseY+dy, 6, window.innerHeight-58);
+      icon.style.left=`${x}px`; icon.style.top=`${y}px`;
+    };
+    const endDrag = ()=>{
+      if(!dragging) return;
+      dragging=false;
+      icon.classList.remove("drag");
+      gmSet(K_ICONP, JSON.stringify({x: parseInt(icon.style.left,10), y: parseInt(icon.style.top,10)}));
+    };
+
+    icon.addEventListener("mousedown", (e)=>{ if(e.button!==0) return; startDrag(e.clientX,e.clientY); });
+    window.addEventListener("mousemove", (e)=>moveDrag(e.clientX,e.clientY));
+    window.addEventListener("mouseup", endDrag);
+
+    icon.addEventListener("touchstart", (e)=>{
+      if(!e.touches || !e.touches[0]) return;
+      startDrag(e.touches[0].clientX, e.touches[0].clientY);
+    }, {passive:true});
+    icon.addEventListener("touchmove", (e)=>{
+      if(!e.touches || !e.touches[0]) return;
+      moveDrag(e.touches[0].clientX, e.touches[0].clientY);
+    }, {passive:true});
+    icon.addEventListener("touchend", endDrag, {passive:true});
+
+    // tap to toggle (but not while dragging)
+    let lastTap=0, tapMoved=false;
+    icon.addEventListener("click", ()=>{
+      // if user just dragged, ignore click
+      if (icon.classList.contains("drag")) return;
+      toggleOverlay();
+    });
+
+    // tabs
+    $$(".hub-tab", wrap).forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        $$(".hub-tab", wrap).forEach(x=>x.classList.remove("active"));
+        btn.classList.add("active");
+        const tab = btn.getAttribute("data-tab");
+        $$(".hub-pane", wrap).forEach(p=>p.classList.toggle("active", p.getAttribute("data-pane")===tab));
+      });
+    });
+
+    // actions
+    wrap.addEventListener("click", async (e)=>{
+      const b = e.target.closest("[data-act]");
+      if(!b) return;
+      const act = b.getAttribute("data-act");
+      try{
+        if(act==="close") toggleOverlay(false);
+        else if(act==="refresh" || act==="reload-state") await refreshState(true);
+        else if(act==="goto-search") { switchTab("search"); }
+        else if(act==="goto-leads") { switchTab("leads"); await reloadLeads(); }
+        else if(act==="load-company") await refreshState(true);
+        else if(act==="login") await doLogin();
+        else if(act==="logout") doLogout();
+        else if(act==="save-companies") await saveCompanies();
+        else if(act==="add-train") await addTrain();
+        else if(act==="add-contract") await addContract();
+        else if(act==="hof-search") await hofSearch();
+        else if(act==="reload-leads") await reloadLeads();
+        else if(act==="mark-leads-seen") await markLeadsSeen();
+        else if(act==="clear-leads") await clearLeads();
+        else if(act==="run-recruit-scan") await runRecruitScan();
+        else if(act==="notifs-seen") await notifsSeen();
+      }catch(err){
+        toast(String(err.message||err));
+      }
+    });
+
+    // load saved settings
+    $("#hub-admin").value = gmGet(K_ADMIN,"");
+    $("#hub-api").value   = gmGet(K_API,"");
+    $("#hub-company-ids").value = gmGet(K_CIDS,"");
+  }
+
+  function switchTab(tab){
+    const wrap = document.getElementById(WRAP_ID);
+    $$(".hub-tab", wrap).forEach(x=>x.classList.toggle("active", x.getAttribute("data-tab")===tab));
+    $$(".hub-pane", wrap).forEach(p=>p.classList.toggle("active", p.getAttribute("data-pane")===tab));
+  }
+
+  function overlayOpen(){ return document.getElementById(WRAP_ID)?.classList.contains("open"); }
+  function toggleOverlay(force){
+    const wrap = document.getElementById(WRAP_ID);
+    if(!wrap) return;
+    const next = (typeof force==="boolean") ? force : !wrap.classList.contains("open");
+    wrap.classList.toggle("open", next);
+    if(next) refreshState(false);
+  }
+
+  function setBadge(n){
+    const b = $("#"+ICON_ID+" .hub-badge");
+    if(!b) return;
+    const v = Number(n||0);
+    if(v>0){
+      b.style.display="flex";
+      b.textContent = String(v>99 ? "99+" : v);
+    }else{
+      b.style.display="none";
+      b.textContent = "0";
+    }
+  }
+
+  function selectedCompanyId(){
+    const sel = $("#hub-company");
+    return (sel && sel.value) ? String(sel.value) : "";
+  }
+
+  async function refreshState(showToast){
+    const cid = selectedCompanyId();
+    const qs = cid ? `?company_id=${encodeURIComponent(cid)}` : "";
+    const st = await apiReq("GET", "/state"+qs);
+    renderState(st);
+    if(showToast) toast("Updated");
+  }
+
+  function renderState(st){
+    $("#hub-service").textContent = st.service || "—";
+    $("#hub-user").textContent = (st.user?.name ? `${st.user.name} [${st.user.user_id}]` : (st.user?.user_id||"—"));
+    $("#hub-unseen").textContent = String(st.unseen_count ?? 0);
+    $("#hub-selco").textContent = st.selected_company_id || "—";
+
+    setBadge(st.unseen_count ?? 0);
+
+    // company dropdown
+    const sel = $("#hub-company");
+    const cids = Array.isArray(st.company_ids) ? st.company_ids : [];
+    sel.innerHTML = "";
+    if(cids.length === 0){
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No companies set";
+      sel.appendChild(opt);
+    } else {
+      cids.forEach(id=>{
+        const opt = document.createElement("option");
+        opt.value = String(id);
+        opt.textContent = `Company #${id}`;
+        sel.appendChild(opt);
+      });
+      sel.value = st.selected_company_id || String(cids[0]);
+    }
+
+    // company info
+    const c = st.company;
+    $("#hub-company-info").textContent = c
+      ? `${c.name || "Company"} — Rating: ${c.rating ?? "?"} (ID ${c.id})`
+      : (st.company_error ? `Company error: ${st.company_error}` : "Load a company to see employees.");
+
+    // employees
+    const emp = Array.isArray(st.employees) ? st.employees : [];
+    const el = $("#hub-employee-list");
+    el.innerHTML = emp.length ? "" : `<div class="hub-muted">No employees returned.</div>`;
+    emp.forEach(e=>{
+      const man = e.man ?? "-";
+      const inte = e.int ?? "-";
+      const end = e.end ?? "-";
+      const total = (Number(e.man||0)+Number(e.int||0)+Number(e.end||0));
+      const inactive = (e.inactive_days===null || e.inactive_days===undefined) ? "" : ` • inactive ${e.inactive_days}d`;
+      const row = document.createElement("div");
+      row.className = "hub-item";
+      row.innerHTML = `
+        <div class="hub-item-top">
+          <div class="hub-item-title">${escapeHtml(e.name || "Employee")}</div>
+          <div class="hub-pill">${escapeHtml(e.position || "")}</div>
         </div>
-        <div class="mini">MAN ${money(r.man)} • INT ${money(r.intel)} • END ${money(r.endu)} • <b>Total ${money(r.total)}</b></div>
-        <button class="p7btn" data-msg="${encodeURIComponent(msg)}" style="margin-top:8px">Copy Recruit Msg</button>
-      `;
-      card.querySelector("button[data-msg]").addEventListener("click", async (e)=>{
-        const txt = decodeURIComponent(e.currentTarget.getAttribute("data-msg"));
-        await navigator.clipboard.writeText(txt);
-        e.currentTarget.textContent = "Copied!";
-        setTimeout(()=>e.currentTarget.textContent="Copy Recruit Msg", 900);
-      });
-      c.appendChild(card);
-    });
-
-    return c;
-  }
-
-  // (Trains / Contracts / Search / Broadcast / Settings can stay exactly as your previous version)
-  // To keep this message readable, those functions are shortened: we reuse the existing ones you already had.
-  // You are replacing the whole file with this file, so we include them below in full.
-
-  function renderTrains(token){
-    const c=el("div",{className:"card"});
-    c.appendChild(el("div",{className:"mini"},"<b>Train Tracker</b>"));
-
-    const grid=el("div",{className:"row",style:"margin-top:8px"});
-    const buyer=el("input",{placeholder:"Buyer name"});
-    const amt=el("input",{placeholder:"Trains bought",type:"number"});
-    const note=el("input",{placeholder:"Note (optional)"});
-    const addBtn=el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Add Train Record");
-
-    addBtn.addEventListener("click",async()=>{
-      await apiPost(`${BASE_URL}/api/trains/add`,{
-        company_id: state.selected_company_id,
-        buyer_name: buyer.value.trim(),
-        trains_bought: Number(amt.value||0),
-        note: note.value.trim()
-      },token);
-      await refresh(state.selected_company_id);
-    });
-
-    [buyer,amt,note,addBtn].forEach(x=>grid.appendChild(x));
-    c.appendChild(grid);
-
-    (state.trains||[]).forEach(t=>{
-      const r=el("div",{className:"card"});
-      r.innerHTML = `
-        <div><b>${t.buyer_name}</b>
-          <span class="pill">Bought: ${t.trains_bought}</span>
-          <span class="pill ${t.remaining===0?"warn":""}">Remaining: ${t.remaining}</span>
+        <div class="hub-item-sub">
+          MAN ${fmt(man)} • INT ${fmt(inte)} • END ${fmt(end)} • <b>Total ${fmt(total)}</b>${inactive}
         </div>
-        <div class="mini">${t.note||""}</div>
       `;
-      const row=el("div",{className:"row",style:"margin-top:8px"});
-      const used=el("input",{type:"number",value:String(t.trains_used||0),placeholder:"Used"});
-      const save=el("button",{className:"p7btn"},"Save Used");
-      const del=el("button",{className:"p7btn"},"Delete");
-
-      save.addEventListener("click",async()=>{
-        await apiPost(`${BASE_URL}/api/trains/set_used`,{id:t.id,trains_used:Number(used.value||0)},token);
-        await refresh(state.selected_company_id);
-      });
-      del.addEventListener("click",async()=>{
-        await apiPost(`${BASE_URL}/api/trains/delete`,{id:t.id},token);
-        await refresh(state.selected_company_id);
-      });
-
-      [used,save,del].forEach(x=>row.appendChild(x));
-      r.appendChild(row);
-      c.appendChild(r);
+      el.appendChild(row);
     });
 
-    return c;
-  }
-
-  function renderContracts(token){
-    const c=el("div",{className:"card"});
-    c.appendChild(el("div",{className:"mini"},"<b>Contracts</b>"));
-
-    const title=el("input",{placeholder:"Title (ex: 50 trains / 10 days)"});
-    const empN=el("input",{placeholder:"Employee name (optional)"});
-    const empI=el("input",{placeholder:"Employee id (optional)"});
-    const exp=el("input",{placeholder:"Expires ISO (optional) e.g. 2026-03-10T00:00:00+00:00"});
-    const note=el("input",{placeholder:"Note (optional)"});
-    const add=el("button",{className:"p7btn gold",style:"margin-top:8px"},"Add Contract");
-
-    add.addEventListener("click",async()=>{
-      await apiPost(`${BASE_URL}/api/contracts/add`,{
-        company_id: state.selected_company_id,
-        title: title.value.trim(),
-        employee_name: empN.value.trim(),
-        employee_id: empI.value.trim(),
-        expires_at: exp.value.trim(),
-        note: note.value.trim()
-      },token);
-      await refresh(state.selected_company_id);
-    });
-
-    const grid=el("div",{className:"row",style:"margin-top:8px"});
-    [title,empN,empI,exp,note].forEach(x=>grid.appendChild(x));
-    c.appendChild(grid);
-    c.appendChild(add);
-
-    (state.contracts||[]).forEach(k=>{
-      const r=el("div",{className:"card"});
-      r.innerHTML = `
-        <div><b>${k.title}</b> ${k.expires_at?`<span class="pill gold">${k.expires_at}</span>`:""}</div>
-        <div class="mini">${k.employee_name||""} ${k.employee_id?`(#${k.employee_id})`:""}</div>
-        <div class="mini">${k.note||""}</div>
-      `;
-      const del=el("button",{className:"p7btn",style:"margin-top:8px"},"Delete");
-      del.addEventListener("click",async()=>{
-        await apiPost(`${BASE_URL}/api/contracts/delete`,{id:k.id},token);
-        await refresh(state.selected_company_id);
-      });
-      r.appendChild(del);
-      c.appendChild(r);
-    });
-
-    return c;
-  }
-
-  function renderSearch(token){
-    const c=el("div",{className:"card"});
-    c.appendChild(el("div",{className:"mini"},"<b>HoF Working Stats Scan</b>"));
-
-    const minMan=el("input",{type:"number",placeholder:"Min MAN"});
-    const maxMan=el("input",{type:"number",placeholder:"Max MAN"});
-    const minInt=el("input",{type:"number",placeholder:"Min INT"});
-    const maxInt=el("input",{type:"number",placeholder:"Max INT"});
-    const minEnd=el("input",{type:"number",placeholder:"Min END"});
-    const maxEnd=el("input",{type:"number",placeholder:"Max END"});
-    const go=el("button",{className:"p7btn gold",style:"grid-column:1/-1"},"Scan");
-    const out=el("div",{className:"mini",style:"margin-top:10px"},"");
-
-    go.addEventListener("click",async()=>{
-      out.textContent="Scanning...";
-      const res=await apiPost(`${BASE_URL}/api/search/hof`,{
-        min_man:Number(minMan.value||0),
-        max_man:Number(maxMan.value||999999999999),
-        min_int:Number(minInt.value||0),
-        max_int:Number(maxInt.value||999999999999),
-        min_end:Number(minEnd.value||0),
-        max_end:Number(maxEnd.value||999999999999),
-      },token);
-      if(!res.ok){ out.textContent="Error: "+(res.error||"unknown"); return; }
-      const rows=res.rows||[];
-      out.innerHTML=`<div><b>Found ${rows.length}</b></div>` + rows.slice(0,50).map(r=>{
-        const prof=`https://www.torn.com/profiles.php?XID=${r.id}`;
-        return `<div style="margin-top:8px">
-          <a href="${prof}" target="_blank"><b>${r.name}</b> (#${r.id})</a>
-          <div>MAN ${money(r.man)} 
+    // trains
+    const trains = Array.isArray(st.trains) ? st.trains : [];
+    const tl = $("#hub-train-list");
+    tl.innerHTML = trains.length ? "" : `<div class="hub-muted">No train records yet.</div>`;
+    trains.forEach(t=>{
+      const row = document.createElement("div");
+      row.className="hub-item";
+      row.innerHTML = `
+        <div class="hub-item-top">
+          <div class="hu
