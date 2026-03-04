@@ -1,420 +1,434 @@
 import os
 import re
-import secrets
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
-from flask import Flask, jsonify, request
-
-from torn_api import (
-    TornAPIError,
-    get_user_basic,
-    get_user_events,
-    get_company_employees,
-    get_user_workstats,
-    normalize_workstats,
-    search_hof_workstats_v2,
-)
+from flask import Flask, jsonify, request, send_from_directory, render_template_string
+from dotenv import load_dotenv
 
 from db import (
     init_db,
     upsert_user,
-    get_user_by_token,
-    set_user_company_ids,
-    get_user_company_ids,
-    upsert_application_rows,
-    list_applications,
-    update_application_status,
-    add_train_entry,
-    list_train_entries,
-    delete_train_entry,
-    cache_get,
-    cache_set,
+    get_user,
+    set_company_ids,
+    touch_user,
+    create_session,
+    get_session,
+    touch_session,
+    add_notification,
+    list_notifications,
+    mark_notifications_seen,
+    add_train,
+    list_trains,
+    set_trains_used,
+    delete_train,
+    add_contract,
+    list_contracts,
+    delete_contract,
 )
+from torn_api import me_basic, company_profile, hof_scan_workstats
 
+load_dotenv()
 app = Flask(__name__)
 
-DB_PATH = (os.getenv("DB_PATH") or "/var/data/hiring.db").strip()
-ADMIN_KEYS = [k.strip() for k in (os.getenv("ADMIN_KEYS") or "").split(",") if k.strip()]
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS") or "2592000")  # 30 days
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS") or "60")  # small cache for heavy endpoints
+init_db()
 
-_DB_INIT = False
+ADMIN_KEYS = [x.strip() for x in (os.getenv("ADMIN_KEYS") or "").split(",") if x.strip()]
+DB_MAX_HOF_PAGES = int(os.getenv("MAX_HOF_PAGES", "10"))
+SERVICE_NAME = os.getenv("SERVICE_NAME", "7DS*: Peace Hiring/Company Hub")
 
 
-def utc() -> str:
+def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _json_error(msg: str, code: int = 400):
+def _bad(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
 
 
-def _require_admin_key(admin_key: str) -> bool:
-    # If ADMIN_KEYS empty => fail closed
-    if not ADMIN_KEYS:
-        return False
-    return admin_key in ADMIN_KEYS
+def _is_admin_key(k: str) -> bool:
+    return bool(k and k.strip() and k.strip() in ADMIN_KEYS)
 
 
-def _get_token_from_request() -> str:
-    # Prefer header, allow query
-    tok = (request.headers.get("X-Session-Token") or "").strip()
-    if not tok:
-        tok = (request.args.get("token") or "").strip()
-    return tok
+def _token() -> str:
+    return (request.headers.get("X-Session-Token") or "").strip()
 
 
-def require_session() -> Dict[str, Any]:
-    tok = _get_token_from_request()
-    if not tok:
-        raise PermissionError("missing token")
-    user = get_user_by_token(DB_PATH, tok, SESSION_TTL_SECONDS, now_iso=utc())
-    if not user:
-        raise PermissionError("invalid/expired token")
-    return user
-
-
-@app.before_request
-def boot_once():
-    global _DB_INIT
-    if not _DB_INIT:
-        init_db(DB_PATH)
-        _DB_INIT = True
-
-
-@app.get("/")
-def index():
-    return (
-        "7DS*: Peace Hiring Scan is running.\n\n"
-        "Endpoints:\n"
-        "POST  /api/auth\n"
-        "POST  /api/user/companies\n"
-        "GET   /api/applications\n"
-        "POST  /api/applications/status\n"
-        "GET   /api/companies\n"
-        "GET   /api/trains\n"
-        "POST  /api/trains/add\n"
-        "POST  /api/trains/delete\n"
-        "GET   /api/applicant\n"
-        "GET   /api/search_workstats\n\n"
-        "Use the userscript to access UI.\n",
-        200,
-        {"Content-Type": "text/plain; charset=utf-8"},
-    )
+def _require_session() -> Optional[Dict[str, Any]]:
+    t = _token()
+    if not t:
+        return None
+    s = get_session(t)
+    if not s:
+        return None
+    touch_session(t)
+    return s
 
 
 @app.get("/health")
 def health():
-    return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
+    return jsonify({"ok": True, "service": SERVICE_NAME, "time": _utc_now()})
 
 
-# ------------------------
-# AUTH
-# ------------------------
-@app.post("/api/auth")
-def api_auth():
-    body = request.get_json(silent=True) or {}
-    admin_key = (body.get("admin_key") or "").strip()
-    api_key = (body.get("api_key") or "").strip()
+@app.get("/static/<path:path>")
+def static_files(path: str):
+    return send_from_directory("static", path)
 
-    if not admin_key or not api_key:
-        return _json_error("missing admin_key/api_key", 400)
 
-    if not _require_admin_key(admin_key):
-        return _json_error("admin key not allowed", 401)
-
-    # Validate Torn key by pulling basic user info
-    try:
-        basic = get_user_basic(api_key)
-    except TornAPIError as e:
-        return _json_error(f"torn api error: {e}", 401)
-    except Exception:
-        return _json_error("failed to validate api key", 401)
-
-    user_id = str(basic.get("player_id") or basic.get("user_id") or basic.get("id") or "")
-    name = (basic.get("name") or basic.get("username") or "").strip()
-
-    if not user_id:
-        return _json_error("could not read user_id from api key", 401)
-
-    token = secrets.token_urlsafe(32)
-
-    upsert_user(
-        DB_PATH,
-        user_id=user_id,
-        name=name,
-        api_key=api_key,
-        token=token,
-        token_created_at=utc(),
-        last_seen_at=utc(),
+@app.get("/")
+def home():
+    return render_template_string(
+        """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{service}}</title>
+<style>
+  body{font-family:system-ui;background:#0b0f14;color:#e9eef6;margin:0;padding:18px}
+  .wrap{max-width:920px;margin:0 auto}
+  .card{background:#0f1722;border:1px solid #203042;border-radius:16px;padding:14px;margin:12px 0}
+  code{background:#0b0f14;padding:2px 8px;border-radius:10px}
+  .muted{opacity:.85;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>{{service}}</h2>
+  <div class="card">
+    <b>Install overlay</b>
+    <div class="muted" style="margin-top:8px">
+      Use: <code>/static/shield.user.js</code><br>
+      In the script, change BASE_URL to this service domain.
+    </div>
+  </div>
+  <div class="card muted">
+    <b>Key handling</b><br>
+    Users enter their own Torn API key in the overlay. This service stores it to fetch company + HoF scan data.
+    Only share admin keys with people you trust.
+  </div>
+</div>
+</body>
+</html>
+        """,
+        service=SERVICE_NAME,
     )
 
-    return jsonify({"ok": True, "token": token, "user": {"id": user_id, "name": name}})
+
+# -------- AUTH ----------
+@app.post("/api/auth")
+def api_auth():
+    data = request.get_json(force=True) or {}
+    admin_key = (data.get("admin_key") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+
+    if not _is_admin_key(admin_key):
+        return _bad("Invalid admin key", 403)
+    if not api_key or len(api_key) < 8:
+        return _bad("Missing/invalid api_key")
+
+    # Validate key and identify user
+    try:
+        me = me_basic(api_key)
+    except Exception as e:
+        return _bad(f"API key validation failed: {e}")
+
+    user_id = str(me.get("player_id") or me.get("user_id") or me.get("playerid") or "")
+    name = (me.get("name") or "").strip()
+    if not user_id or not re.fullmatch(r"\\d+", user_id):
+        return _bad("Could not read user id from Torn response")
+
+    upsert_user(user_id=user_id, name=name, api_key=api_key)
+    token = create_session(user_id)
+    add_notification(user_id, "system", "Authenticated successfully.")
+    return jsonify({"ok": True, "token": token, "user_id": user_id, "name": name})
 
 
+# -------- USER SETTINGS ----------
 @app.post("/api/user/companies")
 def api_user_companies():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
 
-    body = request.get_json(silent=True) or {}
-    company_ids_raw = body.get("company_ids")
+    data = request.get_json(force=True) or {}
+    company_ids = data.get("company_ids") or []
 
-    ids: List[str] = []
-    if isinstance(company_ids_raw, list):
-        ids = [str(x).strip() for x in company_ids_raw if str(x).strip()]
-    else:
-        raw = (str(company_ids_raw or "")).strip()
-        ids = [c.strip() for c in raw.split(",") if c.strip()]
+    if not isinstance(company_ids, list) or not company_ids:
+        return _bad("company_ids must be a non-empty list")
 
-    ids = [re.sub(r"\D+", "", c) for c in ids]
-    ids = [c for c in ids if c]
+    company_ids = [str(x).strip() for x in company_ids if str(x).strip()]
+    if not all(re.fullmatch(r"\\d+", cid) for cid in company_ids):
+        return _bad("All company_ids must be numeric")
 
-    set_user_company_ids(DB_PATH, user["user_id"], ids)
-    return jsonify({"ok": True, "company_ids": ids})
+    user_id = s["user_id"]
+    set_company_ids(user_id, company_ids)
+    add_notification(user_id, "system", f"Saved {len(company_ids)} company id(s).")
+    return jsonify({"ok": True, "company_ids": company_ids})
 
 
-# ------------------------
-# APPLICATIONS (pull on demand from user events)
-# ------------------------
-def _extract_application_events(events_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    events = events_payload.get("events", {}) or {}
-    rows: List[Dict[str, Any]] = []
-    id_pattern = re.compile(r"\[(\d+)\]")
-
-    for k, v in events.items():
-        try:
-            eid = int(k)
-        except Exception:
-            continue
-        if not isinstance(v, dict):
-            continue
-
-        text = (v.get("event") or "").strip()
-        low = text.lower()
-
-        if ("appl" in low or "apply" in low) and "company" in low:
-            m = id_pattern.search(text)
-            applicant_id = m.group(1) if m else None
-            rows.append(
-                {
-                    "event_id": eid,
-                    "applicant_id": applicant_id,
-                    "raw_text": text,
-                    "created_at": utc(),
-                }
-            )
-
-    return rows
-
-
-@app.get("/api/applications")
-def api_applications():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
-
-    try:
-        events_payload = get_user_events(user["api_key"])
-        new_rows = _extract_application_events(events_payload)
-        if new_rows:
-            upsert_application_rows(DB_PATH, user["user_id"], new_rows)
-    except TornAPIError as e:
-        return _json_error(f"torn api error: {e}", 400)
-    except Exception:
-        return _json_error("failed to fetch events", 500)
-
-    rows = list_applications(DB_PATH, user["user_id"], limit=60)
-    return jsonify({"ok": True, "rows": rows})
-
-
-@app.post("/api/applications/status")
-def api_applications_status():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
-
-    body = request.get_json(silent=True) or {}
-    app_id = body.get("id")
-    status = (body.get("status") or "").strip()
-
-    if not app_id or not status:
-        return _json_error("missing id/status", 400)
-
-    update_application_status(DB_PATH, user["user_id"], int(app_id), status)
+@app.post("/api/notifications/seen")
+def api_notifs_seen():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    mark_notifications_seen(s["user_id"])
     return jsonify({"ok": True})
 
 
-# ------------------------
-# COMPANIES + EMPLOYEES (per-user)
-# ------------------------
-@app.get("/api/companies")
-def api_companies():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
+# -------- STATE (CSP-SAFE) ----------
+@app.get("/state")
+def state():
+    s = _require_session()
+    if not s:
+        return jsonify({"ok": False, "error": "No session"}), 403
 
-    company_ids = get_user_company_ids(DB_PATH, user["user_id"])
-    if not company_ids:
-        return jsonify({"ok": True, "updated_at": utc(), "rows": [], "note": "No company IDs set for this user."})
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
 
-    cache_key = f"companies:{user['user_id']}:{','.join(company_ids)}"
-    cached = cache_get(DB_PATH, cache_key, CACHE_TTL_SECONDS)
-    if cached is not None:
-        return jsonify({"ok": True, "cached": True, **cached})
+    touch_user(user_id)
 
-    rows = []
-    for cid in company_ids:
+    company_ids: List[str] = u.get("company_ids") or []
+    selected_company_id = (request.args.get("company_id") or "").strip()
+    if not selected_company_id and company_ids:
+        selected_company_id = company_ids[0]
+    if selected_company_id and selected_company_id not in company_ids:
+        selected_company_id = company_ids[0] if company_ids else ""
+
+    notifs = list_notifications(user_id, limit=10)
+    unseen = sum(1 for n in notifs if int(n.get("seen") or 0) == 0)
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "service": SERVICE_NAME,
+        "user": {"user_id": user_id, "name": u.get("name") or ""},
+        "company_ids": company_ids,
+        "selected_company_id": selected_company_id,
+        "company": None,
+        "employees": [],
+        "stats": {},
+        "trains": [],
+        "contracts": [],
+        "notifications": notifs,
+        "unseen_count": unseen,
+        "updated_at": _utc_now(),
+    }
+
+    if selected_company_id:
         try:
-            payload = get_company_employees(cid, user["api_key"])
-            rows.append(
-                {
-                    "company_id": cid,
-                    "name": payload.get("company_name") or payload.get("name") or f"Company {cid}",
-                    "employees": payload.get("employees") or [],
-                }
-            )
-        except TornAPIError as e:
-            rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": str(e)})
-        except Exception:
-            rows.append({"company_id": cid, "name": f"Company {cid}", "employees": [], "error": "fetch failed"})
+            c = company_profile(selected_company_id, u["api_key"])
+            out["company"] = {
+                "id": selected_company_id,
+                "name": (c.get("company", {}) or {}).get("name") if isinstance(c.get("company"), dict) else c.get("name"),
+                "rating": (c.get("company", {}) or {}).get("rating") if isinstance(c.get("company"), dict) else c.get("rating"),
+            }
 
-    data = {"updated_at": utc(), "rows": rows}
-    cache_set(DB_PATH, cache_key, data)
-    return jsonify({"ok": True, "cached": False, **data})
+            employees = c.get("company_employees") or c.get("employees") or {}
+            rows = []
+            if isinstance(employees, dict):
+                for eid, e in employees.items():
+                    if isinstance(e, dict):
+                        rows.append({"id": str(eid), **e})
+            elif isinstance(employees, list):
+                rows = employees
+
+            # Normalize
+            now = datetime.now(timezone.utc)
+            norm = []
+            inactive_3d = 0
+
+            for e in rows:
+                name = e.get("name") or e.get("username") or ""
+                last_ts = None
+                la = e.get("last_action")
+                if isinstance(la, dict) and la.get("timestamp"):
+                    last_ts = la.get("timestamp")
+                elif isinstance(la, (int, str)):
+                    try:
+                        last_ts = int(la)
+                    except Exception:
+                        last_ts = None
+
+                inactive_days = None
+                try:
+                    if last_ts:
+                        dt = datetime.fromtimestamp(int(last_ts), tz=timezone.utc)
+                        inactive_days = (now - dt).days
+                except Exception:
+                    inactive_days = None
+
+                if inactive_days is not None and inactive_days >= 3:
+                    inactive_3d += 1
+
+                norm.append(
+                    {
+                        "id": str(e.get("id") or e.get("employee_id") or ""),
+                        "name": name,
+                        "position": e.get("position") or e.get("job") or "",
+                        "effectiveness": e.get("effectiveness") or e.get("efficiency"),
+                        "man": e.get("manual_labor") or e.get("man"),
+                        "int": e.get("intelligence") or e.get("int"),
+                        "end": e.get("endurance") or e.get("end"),
+                        "inactive_days": inactive_days,
+                    }
+                )
+
+            out["employees"] = norm
+            out["stats"] = {"employee_count": len(norm), "inactive_3d_plus": inactive_3d}
+
+            out["trains"] = list_trains(user_id, selected_company_id)
+            out["contracts"] = list_contracts(user_id, selected_company_id)
+
+        except Exception as e:
+            out["company_error"] = str(e)
+
+    return jsonify(out)
 
 
-# ------------------------
-# TRAIN TRACKER (per-user)
-# ------------------------
-@app.get("/api/trains")
-def api_trains_list():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
-
-    company_id = re.sub(r"\D+", "", (request.args.get("company_id") or "").strip())
-    if not company_id:
-        return _json_error("missing company_id", 400)
-
-    rows = list_train_entries(DB_PATH, user["user_id"], company_id, limit=80)
-    return jsonify({"ok": True, "rows": rows})
-
-
+# -------- TRAINS ----------
 @app.post("/api/trains/add")
-def api_trains_add():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
+def trains_add():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
 
-    body = request.get_json(silent=True) or {}
-    company_id = re.sub(r"\D+", "", (body.get("company_id") or "").strip())
-    buyer = (body.get("buyer") or "").strip()
-    trains = body.get("trains")
-    note = (body.get("note") or "").strip()
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    buyer_name = (data.get("buyer_name") or "").strip()
+    trains_bought = int(data.get("trains_bought") or 0)
+    note = (data.get("note") or "").strip()
 
-    if not company_id or not buyer or trains is None:
-        return _json_error("missing company_id/buyer/trains", 400)
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+    if not buyer_name or trains_bought <= 0:
+        return _bad("buyer_name and trains_bought required")
 
-    try:
-        trains_int = int(trains)
-    except Exception:
-        return _json_error("trains must be int", 400)
+    add_train(user_id, company_id, buyer_name, trains_bought, note)
+    add_notification(user_id, "trains", f"Added: {buyer_name} bought {trains_bought} trains.")
+    return jsonify({"ok": True})
 
-    add_train_entry(DB_PATH, user["user_id"], company_id, buyer, trains_int, note, utc())
+
+@app.post("/api/trains/set_used")
+def trains_set_used():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+
+    data = request.get_json(force=True) or {}
+    train_id = int(data.get("id") or 0)
+    used = int(data.get("trains_used") or 0)
+    if train_id <= 0 or used < 0:
+        return _bad("bad id/used")
+
+    set_trains_used(user_id, train_id, used)
     return jsonify({"ok": True})
 
 
 @app.post("/api/trains/delete")
-def api_trains_delete():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
+def trains_delete():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
 
-    body = request.get_json(silent=True) or {}
-    entry_id = body.get("id")
-    if not entry_id:
-        return _json_error("missing id", 400)
+    data = request.get_json(force=True) or {}
+    train_id = int(data.get("id") or 0)
+    if train_id <= 0:
+        return _bad("bad id")
 
-    delete_train_entry(DB_PATH, user["user_id"], int(entry_id))
+    delete_train(user_id, train_id)
+    add_notification(user_id, "trains", f"Deleted train record #{train_id}.")
     return jsonify({"ok": True})
 
 
-# ------------------------
-# APPLICANT WORKSTATS (uses user's own key)
-# ------------------------
-@app.get("/api/applicant")
-def api_applicant():
+# -------- CONTRACTS ----------
+@app.post("/api/contracts/add")
+def contracts_add():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+    company_id = (data.get("company_id") or "").strip()
+    title = (data.get("title") or "").strip()
+    employee_id = (data.get("employee_id") or "").strip()
+    employee_name = (data.get("employee_name") or "").strip()
+    expires_at = (data.get("expires_at") or "").strip()
+    note = (data.get("note") or "").strip()
+
+    if company_id not in (u.get("company_ids") or []):
+        return _bad("company_id not registered", 403)
+    if not title:
+        return _bad("title required")
+
+    add_contract(user_id, company_id, title, employee_id, employee_name, expires_at, note)
+    add_notification(user_id, "contract", f"Added contract: {title}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/contracts/delete")
+def contracts_delete():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+
+    data = request.get_json(force=True) or {}
+    contract_id = int(data.get("id") or 0)
+    if contract_id <= 0:
+        return _bad("bad id")
+
+    delete_contract(user_id, contract_id)
+    add_notification(user_id, "contract", f"Deleted contract #{contract_id}.")
+    return jsonify({"ok": True})
+
+
+# -------- HOF SEARCH ----------
+@app.post("/api/search/hof")
+def search_hof():
+    s = _require_session()
+    if not s:
+        return _bad("Missing/invalid session token", 403)
+    user_id = s["user_id"]
+    u = get_user(user_id)
+    if not u:
+        return _bad("User missing", 403)
+
+    data = request.get_json(force=True) or {}
+
+    def _i(k: str, default: int) -> int:
+        try:
+            return int(data.get(k) or default)
+        except Exception:
+            return int(default)
+
+    min_man = _i("min_man", 0)
+    max_man = _i("max_man", 10**12)
+    min_int = _i("min_int", 0)
+    max_int = _i("max_int", 10**12)
+    min_end = _i("min_end", 0)
+    max_end = _i("max_end", 10**12)
+
     try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
-
-    uid = re.sub(r"\D+", "", (request.args.get("id") or "").strip())
-    if not uid:
-        return _json_error("missing id", 400)
-
-    try:
-        payload = get_user_workstats(uid, user["api_key"])
-        ws = normalize_workstats(payload)
-        return jsonify({"ok": True, "workstats": ws})
-    except TornAPIError as e:
-        return _json_error(f"torn api error: {e}", 400)
-    except Exception:
-        return _json_error("failed to fetch workstats", 500)
-
-
-# ------------------------
-# HoF SEARCH (uses user's own key)
-# ------------------------
-@app.get("/api/search_workstats")
-def api_search_workstats():
-    try:
-        user = require_session()
-    except PermissionError as e:
-        return _json_error(str(e), 401)
-
-    try:
-        min_val = int((request.args.get("min") or "").strip())
-        max_val = int((request.args.get("max") or "").strip())
-    except Exception:
-        return _json_error("min/max must be integers", 400)
-
-    try:
-        limit_results = int((request.args.get("limit") or "100").strip())
-        limit_results = max(1, min(limit_results, 300))
-    except Exception:
-        limit_results = 100
-
-    cache_key = f"hof:{user['user_id']}:{min_val}:{max_val}:{limit_results}"
-    cached = cache_get(DB_PATH, cache_key, 60)
-    if cached is not None:
-        return jsonify({"ok": True, "cached": True, **cached})
-
-    try:
-        rows, pages = search_hof_workstats_v2(user["api_key"], min_val, max_val, limit_results=limit_results)
-    except TornAPIError as e:
-        return _json_error(f"torn api error: {e}", 400)
-    except Exception:
-        return _json_error("HoF search failed", 500)
-
-    data = {
-        "cached": False,
-        "min": min_val,
-        "max": max_val,
-        "scanned_pages": pages,
-        "count": len(rows),
-        "rows": rows,
-        "updated_at": utc(),
-    }
-    cache_set(DB_PATH, cache_key, data)
-    return jsonify({"ok": True, **data})
+        rows = hof_scan_workstats(
+            api_key=u["api_key"],
+            min_man=min_man, max_man=max_man,
+            min_int=min_int, max_int=max_int,
+            min_end=min_end, max_end=max_end,
+            max_pages=DB_MAX_HOF_PAGES,
+            page_size=25,
+        )
+        return jsonify({"ok": True, "count": len(rows), "rows": rows[:200]})
+    except Exception as e:
+        return _bad(f"HoF scan failed: {e}")
