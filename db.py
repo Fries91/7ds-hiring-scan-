@@ -1,9 +1,10 @@
+# db.py
 import os
 import json
 import sqlite3
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 DB_PATH = os.getenv("DB_PATH", "hub.db")
 
@@ -90,7 +91,6 @@ def init_db():
         """
     )
 
-    # Recruit leads (premium killer feature)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS recruit_leads (
@@ -115,7 +115,6 @@ def init_db():
     con.close()
 
 
-# ---------------- USERS ----------------
 def upsert_user(user_id: str, name: str, api_key: str):
     con = _con()
     cur = con.cursor()
@@ -169,7 +168,6 @@ def touch_user(user_id: str):
     con.close()
 
 
-# ---------------- SESSIONS ----------------
 def create_session(user_id: str) -> str:
     token = secrets.token_urlsafe(32)
     con = _con()
@@ -200,7 +198,6 @@ def touch_session(token: str):
     con.close()
 
 
-# ---------------- NOTIFICATIONS ----------------
 def add_notification(user_id: str, kind: str, message: str):
     con = _con()
     cur = con.cursor()
@@ -232,7 +229,6 @@ def mark_notifications_seen(user_id: str):
     con.close()
 
 
-# ---------------- TRAINS ----------------
 def add_train(user_id: str, company_id: str, buyer_name: str, trains_bought: int, note: str = ""):
     con = _con()
     cur = con.cursor()
@@ -280,7 +276,6 @@ def delete_train(user_id: str, train_id: int):
     con.close()
 
 
-# ---------------- CONTRACTS ----------------
 def add_contract(
     user_id: str,
     company_id: str,
@@ -323,7 +318,6 @@ def delete_contract(user_id: str, contract_id: int):
     con.close()
 
 
-# ---------------- RECRUIT LEADS ----------------
 def upsert_lead(
     user_id: str,
     company_id: str,
