@@ -3,7 +3,7 @@ import json
 import sqlite3
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 DB_PATH = os.getenv("DB_PATH", "hub.db")
 
@@ -48,26 +48,14 @@ def init_db():
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            kind TEXT DEFAULT 'info',
-            message TEXT NOT NULL,
-            created_at TEXT,
-            seen INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-
-    cur.execute(
-        """
         CREATE TABLE IF NOT EXISTS trains (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
-            company_id TEXT DEFAULT '',
-            buyer TEXT DEFAULT '',
-            amount INTEGER NOT NULL DEFAULT 0,
-            used INTEGER NOT NULL DEFAULT 0,
+            company_id TEXT NOT NULL,
+            buyer_name TEXT NOT NULL,
+            trains_bought INTEGER NOT NULL,
+            trains_used INTEGER NOT NULL DEFAULT 0,
+            note TEXT DEFAULT '',
             created_at TEXT
         )
         """
@@ -78,7 +66,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS contracts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
+            company_id TEXT NOT NULL,
+            employee_id TEXT DEFAULT '',
+            employee_name TEXT DEFAULT '',
             title TEXT NOT NULL,
+            expires_at TEXT DEFAULT '',
             note TEXT DEFAULT '',
             created_at TEXT
         )
@@ -87,15 +79,34 @@ def init_db():
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS leads (
+        CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
-            player_id TEXT DEFAULT '',
-            name TEXT DEFAULT '',
-            value INTEGER DEFAULT 0,
-            note TEXT DEFAULT '',
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
             created_at TEXT,
             seen INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    # Recruit leads (premium killer feature)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recruit_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            company_id TEXT NOT NULL,
+            player_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            man INTEGER NOT NULL,
+            intel INTEGER NOT NULL,
+            endu INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            delta_vs_floor INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            seen INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(user_id, company_id, player_id)
         )
         """
     )
@@ -104,30 +115,32 @@ def init_db():
     con.close()
 
 
-# -------- users / sessions --------
-
+# ---------------- USERS ----------------
 def upsert_user(user_id: str, name: str, api_key: str):
     con = _con()
     cur = con.cursor()
-    now = _utc_now()
+    cur.execute(
+        """
+        INSERT INTO users(user_id, name, api_key, company_ids, created_at, last_seen_at)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          name=excluded.name,
+          api_key=excluded.api_key,
+          last_seen_at=excluded.last_seen_at
+        """,
+        (user_id, name or "", api_key, "[]", _utc_now(), _utc_now()),
+    )
+    con.commit()
+    con.close()
 
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cur.fetchone() is not None
 
-    if exists:
-        cur.execute(
-            "UPDATE users SET name=?, api_key=?, last_seen_at=? WHERE user_id=?",
-            (name or "", api_key, now, user_id),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO users (user_id, name, api_key, company_ids, created_at, last_seen_at)
-            VALUES (?, ?, ?, '[]', ?, ?)
-            """,
-            (user_id, name or "", api_key, now, now),
-        )
-
+def set_company_ids(user_id: str, company_ids: List[str]):
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE users SET company_ids=?, last_seen_at=? WHERE user_id=?",
+        (json.dumps(company_ids), _utc_now(), user_id),
+    )
     con.commit()
     con.close()
 
@@ -156,25 +169,14 @@ def touch_user(user_id: str):
     con.close()
 
 
-def set_company_ids(user_id: str, company_ids: List[str]):
-    con = _con()
-    cur = con.cursor()
-    cur.execute(
-        "UPDATE users SET company_ids=? WHERE user_id=?",
-        (json.dumps([str(x) for x in company_ids]), user_id),
-    )
-    con.commit()
-    con.close()
-
-
+# ---------------- SESSIONS ----------------
 def create_session(user_id: str) -> str:
-    token = secrets.token_urlsafe(24)
+    token = secrets.token_urlsafe(32)
     con = _con()
     cur = con.cursor()
-    now = _utc_now()
     cur.execute(
-        "INSERT INTO sessions (token, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
-        (token, user_id, now, now),
+        "INSERT INTO sessions(token, user_id, created_at, last_seen_at) VALUES(?,?,?,?)",
+        (token, user_id, _utc_now(), _utc_now()),
     )
     con.commit()
     con.close()
@@ -198,29 +200,28 @@ def touch_session(token: str):
     con.close()
 
 
-# -------- notifications --------
-
-def add_notification(user_id: str, message: str, kind: str = "info"):
+# ---------------- NOTIFICATIONS ----------------
+def add_notification(user_id: str, kind: str, message: str):
     con = _con()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO notifications (user_id, kind, message, created_at, seen) VALUES (?, ?, ?, ?, 0)",
+        "INSERT INTO notifications(user_id, kind, message, created_at, seen) VALUES(?,?,?,?,0)",
         (user_id, kind, message, _utc_now()),
     )
     con.commit()
     con.close()
 
 
-def list_notifications(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+def list_notifications(user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     con = _con()
     cur = con.cursor()
     cur.execute(
         "SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, int(limit)),
     )
-    rows = cur.fetchall()
+    rows = [dict(r) for r in cur.fetchall()]
     con.close()
-    return [dict(r) for r in rows]
+    return rows
 
 
 def mark_notifications_seen(user_id: str):
@@ -231,46 +232,41 @@ def mark_notifications_seen(user_id: str):
     con.close()
 
 
-def count_unseen_notifications(user_id: str) -> int:
-    con = _con()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM notifications WHERE user_id=? AND seen=0", (user_id,))
-    row = cur.fetchone()
-    con.close()
-    return int(row["c"]) if row else 0
-
-
-# -------- trains --------
-
-def add_train(user_id: str, company_id: str, buyer: str, amount: int):
+# ---------------- TRAINS ----------------
+def add_train(user_id: str, company_id: str, buyer_name: str, trains_bought: int, note: str = ""):
     con = _con()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO trains (user_id, company_id, buyer, amount, used, created_at)
-        VALUES (?, ?, ?, ?, 0, ?)
+        INSERT INTO trains(user_id, company_id, buyer_name, trains_bought, trains_used, note, created_at)
+        VALUES(?,?,?,?,?,?,?)
         """,
-        (user_id, str(company_id or ""), buyer or "", int(amount or 0), _utc_now()),
+        (user_id, company_id, buyer_name, int(trains_bought), 0, note or "", _utc_now()),
     )
     con.commit()
     con.close()
 
 
-def list_trains(user_id: str) -> List[Dict[str, Any]]:
-    con = _con()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM trains WHERE user_id=? ORDER BY id DESC LIMIT 200", (user_id,))
-    rows = cur.fetchall()
-    con.close()
-    return [dict(r) for r in rows]
-
-
-def set_trains_used(user_id: str, train_id: int, used: int):
+def list_trains(user_id: str, company_id: str) -> List[Dict[str, Any]]:
     con = _con()
     cur = con.cursor()
     cur.execute(
-        "UPDATE trains SET used=? WHERE id=? AND user_id=?",
-        (1 if used else 0, int(train_id), user_id),
+        "SELECT * FROM trains WHERE user_id=? AND company_id=? ORDER BY id DESC",
+        (user_id, company_id),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    for r in rows:
+        r["remaining"] = max(0, int(r["trains_bought"]) - int(r["trains_used"]))
+    return rows
+
+
+def set_trains_used(user_id: str, train_id: int, trains_used: int):
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE trains SET trains_used=? WHERE user_id=? AND id=?",
+        (int(trains_used), user_id, int(train_id)),
     )
     con.commit()
     con.close()
@@ -279,86 +275,126 @@ def set_trains_used(user_id: str, train_id: int, used: int):
 def delete_train(user_id: str, train_id: int):
     con = _con()
     cur = con.cursor()
-    cur.execute("DELETE FROM trains WHERE id=? AND user_id=?", (int(train_id), user_id))
+    cur.execute("DELETE FROM trains WHERE user_id=? AND id=?", (user_id, int(train_id)))
     con.commit()
     con.close()
 
 
-# -------- contracts --------
-
-def add_contract(user_id: str, title: str, note: str = ""):
+# ---------------- CONTRACTS ----------------
+def add_contract(
+    user_id: str,
+    company_id: str,
+    title: str,
+    employee_id: str = "",
+    employee_name: str = "",
+    expires_at: str = "",
+    note: str = "",
+):
     con = _con()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO contracts (user_id, title, note, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, title, note or "", _utc_now()),
+        """
+        INSERT INTO contracts(user_id, company_id, employee_id, employee_name, title, expires_at, note, created_at)
+        VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (user_id, company_id, employee_id or "", employee_name or "", title, expires_at or "", note or "", _utc_now()),
     )
     con.commit()
     con.close()
 
 
-def list_contracts(user_id: str) -> List[Dict[str, Any]]:
+def list_contracts(user_id: str, company_id: str) -> List[Dict[str, Any]]:
     con = _con()
     cur = con.cursor()
-    cur.execute("SELECT * FROM contracts WHERE user_id=? ORDER BY id DESC LIMIT 200", (user_id,))
-    rows = cur.fetchall()
+    cur.execute(
+        "SELECT * FROM contracts WHERE user_id=? AND company_id=? ORDER BY id DESC",
+        (user_id, company_id),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
     con.close()
-    return [dict(r) for r in rows]
+    return rows
 
 
 def delete_contract(user_id: str, contract_id: int):
     con = _con()
     cur = con.cursor()
-    cur.execute("DELETE FROM contracts WHERE id=? AND user_id=?", (int(contract_id), user_id))
+    cur.execute("DELETE FROM contracts WHERE user_id=? AND id=?", (user_id, int(contract_id)))
     con.commit()
     con.close()
 
 
-# -------- leads --------
-
-def add_lead(user_id: str, player_id: str, name: str, value: int, note: str = ""):
+# ---------------- RECRUIT LEADS ----------------
+def upsert_lead(
+    user_id: str,
+    company_id: str,
+    player_id: str,
+    name: str,
+    man: int,
+    intel: int,
+    endu: int,
+    total: int,
+    delta_vs_floor: int,
+):
     con = _con()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO leads (user_id, player_id, name, value, note, created_at, seen)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
+        INSERT INTO recruit_leads(user_id, company_id, player_id, name, man, intel, endu, total, delta_vs_floor, created_at, seen)
+        VALUES(?,?,?,?,?,?,?,?,?,?,0)
+        ON CONFLICT(user_id, company_id, player_id) DO UPDATE SET
+          name=excluded.name,
+          man=excluded.man,
+          intel=excluded.intel,
+          endu=excluded.endu,
+          total=excluded.total,
+          delta_vs_floor=excluded.delta_vs_floor
         """,
-        (user_id, str(player_id or ""), name or "", int(value or 0), note or "", _utc_now()),
+        (user_id, company_id, player_id, name, int(man), int(intel), int(endu), int(total), int(delta_vs_floor), _utc_now()),
     )
     con.commit()
     con.close()
 
 
-def list_leads(user_id: str) -> List[Dict[str, Any]]:
+def list_leads(user_id: str, company_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     con = _con()
     cur = con.cursor()
-    cur.execute("SELECT * FROM leads WHERE user_id=? ORDER BY id DESC LIMIT 500", (user_id,))
-    rows = cur.fetchall()
+    cur.execute(
+        """
+        SELECT * FROM recruit_leads
+        WHERE user_id=? AND company_id=?
+        ORDER BY delta_vs_floor DESC, total DESC, id DESC
+        LIMIT ?
+        """,
+        (user_id, company_id, int(limit)),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
     con.close()
-    return [dict(r) for r in rows]
-
-
-def clear_leads(user_id: str):
-    con = _con()
-    cur = con.cursor()
-    cur.execute("DELETE FROM leads WHERE user_id=?", (user_id,))
-    con.commit()
-    con.close()
-
-
-def mark_leads_seen(user_id: str):
-    con = _con()
-    cur = con.cursor()
-    cur.execute("UPDATE leads SET seen=1 WHERE user_id=?", (user_id,))
-    con.commit()
-    con.close()
+    return rows
 
 
 def count_unseen_leads(user_id: str) -> int:
     con = _con()
     cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM leads WHERE user_id=? AND seen=0", (user_id,))
+    cur.execute("SELECT COUNT(*) as c FROM recruit_leads WHERE user_id=? AND seen=0", (user_id,))
     row = cur.fetchone()
     con.close()
-    return int(row["c"]) if row else 0
+    return int(row["c"] if row else 0)
+
+
+def mark_leads_seen(user_id: str, company_id: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE recruit_leads SET seen=1 WHERE user_id=? AND company_id=?",
+        (user_id, company_id),
+    )
+    con.commit()
+    con.close()
+
+
+def clear_leads(user_id: str, company_id: str):
+    con = _con()
+    cur = con.cursor()
+    cur.execute("DELETE FROM recruit_leads WHERE user_id=? AND company_id=?", (user_id, company_id))
+    con.commit()
+    con.close()
