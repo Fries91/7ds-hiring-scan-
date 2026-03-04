@@ -18,10 +18,22 @@ def _con():
     return con
 
 
+def _has_col(cur: sqlite3.Cursor, table: str, col: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table})")
+    rows = cur.fetchall()
+    return any((r["name"] == col) for r in rows)
+
+
+def _add_col(cur: sqlite3.Cursor, table: str, col_ddl: str):
+    # col_ddl example: "created_at TEXT"
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_ddl}")
+
+
 def init_db():
     con = _con()
     cur = con.cursor()
 
+    # ---------- Base tables (fresh install) ----------
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -109,6 +121,53 @@ def init_db():
         )
         """
     )
+
+    # ---------- ✅ MIGRATIONS (fix older /var/data DBs) ----------
+    # users table
+    if not _has_col(cur, "users", "company_ids"):
+        _add_col(cur, "users", "company_ids TEXT NOT NULL DEFAULT '[]'")
+    if not _has_col(cur, "users", "created_at"):
+        _add_col(cur, "users", "created_at TEXT")
+    if not _has_col(cur, "users", "last_seen_at"):
+        _add_col(cur, "users", "last_seen_at TEXT")
+
+    # sessions table
+    if not _has_col(cur, "sessions", "created_at"):
+        _add_col(cur, "sessions", "created_at TEXT")
+    if not _has_col(cur, "sessions", "last_seen_at"):
+        _add_col(cur, "sessions", "last_seen_at TEXT")
+
+    # trains table
+    if not _has_col(cur, "trains", "trains_used"):
+        _add_col(cur, "trains", "trains_used INTEGER NOT NULL DEFAULT 0")
+    if not _has_col(cur, "trains", "note"):
+        _add_col(cur, "trains", "note TEXT DEFAULT ''")
+    if not _has_col(cur, "trains", "created_at"):
+        _add_col(cur, "trains", "created_at TEXT")
+
+    # contracts table
+    if not _has_col(cur, "contracts", "employee_id"):
+        _add_col(cur, "contracts", "employee_id TEXT DEFAULT ''")
+    if not _has_col(cur, "contracts", "employee_name"):
+        _add_col(cur, "contracts", "employee_name TEXT DEFAULT ''")
+    if not _has_col(cur, "contracts", "expires_at"):
+        _add_col(cur, "contracts", "expires_at TEXT DEFAULT ''")
+    if not _has_col(cur, "contracts", "note"):
+        _add_col(cur, "contracts", "note TEXT DEFAULT ''")
+    if not _has_col(cur, "contracts", "created_at"):
+        _add_col(cur, "contracts", "created_at TEXT")
+
+    # notifications table
+    if not _has_col(cur, "notifications", "created_at"):
+        _add_col(cur, "notifications", "created_at TEXT")
+    if not _has_col(cur, "notifications", "seen"):
+        _add_col(cur, "notifications", "seen INTEGER NOT NULL DEFAULT 0")
+
+    # recruit_leads table
+    if not _has_col(cur, "recruit_leads", "created_at"):
+        _add_col(cur, "recruit_leads", "created_at TEXT")
+    if not _has_col(cur, "recruit_leads", "seen"):
+        _add_col(cur, "recruit_leads", "seen INTEGER NOT NULL DEFAULT 0")
 
     con.commit()
     con.close()
