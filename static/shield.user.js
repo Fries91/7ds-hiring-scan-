@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         7DS*: Peace Hiring Hub 💼 (NO URL prompt + Cancel stops prompts)
+// @name         Company Hub 💼 (High-Value Theme + Draggable + No URL Prompt)
 // @namespace    sevends-hiring-scan
-// @version      2.0.3
-// @description  Multi-user Hiring Hub. No BASE_URL prompt. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt.
+// @version      2.0.5
+// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Draggable. High-value company theme.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -21,11 +21,13 @@
   // -----------------------
   // Storage keys
   // -----------------------
-  const K_ADMIN = "peace_hub_admin_key";
-  const K_API = "peace_hub_user_api_key";
-  const K_TOKEN = "peace_hub_session_token";
-  const K_COMPANY_IDS = "peace_hub_company_ids";
-  const K_CANCELLED = "peace_hub_cancelled_setup"; // if cancelled, never prompt again automatically
+  const K_ADMIN = "company_hub_admin_key";
+  const K_API = "company_hub_user_api_key";
+  const K_TOKEN = "company_hub_session_token";
+  const K_COMPANY_IDS = "company_hub_company_ids";
+  const K_CANCELLED = "company_hub_cancelled_setup"; // if cancelled, never prompt again automatically
+  const K_BADGE_POS = "company_hub_badge_pos_v2"; // {x,y}
+  const K_PANEL_POS = "company_hub_panel_pos_v2"; // {x,y}
 
   // -----------------------
   // Helpers
@@ -64,6 +66,34 @@
       .replace(/'/g, "&#039;");
   }
 
+  function safeParseJSON(str, fallback) {
+    try {
+      const v = JSON.parse(str);
+      return v && typeof v === "object" ? v : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function getSavedPos(key, fallback) {
+    const raw = GM_getValue(key, "");
+    if (!raw) return fallback;
+    const obj = safeParseJSON(raw, null);
+    if (!obj) return fallback;
+    const x = Number(obj.x);
+    const y = Number(obj.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return fallback;
+    return { x, y };
+  }
+
+  function savePos(key, x, y) {
+    GM_setValue(key, JSON.stringify({ x, y }));
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
   function promptMaybe(label, currentVal) {
     const out = prompt(label, currentVal || "");
     if (out === null) return null; // Cancel
@@ -72,13 +102,6 @@
 
   // ✅ ONLY called from Settings button (never auto-called)
   async function runSettingsWizard() {
-    const cancelled = !!GM_getValue(K_CANCELLED, false);
-    // If previously cancelled, we still allow Settings to try again (because they clicked Settings intentionally)
-    // but we won't auto-prompt anywhere else.
-    if (cancelled) {
-      // keep cancelled true until they successfully complete auth
-    }
-
     let admin = (GM_getValue(K_ADMIN, "") || "").trim();
     let api = (GM_getValue(K_API, "") || "").trim();
     let cids = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
@@ -114,7 +137,6 @@
     // Try auth now
     try {
       await ensureAuth(true);
-      // ✅ only clear cancelled flag after successful auth
       GM_setValue(K_CANCELLED, false);
       return { ok: true };
     } catch (e) {
@@ -122,14 +144,13 @@
     }
   }
 
-  async function ensureAuth(allowErrorThrow = false) {
+  async function ensureAuth(allowThrow = false) {
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
-    const cancelled = !!GM_getValue(K_CANCELLED, false);
 
     // ✅ NEVER prompt automatically
     if (!admin || !api) {
-      if (allowErrorThrow) throw new Error("Missing keys");
+      if (allowThrow) throw new Error("Missing keys. Click Settings.");
       return false;
     }
 
@@ -159,118 +180,367 @@
   }
 
   // -----------------------
-  // UI
+  // UI (High-Value Company Theme)
   // -----------------------
   GM_addStyle(`
-    #peace-badge, #peace-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
-    #peace-badge {
+    :root{
+      --hv-bg: rgba(8,10,14,0.92);
+      --hv-panel: rgba(12,15,22,0.95);
+      --hv-stroke: rgba(255,255,255,0.10);
+      --hv-stroke2: rgba(255,255,255,0.14);
+      --hv-text: #e5e7eb;
+      --hv-muted: rgba(229,231,235,0.72);
+      --hv-gold: #d4af37;
+      --hv-gold2: #f7e7a9;
+      --hv-emerald: rgba(16,185,129,0.25);
+      --hv-red: rgba(239,68,68,0.25);
+      --hv-blue: rgba(99,102,241,0.25);
+    }
+
+    #companyhub-badge, #companyhub-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
+
+    /* ✅ Icon size matches Company Hub (54x54) */
+    #companyhub-badge {
       position: fixed; right: 14px; bottom: 110px; z-index: 999999;
       width: 54px; height: 54px; border-radius: 16px;
-      background: linear-gradient(135deg, #111827, #0b1220);
-      border: 1px solid rgba(255,255,255,0.12);
-      box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+      background:
+        radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
+        linear-gradient(135deg, rgba(18,22,32,0.95), rgba(7,9,13,0.95));
+      border: 1px solid rgba(212,175,55,0.35);
+      box-shadow:
+        0 14px 34px rgba(0,0,0,0.55),
+        0 0 0 1px rgba(255,255,255,0.06) inset;
       display: grid; place-items: center; cursor: pointer;
       user-select:none;
+      touch-action: none;
     }
-    #peace-badge span { font-size: 26px; line-height: 1; }
-    #peace-panel {
+
+    #companyhub-badge::after{
+      content:"";
+      position:absolute; inset: 6px;
+      border-radius: 12px;
+      border: 1px solid rgba(247,231,169,0.18);
+      pointer-events:none;
+    }
+
+    #companyhub-badge span {
+      font-size: 26px; line-height: 1;
+      filter: drop-shadow(0 2px 6px rgba(0,0,0,0.55));
+    }
+
+    #companyhub-panel {
       position: fixed; right: 14px; bottom: 170px; z-index: 999999;
       width: min(92vw, 360px);
-      background: rgba(10,14,22,0.94);
-      border: 1px solid rgba(255,255,255,0.12);
+      background:
+        radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.10), transparent 40%),
+        radial-gradient(120% 120% at 100% 0%, rgba(99,102,241,0.08), transparent 45%),
+        linear-gradient(180deg, rgba(14,18,28,0.96), rgba(8,10,14,0.96));
+      border: 1px solid rgba(255,255,255,0.10);
       border-radius: 16px;
-      box-shadow: 0 16px 40px rgba(0,0,0,0.5);
+      box-shadow: 0 18px 52px rgba(0,0,0,0.65);
       overflow: hidden;
       display: none;
-      backdrop-filter: blur(6px);
+      backdrop-filter: blur(8px);
+      touch-action: none;
     }
-    #peace-head {
+
+    #companyhub-head {
       padding: 10px 12px;
       display:flex; align-items:center; justify-content:space-between;
       border-bottom: 1px solid rgba(255,255,255,0.10);
-      color: #e5e7eb;
-      font-weight: 900;
+      color: var(--hv-text);
+      font-weight: 950;
+      cursor: move;
+      user-select:none;
+      letter-spacing: 0.2px;
     }
-    #peace-tabs {
-      display:flex; gap:6px; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
+
+    #companyhub-title {
+      display:flex; align-items:center; gap:8px;
+      min-width:0;
+    }
+
+    #companyhub-title .crest{
+      width: 18px; height: 18px; border-radius: 6px;
+      background:
+        radial-gradient(110% 110% at 30% 20%, rgba(247,231,169,0.35), transparent 55%),
+        linear-gradient(135deg, rgba(212,175,55,0.32), rgba(212,175,55,0.10));
+      border: 1px solid rgba(212,175,55,0.35);
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
+      flex: 0 0 auto;
+    }
+
+    #companyhub-title .text{
+      display:flex; flex-direction:column; min-width:0;
+    }
+
+    #companyhub-title .text .main{
+      font-size: 14px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    #companyhub-title .text .sub{
+      font-size: 11px;
+      color: rgba(247,231,169,0.70);
+      font-weight: 800;
+      margin-top: 2px;
+    }
+
+    #companyhub-tabs {
+      display:flex; gap:6px; padding: 8px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
       flex-wrap: wrap;
     }
-    .p-tab {
-      background: rgba(255,255,255,0.08);
+
+    .ch-tab {
+      background: rgba(255,255,255,0.06);
       border: 1px solid rgba(255,255,255,0.08);
-      color: #e5e7eb;
-      font-weight: 800;
+      color: var(--hv-text);
+      font-weight: 900;
       border-radius: 10px;
       padding: 6px 8px;
       font-size: 12px;
       cursor: pointer;
+      user-select:none;
     }
-    .p-tab.active { background: rgba(99,102,241,0.22); border-color: rgba(99,102,241,0.35); }
-    #peace-body { padding: 10px; color: #e5e7eb; }
-    .p-btn {
-      background: rgba(34,197,94,0.20);
-      border: 1px solid rgba(34,197,94,0.25);
-      color: #e5e7eb;
+
+    .ch-tab.active {
+      background:
+        linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
+      border-color: rgba(212,175,55,0.28);
+    }
+
+    #companyhub-body { padding: 10px; color: var(--hv-text); }
+
+    .ch-btn {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: var(--hv-text);
       border-radius: 10px;
       padding: 8px 10px;
-      font-weight: 900;
+      font-weight: 950;
       cursor: pointer;
       font-size: 12px;
       white-space: nowrap;
+      user-select:none;
     }
-    .p-btn.red { background: rgba(239,68,68,0.20); border-color: rgba(239,68,68,0.25); }
-    .muted { opacity: 0.75; font-size: 12px; }
+
+    .ch-btn.primary{
+      background: rgba(16,185,129,0.16);
+      border-color: rgba(16,185,129,0.25);
+    }
+
+    .ch-btn.red {
+      background: rgba(239,68,68,0.16);
+      border-color: rgba(239,68,68,0.25);
+    }
+
+    .muted { color: var(--hv-muted); font-size: 12px; }
+
     .card {
-      background: rgba(255,255,255,0.06);
+      background:
+        radial-gradient(120% 120% at 0% 0%, rgba(212,175,55,0.07), transparent 45%),
+        rgba(255,255,255,0.05);
       border: 1px solid rgba(255,255,255,0.10);
       border-radius: 12px;
       padding: 10px;
       margin: 8px 0;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+    }
+
+    .card .headline{
+      font-weight: 950;
+      letter-spacing: 0.1px;
+    }
+
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.10);
+    }
+
+    .pill.gold{
+      background: rgba(212,175,55,0.12);
+      border-color: rgba(212,175,55,0.22);
+      color: rgba(247,231,169,0.92);
+    }
+
+    .row-actions{
+      display:flex; gap:6px; align-items:center;
     }
   `);
 
+  // ---- Create badge + panel
   const badge = document.createElement("div");
-  badge.id = "peace-badge";
+  badge.id = "companyhub-badge";
   badge.innerHTML = `<span>💼</span>`;
   document.body.appendChild(badge);
 
   const panel = document.createElement("div");
-  panel.id = "peace-panel";
+  panel.id = "companyhub-panel";
   panel.innerHTML = `
-    <div id="peace-head">
-      <div>7DS*: Peace Hiring Hub</div>
-      <div style="display:flex;gap:6px;">
-        <button class="p-btn" id="p-settings">Settings</button>
-        <button class="p-btn red" id="p-close">X</button>
+    <div id="companyhub-head">
+      <div id="companyhub-title">
+        <div class="crest"></div>
+        <div class="text">
+          <div class="main">Company Hub</div>
+          <div class="sub">High-Value Suite</div>
+        </div>
+      </div>
+      <div class="row-actions">
+        <button class="ch-btn primary" id="ch-settings">Settings</button>
+        <button class="ch-btn red" id="ch-close">X</button>
       </div>
     </div>
-    <div id="peace-tabs">
-      <button class="p-tab active" data-tab="companies">Companies</button>
-      <button class="p-tab" data-tab="trains">Trains</button>
-      <button class="p-tab" data-tab="apps">Applications</button>
-      <button class="p-tab" data-tab="search">Search</button>
+    <div id="companyhub-tabs">
+      <button class="ch-tab active" data-tab="companies">Companies</button>
+      <button class="ch-tab" data-tab="trains">Trains</button>
+      <button class="ch-tab" data-tab="apps">Applications</button>
+      <button class="ch-tab" data-tab="search">Search</button>
     </div>
-    <div id="peace-body"></div>
+    <div id="companyhub-body"></div>
   `;
   document.body.appendChild(panel);
 
+  // ---- restore saved positions
+  (function restorePositions() {
+    // Badge default (right/bottom)
+    const b = getSavedPos(K_BADGE_POS, null);
+    if (b) {
+      badge.style.left = b.x + "px";
+      badge.style.top = b.y + "px";
+      badge.style.right = "auto";
+      badge.style.bottom = "auto";
+    }
+
+    // Panel default (right/bottom)
+    const p = getSavedPos(K_PANEL_POS, null);
+    if (p) {
+      panel.style.left = p.x + "px";
+      panel.style.top = p.y + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+    }
+  })();
+
+  // ---- draggable helper (pointer events) for iOS/desktop
+  function makeDraggable(handleEl, moveEl, storeKey, restrictToViewport = true) {
+    let dragging = false;
+    let startX = 0, startY = 0;
+    let startLeft = 0, startTop = 0;
+
+    function getLeftTop(el) {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top };
+    }
+
+    function onDown(ev) {
+      // Prevent dragging on buttons/inputs inside the handle
+      const t = ev.target;
+      if (t && (t.tagName === "BUTTON" || t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.closest("button"))) {
+        return;
+      }
+
+      dragging = true;
+      const pt = ev.touches ? ev.touches[0] : ev;
+      const pos = getLeftTop(moveEl);
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startLeft = pos.left;
+      startTop = pos.top;
+
+      moveEl.style.left = startLeft + "px";
+      moveEl.style.top = startTop + "px";
+      moveEl.style.right = "auto";
+      moveEl.style.bottom = "auto";
+
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      window.addEventListener("mousemove", onMove, { passive: false });
+      window.addEventListener("mouseup", onUp, { passive: false });
+      window.addEventListener("touchmove", onMove, { passive: false });
+      window.addEventListener("touchend", onUp, { passive: false });
+      window.addEventListener("touchcancel", onUp, { passive: false });
+    }
+
+    function onMove(ev) {
+      if (!dragging) return;
+      const pt = ev.touches ? ev.touches[0] : ev;
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      let x = startLeft + dx;
+      let y = startTop + dy;
+
+      if (restrictToViewport) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const rect = moveEl.getBoundingClientRect();
+        const w = rect.width;
+        const h = rect.height;
+        x = clamp(x, 6, vw - w - 6);
+        y = clamp(y, 6, vh - h - 6);
+      }
+
+      moveEl.style.left = x + "px";
+      moveEl.style.top = y + "px";
+
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+
+    function onUp(ev) {
+      if (!dragging) return;
+      dragging = false;
+
+      const rect = moveEl.getBoundingClientRect();
+      savePos(storeKey, Math.round(rect.left), Math.round(rect.top));
+
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onUp);
+      window.removeEventListener("touchcancel", onUp);
+
+      ev?.preventDefault?.();
+      ev?.stopPropagation?.();
+    }
+
+    handleEl.addEventListener("mousedown", onDown, { passive: false });
+    handleEl.addEventListener("touchstart", onDown, { passive: false });
+  }
+
+  // ✅ Make briefcase draggable (drag the icon)
+  makeDraggable(badge, badge, K_BADGE_POS, true);
+  // ✅ Make panel draggable (drag header)
+  const panelHeader = panel.querySelector("#companyhub-head");
+  makeDraggable(panelHeader, panel, K_PANEL_POS, true);
+
+  // ---- open/close
   function togglePanel() {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
     if (panel.style.display !== "none") renderActiveTab();
   }
 
-  badge.addEventListener("click", togglePanel);
-  panel.querySelector("#p-close").addEventListener("click", togglePanel);
+  badge.addEventListener("click", () => togglePanel());
+  panel.querySelector("#ch-close").addEventListener("click", () => togglePanel());
 
-  panel.querySelector("#p-settings").addEventListener("click", async () => {
-    const body = panel.querySelector("#peace-body");
+  // ---- settings
+  panel.querySelector("#ch-settings").addEventListener("click", async () => {
+    const body = panel.querySelector("#companyhub-body");
     body.innerHTML = `<div class="card"><div class="muted">Opening setup…</div></div>`;
 
     const res = await runSettingsWizard();
     if (!res.ok) {
       body.innerHTML = `
         <div class="card">
-          <div style="font-weight:900;">Setup not completed</div>
+          <div class="headline">Setup not completed</div>
           <div class="muted" style="margin-top:6px;">${escapeHtml(res.error || "Cancelled")}</div>
           <div class="muted" style="margin-top:6px;">It will NOT ask again unless you click Settings.</div>
         </div>`;
@@ -280,7 +550,8 @@
     renderActiveTab();
   });
 
-  const tabs = Array.from(panel.querySelectorAll(".p-tab"));
+  // ---- tabs
+  const tabs = Array.from(panel.querySelectorAll(".ch-tab"));
   let active = "companies";
   tabs.forEach((b) => {
     b.addEventListener("click", () => {
@@ -291,23 +562,24 @@
     });
   });
 
-  const body = panel.querySelector("#peace-body");
+  const body = panel.querySelector("#companyhub-body");
 
   async function renderActiveTab() {
     body.innerHTML = `<div class="muted">Loading…</div>`;
 
-    // ✅ NEVER auto-prompt. If missing keys, show a message.
+    // ✅ NEVER auto-prompt. If missing keys, show message.
     const admin = (GM_getValue(K_ADMIN, "") || "").trim();
     const api = (GM_getValue(K_API, "") || "").trim();
 
     if (!admin || !api) {
       body.innerHTML = `
         <div class="card">
-          <div style="font-weight:900;">Setup needed</div>
+          <div class="headline">Setup needed</div>
           <div class="muted" style="margin-top:6px;">
             Click <b>Settings</b> to enter your Admin Key + Torn API key.
             <br/>No popups will appear unless you click Settings.
           </div>
+          <div class="pill gold" style="margin-top:10px;">🔒 Access controlled by admin keys</div>
         </div>`;
       return;
     }
@@ -317,7 +589,7 @@
     } catch (e) {
       body.innerHTML = `
         <div class="card">
-          <div style="font-weight:900;">Auth error</div>
+          <div class="headline">Auth error</div>
           <div class="muted" style="margin-top:6px;">${escapeHtml(e.message || String(e))}</div>
           <div class="muted" style="margin-top:6px;">Click <b>Settings</b> to fix keys.</div>
         </div>`;
@@ -333,23 +605,25 @@
   async function renderCompanies() {
     const res = await gmReqAuthed("GET", `${BASE_URL}/api/companies`, null);
     if (!res.json || res.json.ok !== true) {
-      body.innerHTML = `<div class="card"><div style="font-weight:900;">Error</div><div class="muted">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
+      body.innerHTML = `<div class="card"><div class="headline">Error</div><div class="muted" style="margin-top:6px;">${escapeHtml(res.json?.error || "Failed")}</div></div>`;
       return;
     }
     const rows = res.json.rows || [];
     if (!rows.length) {
-      body.innerHTML = `<div class="card"><div style="font-weight:900;">No companies loaded</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings.</div></div>`;
+      body.innerHTML = `<div class="card"><div class="headline">No companies loaded</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings.</div></div>`;
       return;
     }
     body.innerHTML = rows
       .map((c) => {
         const emps = (c.employees || []).length;
-        const err = c.error ? `<div class="muted" style="margin-top:6px;color:#fca5a5;">${escapeHtml(c.error)}</div>` : "";
+        const err = c.error ? `<div class="muted" style="margin-top:6px;color:rgba(248,113,113,0.9);">${escapeHtml(c.error)}</div>` : "";
         return `
           <div class="card">
-            <div style="font-weight:900;">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
-            <div class="muted" style="margin-top:6px;">Employees: ${escapeHtml(String(emps))}</div>
-            <div class="muted" style="margin-top:4px;">ID: ${escapeHtml(c.company_id)}</div>
+            <div class="headline">${escapeHtml(c.name || ("Company " + c.company_id))}</div>
+            <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+              <div class="pill gold">👥 ${escapeHtml(String(emps))} employees</div>
+              <div class="pill">🆔 ${escapeHtml(c.company_id)}</div>
+            </div>
             ${err}
           </div>`;
       })
@@ -359,20 +633,20 @@
   async function renderTrains() {
     const companyIds = (GM_getValue(K_COMPANY_IDS, "") || "").trim();
     if (!companyIds) {
-      body.innerHTML = `<div class="card"><div style="font-weight:900;">No company IDs</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings to use train tracking.</div></div>`;
+      body.innerHTML = `<div class="card"><div class="headline">No company IDs</div><div class="muted" style="margin-top:6px;">Add company IDs in Settings to use train tracking.</div></div>`;
       return;
     }
-    body.innerHTML = `<div class="card"><div class="muted">Trains tab is enabled (backend endpoints ready). If you want the full trains UI list/add/delete here, tell me and I’ll drop it in.</div></div>`;
+    body.innerHTML = `<div class="card"><div class="muted">Trains endpoints are ready. If you want the full trains UI (add/list/delete) here, say “add full trains UI”.</div></div>`;
   }
 
   async function renderApps() {
-    body.innerHTML = `<div class="card"><div class="muted">Applications tab is enabled (backend endpoints ready). If you want the full applications UI here, tell me and I’ll drop it in.</div></div>`;
+    body.innerHTML = `<div class="card"><div class="muted">Applications endpoints are ready. If you want the full applications UI here, say “add full applications UI”.</div></div>`;
   }
 
   async function renderSearch() {
-    body.innerHTML = `<div class="card"><div class="muted">Search tab is enabled (backend endpoints ready). If you want the full HoF search UI here, tell me and I’ll drop it in.</div></div>`;
+    body.innerHTML = `<div class="card"><div class="muted">HoF search endpoints are ready. If you want the full search UI here, say “add full search UI”.</div></div>`;
   }
 
-  // start
+  // start hidden
   panel.style.display = "none";
 })();
