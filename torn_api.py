@@ -1,15 +1,12 @@
-# torn_api.py
 import re
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
+API_BASE_V1 = "https://api.torn.com"
 API_BASE_V2 = "https://api.torn.com/v2"
 
 
 def _to_int(x: Any) -> int:
-    """
-    Torn often returns numbers as strings (sometimes with commas).
-    """
     if x is None:
         return 0
     s = str(x)
@@ -18,41 +15,44 @@ def _to_int(x: Any) -> int:
 
 
 def me_basic(api_key: str) -> Dict[str, Any]:
-    # v1 is fine for "me"
-    url = "https://api.torn.com/user/"
+    url = f"{API_BASE_V1}/user/"
     r = requests.get(url, params={"selections": "basic", "key": api_key}, timeout=25)
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j
 
 
 def company_profile(company_id: str, api_key: str) -> Dict[str, Any]:
-    # v1 company endpoint is fine
-    url = "https://api.torn.com/company/"
-    r = requests.get(url, params={"selections": "profile,employees", "id": company_id, "key": api_key}, timeout=25)
+    url = f"{API_BASE_V1}/company/"
+    r = requests.get(
+        url,
+        params={"selections": "profile,employees", "id": company_id, "key": api_key},
+        timeout=25,
+    )
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
+    return j
 
 
 def _hof_workstats_page(api_key: str, offset: int, limit: int) -> List[Dict[str, Any]]:
     """
     Torn API v2 HoF endpoint.
-    cat=workstats returns the TOTAL working stats leaderboard.
+    cat=workstats returns TOTAL working stats leaderboard.
     """
     url = f"{API_BASE_V2}/torn/hof"
-    params = {
-        "key": api_key,
-        "cat": "workstats",
-        "offset": int(offset),
-        "limit": int(limit),
-    }
+    params = {"key": api_key, "cat": "workstats", "offset": int(offset), "limit": int(limit)}
     r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
     j = r.json()
+    if "error" in j:
+        raise RuntimeError(j["error"])
 
-    # Different wrappers exist depending on API changes; handle common shapes safely.
     data = j.get("hof") or j.get("data") or j.get("entries") or j.get("ranking") or j.get("rankings") or []
     if isinstance(data, dict):
-        # sometimes it's keyed by rank/id
         data = list(data.values())
     if not isinstance(data, list):
         return []
@@ -62,12 +62,10 @@ def _hof_workstats_page(api_key: str, offset: int, limit: int) -> List[Dict[str,
         if not isinstance(row, dict):
             continue
 
-        # common key variations
         pid = row.get("user_id") or row.get("player_id") or row.get("id")
         name = row.get("name") or row.get("username") or ""
         val = row.get("value") or row.get("score") or row.get("total") or row.get("stat") or 0
 
-        total = _to_int(val)
         if pid is None:
             continue
 
@@ -75,8 +73,8 @@ def _hof_workstats_page(api_key: str, offset: int, limit: int) -> List[Dict[str,
             {
                 "id": str(pid),
                 "name": str(name),
-                "total": int(total),
-                # keep compatibility if old UI expects these fields
+                "total": int(_to_int(val)),
+                # keep compatibility fields (UI prints them sometimes)
                 "man": 0,
                 "int": 0,
                 "end": 0,
@@ -89,20 +87,17 @@ def hof_scan_workstats(
     api_key: str,
     min_total: int = 0,
     max_total: int = 10**12,
-    max_pages: int = 10,
+    max_pages: int = 10,   # IMPORTANT: counts API calls, not “pages”
     page_size: int = 25,
 ) -> List[Dict[str, Any]]:
     """
-    Smart HoF scanner for TOTAL workstats.
-
-    Problem you had:
-      - If you only scan offset=0..(N pages), you only see the TOP players
-        (huge totals), so ranges like 500..120000 return nothing.
+    Smart HoF scanner:
+    - If you only scan offset=0.., you're stuck at the TOP (huge totals).
+    - Ranges like 500..120000 return none.
 
     Fix:
-      - Use an exponential "jump down" using offset until page minimum is <= max_total,
-        then walk forward collecting rows within [min_total, max_total].
-      - max_pages is the maximum number of API calls (keeps it safe for Render).
+    - Jump down using exponential offset until the page min drops into your band,
+      then walk forward collecting matches.
     """
     min_total = int(min_total or 0)
     max_total = int(max_total or 10**12)
@@ -111,35 +106,29 @@ def hof_scan_workstats(
 
     calls = 0
     limit = max(1, int(page_size))
-    step_pages = 1
     offset = 0
+    step_pages = 1
 
-    # Helper to fetch and count calls
     def fetch(off: int) -> List[Dict[str, Any]]:
         nonlocal calls
         calls += 1
         return _hof_workstats_page(api_key, off, limit)
 
-    # 1) Exponential search downwards until we reach totals <= max_total
     page = fetch(offset)
     if not page:
         return []
-    if calls >= max_pages:
-        # return whatever matches in the first page (best effort)
-        return [r for r in page if min_total <= int(r["total"]) <= max_total]
 
-    # If the LOWEST total on this page is still above our max_total,
-    # we must jump deeper (increase offset).
-    while page and min(int(r["total"]) for r in page) > max_total and calls < max_pages:
+    # Jump down until we get near max_total
+    while calls < max_pages:
+        page_min = min(int(r.get("total") or 0) for r in page)
+        if page_min <= max_total:
+            break
         offset += step_pages * limit
         step_pages *= 2
         page = fetch(offset)
+        if not page:
+            return []
 
-    if not page:
-        return []
-
-    # 2) Now we are around the zone where totals cross max_total.
-    # Walk forward collecting until we drop below min_total.
     results: List[Dict[str, Any]] = []
 
     def add_matches(rows: List[Dict[str, Any]]):
@@ -150,18 +139,16 @@ def hof_scan_workstats(
 
     add_matches(page)
 
+    # Walk down collecting until we fall under min_total
     while calls < max_pages:
-        # if this page's LOWEST total is already below min_total, going further down only decreases
-        lowest = min(int(r["total"]) for r in page) if page else 0
-        if lowest < min_total:
+        page_min = min(int(r.get("total") or 0) for r in page) if page else 0
+        if page_min < min_total:
             break
-
         offset += limit
         page = fetch(offset)
         if not page:
             break
         add_matches(page)
 
-    # sort descending total (HoF is already, but just in case)
     results.sort(key=lambda r: int(r.get("total") or 0), reverse=True)
     return results
