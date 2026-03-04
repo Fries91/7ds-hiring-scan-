@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Company Hub 💼 (High-Value Theme + Draggable + No URL Prompt)
+// @name         Company Hub 💼 (High-Value Theme + Clickable/Draggable Icon + No URL Prompt)
 // @namespace    sevends-hiring-scan
-// @version      2.0.5
-// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Draggable. High-value company theme.
+// @version      2.0.6
+// @description  Company Hub overlay. Hardcoded BASE_URL. Users enter Admin Key + their Torn API key via Settings only. Cancel won't re-prompt. 💼 Icon is smaller + clickable + draggable.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_addStyle
@@ -26,8 +26,8 @@
   const K_TOKEN = "company_hub_session_token";
   const K_COMPANY_IDS = "company_hub_company_ids";
   const K_CANCELLED = "company_hub_cancelled_setup"; // if cancelled, never prompt again automatically
-  const K_BADGE_POS = "company_hub_badge_pos_v2"; // {x,y}
-  const K_PANEL_POS = "company_hub_panel_pos_v2"; // {x,y}
+  const K_BADGE_POS = "company_hub_badge_pos_v3"; // {x,y}
+  const K_PANEL_POS = "company_hub_panel_pos_v3"; // {x,y}
 
   // -----------------------
   // Helpers
@@ -184,25 +184,18 @@
   // -----------------------
   GM_addStyle(`
     :root{
-      --hv-bg: rgba(8,10,14,0.92);
-      --hv-panel: rgba(12,15,22,0.95);
-      --hv-stroke: rgba(255,255,255,0.10);
-      --hv-stroke2: rgba(255,255,255,0.14);
       --hv-text: #e5e7eb;
       --hv-muted: rgba(229,231,235,0.72);
       --hv-gold: #d4af37;
       --hv-gold2: #f7e7a9;
-      --hv-emerald: rgba(16,185,129,0.25);
-      --hv-red: rgba(239,68,68,0.25);
-      --hv-blue: rgba(99,102,241,0.25);
     }
 
     #companyhub-badge, #companyhub-panel { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
 
-    /* ✅ Icon size matches Company Hub (54x54) */
+    /* ✅ Smaller icon (44x44) */
     #companyhub-badge {
       position: fixed; right: 14px; bottom: 110px; z-index: 999999;
-      width: 54px; height: 54px; border-radius: 16px;
+      width: 44px; height: 44px; border-radius: 14px;
       background:
         radial-gradient(120% 120% at 20% 10%, rgba(212,175,55,0.20), transparent 45%),
         linear-gradient(135deg, rgba(18,22,32,0.95), rgba(7,9,13,0.95));
@@ -217,14 +210,14 @@
 
     #companyhub-badge::after{
       content:"";
-      position:absolute; inset: 6px;
-      border-radius: 12px;
+      position:absolute; inset: 5px;
+      border-radius: 11px;
       border: 1px solid rgba(247,231,169,0.18);
       pointer-events:none;
     }
 
     #companyhub-badge span {
-      font-size: 26px; line-height: 1;
+      font-size: 22px; line-height: 1;
       filter: drop-shadow(0 2px 6px rgba(0,0,0,0.55));
     }
 
@@ -305,8 +298,7 @@
     }
 
     .ch-tab.active {
-      background:
-        linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
+      background: linear-gradient(135deg, rgba(212,175,55,0.20), rgba(99,102,241,0.14));
       border-color: rgba(212,175,55,0.28);
     }
 
@@ -348,10 +340,7 @@
       box-shadow: 0 6px 20px rgba(0,0,0,0.35);
     }
 
-    .card .headline{
-      font-weight: 950;
-      letter-spacing: 0.1px;
-    }
+    .card .headline{ font-weight: 950; letter-spacing: 0.1px; }
 
     .pill{
       display:inline-flex;
@@ -370,9 +359,7 @@
       color: rgba(247,231,169,0.92);
     }
 
-    .row-actions{
-      display:flex; gap:6px; align-items:center;
-    }
+    .row-actions{ display:flex; gap:6px; align-items:center; }
   `);
 
   // ---- Create badge + panel
@@ -409,7 +396,6 @@
 
   // ---- restore saved positions
   (function restorePositions() {
-    // Badge default (right/bottom)
     const b = getSavedPos(K_BADGE_POS, null);
     if (b) {
       badge.style.left = b.x + "px";
@@ -418,7 +404,6 @@
       badge.style.bottom = "auto";
     }
 
-    // Panel default (right/bottom)
     const p = getSavedPos(K_PANEL_POS, null);
     if (p) {
       panel.style.left = p.x + "px";
@@ -428,7 +413,102 @@
     }
   })();
 
-  // ---- draggable helper (pointer events) for iOS/desktop
+  // ---- draggable helper (touch + mouse) + click preserved
+  function makeDraggableClickable(handleEl, moveEl, storeKey, opts = {}) {
+    const threshold = opts.threshold ?? 8; // px
+    const restrictToViewport = opts.restrictToViewport ?? true;
+    const onClick = opts.onClick ?? null;
+
+    let dragging = false;
+    let moved = false;
+    let startX = 0, startY = 0;
+    let startLeft = 0, startTop = 0;
+
+    function getLeftTop(el) {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top };
+    }
+
+    function onDown(ev) {
+      const pt = ev.touches ? ev.touches[0] : ev;
+
+      dragging = true;
+      moved = false;
+
+      const pos = getLeftTop(moveEl);
+      startX = pt.clientX;
+      startY = pt.clientY;
+      startLeft = pos.left;
+      startTop = pos.top;
+
+      // Force to left/top positioning so it moves cleanly
+      moveEl.style.left = startLeft + "px";
+      moveEl.style.top = startTop + "px";
+      moveEl.style.right = "auto";
+      moveEl.style.bottom = "auto";
+
+      // Don't preventDefault here—so taps can still become clicks if no move
+      window.addEventListener("mousemove", onMove, { passive: false });
+      window.addEventListener("mouseup", onUp, { passive: false });
+      window.addEventListener("touchmove", onMove, { passive: false });
+      window.addEventListener("touchend", onUp, { passive: false });
+      window.addEventListener("touchcancel", onUp, { passive: false });
+    }
+
+    function onMove(ev) {
+      if (!dragging) return;
+      const pt = ev.touches ? ev.touches[0] : ev;
+      const dx = pt.clientX - startX;
+      const dy = pt.clientY - startY;
+
+      if (Math.abs(dx) + Math.abs(dy) > threshold) moved = true;
+
+      let x = startLeft + dx;
+      let y = startTop + dy;
+
+      if (restrictToViewport) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const rect = moveEl.getBoundingClientRect();
+        const w = rect.width;
+        const h = rect.height;
+        x = clamp(x, 6, vw - w - 6);
+        y = clamp(y, 6, vh - h - 6);
+      }
+
+      moveEl.style.left = x + "px";
+      moveEl.style.top = y + "px";
+
+      // If we are really moving, prevent scroll
+      if (moved) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }
+
+    function onUp(ev) {
+      if (!dragging) return;
+      dragging = false;
+
+      const rect = moveEl.getBoundingClientRect();
+      savePos(storeKey, Math.round(rect.left), Math.round(rect.top));
+
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onUp);
+      window.removeEventListener("touchcancel", onUp);
+
+      // If it was a tap (no move), treat as click
+      if (!moved && typeof onClick === "function") {
+        onClick();
+      }
+    }
+
+    handleEl.addEventListener("mousedown", onDown, { passive: false });
+    handleEl.addEventListener("touchstart", onDown, { passive: false });
+  }
+
   function makeDraggable(handleEl, moveEl, storeKey, restrictToViewport = true) {
     let dragging = false;
     let startX = 0, startY = 0;
@@ -440,7 +520,6 @@
     }
 
     function onDown(ev) {
-      // Prevent dragging on buttons/inputs inside the handle
       const t = ev.target;
       if (t && (t.tagName === "BUTTON" || t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.closest("button"))) {
         return;
@@ -516,19 +595,24 @@
     handleEl.addEventListener("touchstart", onDown, { passive: false });
   }
 
-  // ✅ Make briefcase draggable (drag the icon)
-  makeDraggable(badge, badge, K_BADGE_POS, true);
-  // ✅ Make panel draggable (drag header)
-  const panelHeader = panel.querySelector("#companyhub-head");
-  makeDraggable(panelHeader, panel, K_PANEL_POS, true);
-
   // ---- open/close
   function togglePanel() {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
     if (panel.style.display !== "none") renderActiveTab();
   }
 
-  badge.addEventListener("click", () => togglePanel());
+  // ✅ Badge is BOTH clickable and draggable (tap toggles, drag moves)
+  makeDraggableClickable(badge, badge, K_BADGE_POS, {
+    threshold: 8,
+    restrictToViewport: true,
+    onClick: togglePanel,
+  });
+
+  // ✅ Panel draggable (drag header)
+  const panelHeader = panel.querySelector("#companyhub-head");
+  makeDraggable(panelHeader, panel, K_PANEL_POS, true);
+
+  // Close button
   panel.querySelector("#ch-close").addEventListener("click", () => togglePanel());
 
   // ---- settings
