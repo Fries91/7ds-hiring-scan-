@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Company Hub 💼
-// @namespace    fries91-7ds-wrath
-// @version      6.2.2
-// @description  Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value company theme. Briefcase always on top, smaller, no duplicates. HoF search is TOTAL-only.
+// @namespace    fries91-company-hub
+// @version      6.2.3
+// @description  Company Hub overlay. Auth via /api/auth then uses /state with X-Session-Token. High-value theme. Briefcase always on top, draggable, no duplicates. HoF search TOTAL-only.
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @run-at       document-idle
@@ -22,18 +22,14 @@
   const POLL_MS = 15000;
   // ==============================================
 
-  // -------- HARD GUARD: prevents duplicates ----------
-  if (window.__PEACE_HUB_RUNNING__) return;
-  window.__PEACE_HUB_RUNNING__ = true;
+  // ---------- HARD GUARD: prevents duplicates ----------
+  if (window.__COMPANY_HUB_RUNNING__) return;
+  window.__COMPANY_HUB_RUNNING__ = true;
 
-  const EL_BTN = "peacehub-btn";
-  const EL_PANEL = "peacehub-panel";
-  const EL_TOAST = "peacehub-toast";
-
-  // Cleanup remnants from older versions
-  try { document.getElementById(EL_BTN)?.remove(); } catch {}
-  try { document.getElementById(EL_PANEL)?.remove(); } catch {}
-  try { document.getElementById(EL_TOAST)?.remove(); } catch {}
+  const EL_BTN = "companyhub-btn";
+  const EL_PANEL = "companyhub-panel";
+  const EL_TOAST = "companyhub-toast";
+  const EL_BADGE = "companyhub-badge";
 
   // ---------------- Storage ----------------
   const S = {
@@ -111,20 +107,20 @@
   // ---------------- State ----------------
   const state = {
     open: false,
-    tab: S.get("peacehub_tab", "hub") || "hub",
+    tab: S.get("companyhub_tab", "hub") || "hub",
     last: "—",
     timer: null,
 
     // saved inputs
-    admin_key: S.get("peacehub_admin_key", "") || "",
-    api_key: S.get("peacehub_api_key", "") || "",
+    admin_key: S.get("companyhub_admin_key", "") || "",
+    api_key: S.get("companyhub_api_key", "") || "",
 
     // session
-    token: S.get("peacehub_session_token", "") || "",
+    token: S.get("companyhub_session_token", "") || "",
 
     // selection + inputs
     selected_company_id: "",
-    company_ids_input: S.get("peacehub_company_ids_input", "") || "",
+    company_ids_input: S.get("companyhub_company_ids_input", "") || "",
 
     // /state cache
     data: null,
@@ -134,18 +130,18 @@
     hofCount: 0,
 
     // positions
-    btnLeft: S.get("peacehub_btn_left", null),
-    btnTop: S.get("peacehub_btn_top", null),
-    panelLeft: S.get("peacehub_panel_left", null),
-    panelTop: S.get("peacehub_panel_top", null),
+    btnLeft: S.get("companyhub_btn_left", null),
+    btnTop: S.get("companyhub_btn_top", null),
+    panelLeft: S.get("companyhub_panel_left", null),
+    panelTop: S.get("companyhub_panel_top", null),
   };
 
-  // ---------------- High-value theme styles ----------------
+  // ---------------- Theme styles ----------------
   GM_addStyle(`
     #${EL_BTN}{
       position: fixed;
       z-index: 2147483647;
-      width: 40px; height: 40px;
+      width: 42px; height: 42px;
       border-radius: 14px;
       display:flex; align-items:center; justify-content:center;
       background: linear-gradient(180deg, rgba(18,22,30,.95), rgba(10,12,18,.92));
@@ -164,6 +160,7 @@
       display:none; align-items:center; justify-content:center;
       color:#fff; font-weight: 900; font-size: 11px;
       box-shadow: 0 10px 20px rgba(0,0,0,.45);
+      pointer-events:none;
     }
 
     #${EL_TOAST}{
@@ -194,7 +191,7 @@
     }
 
     #${EL_PANEL} .head{
-      height: 54px;
+      height: 52px;
       display:flex; align-items:center; justify-content:space-between;
       padding: 0 12px;
       background: linear-gradient(180deg, rgba(255,215,120,.12), rgba(255,255,255,.03));
@@ -203,8 +200,8 @@
       user-select:none; -webkit-user-select:none; touch-action:none;
       cursor: grab;
     }
-    #${EL_PANEL} .title{ font-weight: 1000; font-size: 13px; letter-spacing:.2px; line-height: 1.05; }
-    #${EL_PANEL} .sub{ opacity:.86; font-weight: 800; font-size: 11px; line-height: 1.15; }
+    #${EL_PANEL} .title{ font-weight: 1000; font-size: 13px; letter-spacing:.2px; }
+    #${EL_PANEL} .sub{ opacity:.86; font-weight: 800; font-size: 11px; }
 
     #${EL_PANEL} .btn{
       border: 1px solid rgba(255, 215, 120, .18);
@@ -250,7 +247,7 @@
     }
 
     #${EL_PANEL} .body{
-      height: calc(100% - 54px - 60px);
+      height: calc(100% - 52px - 60px);
       overflow: auto;
       padding: 10px;
       color: #fff;
@@ -292,26 +289,46 @@
     }
   `);
 
-  // ---------------- UI Nodes ----------------
-  const toast = document.createElement("div");
-  toast.id = EL_TOAST;
-  document.documentElement.appendChild(toast);
+  // ---------------- Create nodes (always) ----------------
+  function ensureNodes() {
+    // Toast
+    let toast = document.getElementById(EL_TOAST);
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.id = EL_TOAST;
+      document.documentElement.appendChild(toast);
+    }
 
-  const btn = document.createElement("div");
-  btn.id = EL_BTN;
-  btn.innerHTML = `<span class="ico">💼</span><span class="badge" id="peacehub-badge">0</span>`;
-  document.documentElement.appendChild(btn);
+    // Button
+    let btn = document.getElementById(EL_BTN);
+    if (!btn) {
+      btn = document.createElement("div");
+      btn.id = EL_BTN;
+      btn.innerHTML = `<span class="ico">💼</span><span class="badge" id="${EL_BADGE}">0</span>`;
+      document.documentElement.appendChild(btn);
+    }
 
-  const panel = document.createElement("div");
-  panel.id = EL_PANEL;
-  document.documentElement.appendChild(panel);
+    // Panel
+    let panel = document.getElementById(EL_PANEL);
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = EL_PANEL;
+      document.documentElement.appendChild(panel);
+    }
 
-  // KeepAlive
-  setInterval(() => {
-    if (!document.getElementById(EL_BTN)) { try { document.documentElement.appendChild(btn); } catch {} }
-    if (!document.getElementById(EL_TOAST)) { try { document.documentElement.appendChild(toast); } catch {} }
-    if (!document.getElementById(EL_PANEL)) { try { document.documentElement.appendChild(panel); } catch {} }
-  }, 2000);
+    // keep top
+    btn.style.zIndex = "2147483647";
+    panel.style.zIndex = "2147483646";
+    toast.style.zIndex = "2147483647";
+
+    return { toast, btn, panel };
+  }
+
+  // Re-add nodes if Torn swaps DOM
+  const mo = new MutationObserver(() => ensureNodes());
+  mo.observe(document.documentElement, { childList: true, subtree: true });
+
+  const { btn, panel } = ensureNodes();
 
   // ---------------- Initial positions ----------------
   function setInitialPos() {
@@ -383,8 +400,8 @@
     onTap: () => toggle(),
     onSavePos: (x, y) => {
       state.btnLeft = x; state.btnTop = y;
-      S.set("peacehub_btn_left", x);
-      S.set("peacehub_btn_top", y);
+      S.set("companyhub_btn_left", x);
+      S.set("companyhub_btn_top", y);
     }
   });
 
@@ -398,7 +415,7 @@
     const { status, json } = await reqJSON("/api/auth", "POST", { admin_key, api_key });
     if (status >= 400 || !json || json.ok !== true) throw new Error(json?.error || `Auth failed (${status})`);
     state.token = json.token || "";
-    S.set("peacehub_session_token", state.token);
+    S.set("companyhub_session_token", state.token);
     return json;
   }
 
@@ -415,14 +432,12 @@
     return json;
   }
 
-  // HoF Search
   async function hofSearch(filters) {
     const { status, json } = await reqJSON("/api/search/hof", "POST", filters, tokenHeaders());
     if (status >= 400 || !json || json.ok !== true) throw new Error(json?.error || "HoF failed");
     return json;
   }
 
-  // Recruit
   async function recruitScan(company_id_or_empty) {
     const body = company_id_or_empty ? { company_id: company_id_or_empty } : {};
     const { status, json } = await reqJSON("/api/recruit/scan", "POST", body, tokenHeaders());
@@ -445,14 +460,12 @@
     return json;
   }
 
-  // Notifications
   async function notifsSeen() {
     const { status, json } = await reqJSON("/api/notifications/seen", "POST", {}, tokenHeaders());
     if (status >= 400 || !json || json.ok !== true) throw new Error(json?.error || "Notifs seen failed");
     return json;
   }
 
-  // Trains
   async function trainsAdd(company_id, buyer_name, trains_bought, note) {
     const { status, json } = await reqJSON("/api/trains/add", "POST", { company_id, buyer_name, trains_bought, note }, tokenHeaders());
     if (status >= 400 || !json || json.ok !== true) throw new Error(json?.error || "Add train failed");
@@ -469,7 +482,6 @@
     return json;
   }
 
-  // Contracts
   async function contractsAdd(company_id, title, employee_id, employee_name, expires_at, note) {
     const { status, json } = await reqJSON("/api/contracts/add", "POST", { company_id, title, employee_id, employee_name, expires_at, note }, tokenHeaders());
     if (status >= 400 || !json || json.ok !== true) throw new Error(json?.error || "Add contract failed");
@@ -503,11 +515,12 @@
       state.last = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
       const unseen = Number(j.unseen_count || 0);
-      const b = document.getElementById("peacehub-badge");
+      const b = document.getElementById(EL_BADGE);
       if (b) {
         if (unseen > 0) { b.style.display = "flex"; b.textContent = unseen > 99 ? "99+" : String(unseen); }
         else b.style.display = "none";
       }
+
       render();
     } catch (e) {
       if (!silent) toastMsg(String(e.message || "Refresh failed"));
@@ -531,7 +544,6 @@
     top.className = "card";
     top.innerHTML = `
       <div style="font-weight:1000;">Company Hub</div>
-      <div class="muted">made by Fries91</div>
       <div class="muted">User: ${escapeHtml(d.user?.name || "")} [${escapeHtml(d.user?.user_id || "")}]</div>
       <div class="muted">Updated: ${escapeHtml(d.updated_at || "")}</div>
     `;
@@ -546,10 +558,7 @@
         : `Company ${cid}`;
       return `<option value="${escapeHtml(cid)}" ${selected}>${escapeHtml(label)}</option>`;
     }).join("");
-    sel.onchange = async () => {
-      state.selected_company_id = sel.value;
-      await refresh(true);
-    };
+    sel.onchange = async () => { state.selected_company_id = sel.value; await refresh(true); };
     wrap.appendChild(sel);
 
     const comp = d.company;
@@ -581,10 +590,7 @@
     c3.appendChild(list);
 
     if (!emps.length) {
-      const m = document.createElement("div");
-      m.className = "muted";
-      m.textContent = "—";
-      list.appendChild(m);
+      list.innerHTML = `<div class="muted">—</div>`;
     } else {
       emps.forEach(e => {
         const total = (Number(e.man || 0) + Number(e.int || 0) + Number(e.end || 0)) || 0;
@@ -618,36 +624,629 @@
     return wrap;
   }
 
-  // (rest of your script unchanged, except the header render below)
+  function viewTrains() {
+    const wrap = document.createElement("div");
+    const d = state.data;
 
-  function viewTrains() { /* unchanged */ return document.createElement("div"); }
-  function viewContracts() { /* unchanged */ return document.createElement("div"); }
-  function viewRecruit() { /* unchanged */ return document.createElement("div"); }
-  function viewHof() { /* unchanged */ return document.createElement("div"); }
-  function viewNotifs() { /* unchanged */ return document.createElement("div"); }
-  function viewSettings() { /* unchanged */ return document.createElement("div"); }
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = `<div style="font-weight:1000;">Trains</div><div class="muted">Add purchases, track used, delete records.</div>`;
+    wrap.appendChild(c);
+
+    if (!d?.selected_company_id) {
+      wrap.appendChild(Object.assign(document.createElement("div"), { className: "card muted", textContent: "Select a company in Hub tab first." }));
+      return wrap;
+    }
+
+    const add = document.createElement("div");
+    add.className = "card";
+    add.innerHTML = `<div style="font-weight:1000;">Add Train Purchase</div>`;
+
+    const buyer = document.createElement("input"); buyer.placeholder = "Buyer name (required)";
+    const qty = document.createElement("input"); qty.type = "number"; qty.placeholder = "Trains bought (required)";
+    const note = document.createElement("input"); note.placeholder = "Note (optional)";
+    const btnAdd = document.createElement("button"); btnAdd.className = "btn"; btnAdd.textContent = "Add";
+
+    add.append(buyer, gap8(), qty, gap8(), note, gap10(), btnAdd);
+    wrap.appendChild(add);
+
+    btnAdd.onclick = async () => {
+      try {
+        const b = buyer.value.trim();
+        const n = Number(qty.value || 0);
+        if (!b || n <= 0) return toastMsg("Buyer + trains required");
+        btnAdd.disabled = true;
+        await trainsAdd(d.selected_company_id, b, n, note.value.trim());
+        toastMsg("Added");
+        buyer.value = ""; qty.value = ""; note.value = "";
+        await refresh(true);
+      } catch (e) {
+        toastMsg(e.message || "Add failed");
+      } finally {
+        btnAdd.disabled = false;
+      }
+    };
+
+    const rows = Array.isArray(d.trains) ? d.trains : [];
+    const listCard = document.createElement("div");
+    listCard.className = "card";
+    listCard.innerHTML = `<div style="font-weight:1000;">Records</div><div class="muted">Company #${escapeHtml(d.selected_company_id)}</div>`;
+    const list = document.createElement("div");
+    list.className = "list";
+    listCard.appendChild(list);
+
+    if (!rows.length) {
+      list.innerHTML = `<div class="muted">—</div>`;
+    } else {
+      rows.forEach(r => {
+        const id = r.id ?? 0;
+        const bought = Number(r.trains_bought ?? 0);
+        const used = Number(r.trains_used ?? 0);
+
+        const item = document.createElement("div");
+        item.className = "card";
+        item.style.marginBottom = "0";
+        item.innerHTML = `
+          <div class="row">
+            <div style="flex:2;min-width:0;">
+              <div style="font-weight:1000;">${escapeHtml(fmt(r.buyer_name || r.buyer))}</div>
+              <div class="muted">${escapeHtml(fmt(r.created_at))}${r.note ? " • " + escapeHtml(String(r.note)) : ""}</div>
+              <div class="muted">Bought: ${escapeHtml(String(bought))} • Used: ${escapeHtml(String(used))}</div>
+            </div>
+            <button class="btn danger" data-del style="flex:0 0 auto;">Delete</button>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <input data-used type="number" placeholder="Set used…" value="${escapeHtml(String(used))}">
+            <button class="btn" data-set>Save Used</button>
+          </div>
+        `;
+
+        item.querySelector("[data-del]")?.addEventListener("click", async () => {
+          try { await trainsDelete(Number(id)); toastMsg("Deleted"); await refresh(true); }
+          catch (e) { toastMsg(e.message || "Delete failed"); }
+        });
+
+        item.querySelector("[data-set]")?.addEventListener("click", async () => {
+          try {
+            const v = Number(item.querySelector("[data-used]")?.value || 0);
+            if (v < 0) return toastMsg("Used must be 0+");
+            await trainsSetUsed(Number(id), v);
+            toastMsg("Saved");
+            await refresh(true);
+          } catch (e) {
+            toastMsg(e.message || "Save failed");
+          }
+        });
+
+        list.appendChild(item);
+      });
+    }
+
+    wrap.appendChild(listCard);
+    return wrap;
+  }
+
+  function viewContracts() {
+    const wrap = document.createElement("div");
+    const d = state.data;
+
+    wrap.appendChild(card(`<div style="font-weight:1000;">Contracts</div><div class="muted">Add contracts per company and delete when done.</div>`));
+
+    if (!d?.selected_company_id) {
+      wrap.appendChild(Object.assign(document.createElement("div"), { className: "card muted", textContent: "Select a company in Hub tab first." }));
+      return wrap;
+    }
+
+    const add = document.createElement("div");
+    add.className = "card";
+    add.innerHTML = `<div style="font-weight:1000;">Add Contract</div>`;
+
+    const title = document.createElement("input"); title.placeholder = "Title (required)";
+    const empId = document.createElement("input"); empId.placeholder = "Employee id (optional)";
+    const empName = document.createElement("input"); empName.placeholder = "Employee name (optional)";
+    const exp = document.createElement("input"); exp.placeholder = "Expires at (text) e.g. 2026-04-01";
+    const note = document.createElement("input"); note.placeholder = "Note (optional)";
+    const btnAdd = document.createElement("button"); btnAdd.className = "btn"; btnAdd.textContent = "Add";
+
+    [title, empId, empName, exp, note].forEach((x, i) => { if (i) add.appendChild(gap8()); add.appendChild(x); });
+    add.appendChild(gap10());
+    add.appendChild(btnAdd);
+    wrap.appendChild(add);
+
+    btnAdd.onclick = async () => {
+      try {
+        const t = title.value.trim();
+        if (!t) return toastMsg("Title required");
+        btnAdd.disabled = true;
+        await contractsAdd(d.selected_company_id, t, empId.value.trim(), empName.value.trim(), exp.value.trim(), note.value.trim());
+        toastMsg("Added");
+        title.value=""; empId.value=""; empName.value=""; exp.value=""; note.value="";
+        await refresh(true);
+      } catch (e) {
+        toastMsg(e.message || "Add failed");
+      } finally {
+        btnAdd.disabled = false;
+      }
+    };
+
+    const rows = Array.isArray(d.contracts) ? d.contracts : [];
+    const listCard = document.createElement("div");
+    listCard.className = "card";
+    listCard.innerHTML = `<div style="font-weight:1000;">Records</div><div class="muted">Company #${escapeHtml(d.selected_company_id)}</div>`;
+    const list = document.createElement("div");
+    list.className = "list";
+    listCard.appendChild(list);
+
+    if (!rows.length) {
+      list.innerHTML = `<div class="muted">—</div>`;
+    } else {
+      rows.forEach(r => {
+        const id = r.id ?? 0;
+        const item = document.createElement("div");
+        item.className = "card";
+        item.style.marginBottom = "0";
+        item.innerHTML = `
+          <div class="row">
+            <div style="flex:2;min-width:0;">
+              <div style="font-weight:1000;">${escapeHtml(fmt(r.title))}</div>
+              <div class="muted">${escapeHtml(fmt(r.employee_name))}${r.employee_id ? " ["+escapeHtml(String(r.employee_id))+"]" : ""}</div>
+              <div class="muted">Expires: ${escapeHtml(fmt(r.expires_at))}</div>
+              <div class="muted">${escapeHtml(fmt(r.note))}</div>
+            </div>
+            <button class="btn danger" data-del style="flex:0 0 auto;">Delete</button>
+          </div>
+        `;
+        item.querySelector("[data-del]")?.addEventListener("click", async () => {
+          try { await contractsDelete(Number(id)); toastMsg("Deleted"); await refresh(true); }
+          catch (e) { toastMsg(e.message || "Delete failed"); }
+        });
+        list.appendChild(item);
+      });
+    }
+
+    wrap.appendChild(listCard);
+    return wrap;
+  }
+
+  function viewRecruit() {
+    const wrap = document.createElement("div");
+    const d = state.data;
+
+    wrap.appendChild(card(`
+      <div style="font-weight:1000;">Recruit Leads</div>
+      <div class="muted">Scans HoF and stores leads beating your weakest employee total.</div>
+    `));
+
+    if (!d?.selected_company_id) {
+      wrap.appendChild(Object.assign(document.createElement("div"), { className: "card muted", textContent: "Select a company in Hub tab first." }));
+      return wrap;
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "card";
+    actions.innerHTML = `
+      <div style="font-weight:1000;">Actions</div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" data-scan>Scan This Company</button>
+        <button class="btn" data-load>Load Leads</button>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" data-seen>Mark Seen</button>
+        <button class="btn danger" data-clear>Clear Leads</button>
+      </div>
+      <div class="muted" style="margin-top:10px;" id="rec-msg">—</div>
+    `;
+    wrap.appendChild(actions);
+
+    const msg = qs("#rec-msg", actions);
+
+    const listCard = document.createElement("div");
+    listCard.className = "card";
+    listCard.innerHTML = `<div style="font-weight:1000;">Leads</div><div class="muted">Company #${escapeHtml(d.selected_company_id)}</div>`;
+    const list = document.createElement("div");
+    list.className = "list";
+    listCard.appendChild(list);
+    wrap.appendChild(listCard);
+
+    async function loadLeads(showToast) {
+      list.innerHTML = `<div class="muted">Loading…</div>`;
+      try {
+        const res = await recruitLeads(d.selected_company_id);
+        const rows = Array.isArray(res.rows) ? res.rows : [];
+        list.innerHTML = rows.length ? "" : `<div class="muted">—</div>`;
+        rows.forEach(r => {
+          const pid = r.player_id || r.id;
+          const item = document.createElement("div");
+          item.className = "card";
+          item.style.marginBottom = "0";
+          item.innerHTML = `
+            <div class="row">
+              <button class="btn" data-open style="flex:1;text-align:left;">
+                ${escapeHtml(fmt(r.name))} [${escapeHtml(fmt(pid))}]
+              </button>
+              <div style="text-align:right;min-width:120px;">
+                <div class="pill">+${escapeHtml(fmt(r.delta_vs_floor))}</div><br>
+                <div class="muted" style="margin-top:6px;">Total: ${escapeHtml(fmt(r.total))}</div>
+              </div>
+            </div>
+            <div class="muted" style="margin-top:8px;">
+              MAN ${escapeHtml(fmt(r.man))} • INT ${escapeHtml(fmt(r.intel || r.int))} • END ${escapeHtml(fmt(r.endu || r.end))}
+            </div>
+          `;
+          item.querySelector("[data-open]")?.addEventListener("click", () => {
+            if (!pid) return;
+            window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(pid)}`, "_blank");
+          });
+          list.appendChild(item);
+        });
+        if (showToast) toastMsg("Loaded");
+      } catch (e) {
+        list.innerHTML = `<div class="muted">${escapeHtml(e.message || "Load failed")}</div>`;
+        if (showToast) toastMsg("Load failed");
+      }
+    }
+
+    qs("[data-scan]", actions).onclick = async () => {
+      try {
+        msg.textContent = "Scanning…";
+        await recruitScan(d.selected_company_id);
+        msg.textContent = "Scan complete.";
+        toastMsg("Scan done");
+        await loadLeads(false);
+        await refresh(true);
+      } catch (e) {
+        msg.textContent = e.message || "Scan failed";
+        toastMsg("Scan failed");
+      }
+    };
+    qs("[data-load]", actions).onclick = async () => { await loadLeads(true); };
+    qs("[data-seen]", actions).onclick = async () => {
+      try { await recruitSeen(d.selected_company_id); toastMsg("Marked seen"); await refresh(true); }
+      catch (e) { toastMsg(e.message || "Seen failed"); }
+    };
+    qs("[data-clear]", actions).onclick = async () => {
+      try { await recruitClear(d.selected_company_id); toastMsg("Cleared"); await loadLeads(false); await refresh(true); }
+      catch (e) { toastMsg(e.message || "Clear failed"); }
+    };
+
+    const cached = Array.isArray(d.recruit_leads) ? d.recruit_leads : [];
+    if (cached.length) {
+      list.innerHTML = "";
+      cached.forEach(r => {
+        const pid = r.player_id || r.id;
+        const item = document.createElement("div");
+        item.className = "card";
+        item.style.marginBottom = "0";
+        item.innerHTML = `
+          <div class="row">
+            <button class="btn" data-open style="flex:1;text-align:left;">
+              ${escapeHtml(fmt(r.name))} [${escapeHtml(fmt(pid))}]
+            </button>
+            <div style="text-align:right;min-width:120px;">
+              <div class="pill">+${escapeHtml(fmt(r.delta_vs_floor))}</div><br>
+              <div class="muted" style="margin-top:6px;">Total: ${escapeHtml(fmt(r.total))}</div>
+            </div>
+          </div>
+        `;
+        item.querySelector("[data-open]")?.addEventListener("click", () => {
+          if (!pid) return;
+          window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(pid)}`, "_blank");
+        });
+        list.appendChild(item);
+      });
+    } else {
+      list.innerHTML = `<div class="muted">Tap “Load Leads”</div>`;
+    }
+
+    return wrap;
+  }
+
+  function viewHof() {
+    const wrap = document.createElement("div");
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = `
+      <div style="font-weight:1000;">HoF Workstats Search</div>
+      <div class="muted">TOTAL-only filter (MAN+INT+END).</div>
+    `;
+    wrap.appendChild(c);
+
+    const minTotal = document.createElement("input"); minTotal.type="number"; minTotal.placeholder="Min TOTAL (e.g. 500)";
+    const maxTotal = document.createElement("input"); maxTotal.type="number"; maxTotal.placeholder="Max TOTAL (e.g. 120000)";
+    const go = document.createElement("button"); go.className = "btn"; go.textContent = "Search";
+
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.style.marginTop = "10px";
+    meta.textContent = "—";
+
+    const grid = document.createElement("div"); grid.className="row"; grid.append(minTotal, maxTotal);
+
+    c.appendChild(gap10());
+    c.appendChild(grid);
+    c.appendChild(gap10());
+    c.appendChild(go);
+    c.appendChild(meta);
+
+    const listCard = document.createElement("div");
+    listCard.className = "card";
+    listCard.innerHTML = `<div style="font-weight:1000;">Results</div>`;
+    const list = document.createElement("div");
+    list.className = "list";
+    listCard.appendChild(list);
+    wrap.appendChild(listCard);
+
+    function renderRows() {
+      list.innerHTML = "";
+      if (!state.hofRows.length) {
+        list.innerHTML = `<div class="muted">—</div>`;
+        return;
+      }
+      state.hofRows.forEach(r => {
+        const item = document.createElement("div");
+        item.className = "card";
+        item.style.marginBottom = "0";
+        item.innerHTML = `
+          <div class="row">
+            <button class="btn" data-open style="flex:1;text-align:left;">
+              ${escapeHtml(fmt(r.name))} [${escapeHtml(fmt(r.id))}]
+            </button>
+            <div style="text-align:right;min-width:120px;">
+              <div class="pill">Total: ${escapeHtml(fmt(r.total))}</div>
+            </div>
+          </div>
+          <div class="muted" style="margin-top:8px;">
+            MAN ${escapeHtml(fmt(r.man))} • INT ${escapeHtml(fmt(r.int))} • END ${escapeHtml(fmt(r.end))}
+          </div>
+        `;
+        item.querySelector("[data-open]")?.addEventListener("click", () => {
+          if (!r.id) return;
+          window.open(`https://www.torn.com/profiles.php?XID=${encodeURIComponent(r.id)}`, "_blank");
+        });
+        list.appendChild(item);
+      });
+    }
+
+    go.onclick = async () => {
+      if (!state.token) return toastMsg("Login first");
+      try {
+        go.disabled = true;
+        meta.textContent = "Searching…";
+
+        const min_total = Number(minTotal.value || 0);
+        const max_total = maxTotal.value === "" ? (10 ** 12) : Number(maxTotal.value || (10 ** 12));
+
+        const res = await hofSearch({ min_total, max_total });
+        state.hofCount = Number(res.count || 0);
+        state.hofRows = Array.isArray(res.rows) ? res.rows : [];
+        meta.textContent = `Found: ${state.hofCount} (showing ${state.hofRows.length})`;
+        renderRows();
+        toastMsg("Done");
+      } catch (e) {
+        meta.textContent = e.message || "Failed";
+        toastMsg("Search failed");
+      } finally {
+        go.disabled = false;
+      }
+    };
+
+    renderRows();
+    return wrap;
+  }
+
+  function viewNotifs() {
+    const wrap = document.createElement("div");
+    const d = state.data;
+
+    wrap.appendChild(card(`<div style="font-weight:1000;">Notifications</div><div class="muted">Recent system + hub alerts.</div>`));
+
+    const actions = document.createElement("div");
+    actions.className = "card";
+    actions.innerHTML = `
+      <div class="row">
+        <button class="btn" data-seen>Mark Seen</button>
+        <button class="btn" data-refresh>Refresh</button>
+      </div>
+    `;
+    wrap.appendChild(actions);
+
+    qs("[data-seen]", actions).onclick = async () => {
+      try { await notifsSeen(); toastMsg("Seen"); await refresh(true); }
+      catch (e) { toastMsg(e.message || "Failed"); }
+    };
+    qs("[data-refresh]", actions).onclick = async () => { await refresh(false); };
+
+    const listCard = document.createElement("div");
+    listCard.className = "card";
+    listCard.innerHTML = `<div style="font-weight:1000;">Recent</div>`;
+    const list = document.createElement("div");
+    list.className = "list";
+    listCard.appendChild(list);
+    wrap.appendChild(listCard);
+
+    const rows = Array.isArray(d?.notifications) ? d.notifications : [];
+    if (!rows.length) {
+      list.innerHTML = `<div class="muted">—</div>`;
+      return wrap;
+    }
+
+    rows.forEach(n => {
+      const seen = Number(n.seen || 0) === 1;
+      const item = document.createElement("div");
+      item.className = "card";
+      item.style.marginBottom = "0";
+      item.innerHTML = `
+        <div style="font-weight:1000;">
+          ${escapeHtml(fmt(n.kind || "system"))}
+          ${seen ? `<span class="pill" style="opacity:.65;margin-left:6px;">seen</span>` : `<span class="pill" style="margin-left:6px;">new</span>`}
+        </div>
+        <div class="muted" style="margin-top:8px;">${escapeHtml(fmt(n.message || ""))}</div>
+        <div class="muted" style="margin-top:8px;">${escapeHtml(fmt(n.created_at || ""))}</div>
+      `;
+      list.appendChild(item);
+    });
+
+    return wrap;
+  }
+
+  function viewSettings() {
+    const wrap = document.createElement("div");
+
+    wrap.appendChild(card(`
+      <div style="font-weight:1000;">Settings / Login</div>
+      <div class="muted">Server: ${escapeHtml(BASE_URL)}</div>
+      <div class="muted">If you see “Bad JSON”, the preview is your server’s actual response (502/HTML/error).</div>
+    `));
+
+    const c = wrap.lastChild;
+
+    const admin = document.createElement("input");
+    admin.placeholder = "Admin key (provided by you)";
+    admin.value = state.admin_key || "";
+
+    const api = document.createElement("input");
+    api.placeholder = "User Torn API key";
+    api.value = state.api_key || "";
+
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const login = document.createElement("button");
+    login.className = "btn";
+    login.textContent = "Login";
+
+    const logout = document.createElement("button");
+    logout.className = "btn danger";
+    logout.textContent = "Logout";
+
+    row.append(login, logout);
+
+    const health = document.createElement("button");
+    health.className = "btn";
+    health.textContent = "Test /health";
+
+    const status = document.createElement("div");
+    status.className = "muted";
+    status.style.marginTop = "10px";
+    status.textContent = state.token ? "Session: saved" : "Session: none";
+
+    c.append(gap10(), admin, gap8(), api, gap10(), row, gap8(), health, status);
+
+    health.onclick = async () => {
+      try {
+        const { status: st, raw } = await reqJSON("/health", "GET");
+        const prev = String(raw || "").replace(/\s+/g, " ").slice(0, 160);
+        toastMsg(`/health ${st}: ${prev || "[empty]"}`);
+      } catch (e) {
+        toastMsg(e.message || "Health failed");
+      }
+    };
+
+    login.onclick = async () => {
+      try {
+        const ak = admin.value.trim();
+        const pk = api.value.trim();
+        if (!ak || !pk) return toastMsg("Admin key + API key required");
+
+        login.disabled = true;
+
+        state.admin_key = ak;
+        state.api_key = pk;
+        S.set("companyhub_admin_key", ak);
+        S.set("companyhub_api_key", pk);
+
+        const j = await doAuth(ak, pk);
+        status.textContent = `Logged in as ${j.name || "user"} [${j.user_id || ""}]`;
+        toastMsg("Logged in");
+        await refresh(true);
+        startPolling();
+      } catch (e) {
+        status.textContent = e.message || "Login failed";
+        toastMsg(e.message || "Login failed");
+      } finally {
+        login.disabled = false;
+      }
+    };
+
+    logout.onclick = () => {
+      state.token = "";
+      S.del("companyhub_session_token");
+      state.data = null;
+      stopPolling();
+      toastMsg("Logged out");
+      status.textContent = "Session: none";
+      render();
+    };
+
+    const c2 = card(`
+      <div style="font-weight:1000;">My Company IDs</div>
+      <div class="muted">Comma separated (example): 123,456</div>
+    `);
+    wrap.appendChild(c2);
+
+    const ids = document.createElement("input");
+    ids.placeholder = "123,456,789";
+    ids.value = state.company_ids_input || "";
+
+    const save = document.createElement("button");
+    save.className = "btn";
+    save.textContent = "Save Company IDs";
+
+    const note = document.createElement("div");
+    note.className = "muted";
+    note.style.marginTop = "10px";
+    note.textContent = "—";
+
+    c2.append(ids, gap10(), save, note);
+
+    save.onclick = async () => {
+      if (!state.token) return toastMsg("Login first");
+      try {
+        save.disabled = true;
+
+        const raw = ids.value.split(",").map(s => s.trim()).filter(Boolean);
+        if (!raw.length) return toastMsg("Enter at least 1 company id");
+        if (!raw.every(x => /^\d+$/.test(x))) return toastMsg("Company IDs must be numeric");
+
+        state.company_ids_input = raw.join(",");
+        S.set("companyhub_company_ids_input", state.company_ids_input);
+
+        const res = await saveCompanyIds(raw);
+        note.textContent = `Saved ${res.company_ids?.length || 0} company ids.`;
+        toastMsg("Saved");
+        await refresh(true);
+      } catch (e) {
+        note.textContent = e.message || "Save failed";
+        toastMsg("Save failed");
+      } finally {
+        save.disabled = false;
+      }
+    };
+
+    return wrap;
+  }
+
+  // small helpers for layout
+  function gap8(){ const d=document.createElement("div"); d.style.height="8px"; return d; }
+  function gap10(){ const d=document.createElement("div"); d.style.height="10px"; return d; }
+  function card(html){ const d=document.createElement("div"); d.className="card"; d.innerHTML=html; return d; }
 
   // ---------------- Render ----------------
   function render() {
-    S.set("peacehub_tab", state.tab);
-
-    // ✅ Branding
-    const service = "Company Hub";
-    const maker = "made by Fries91";
+    S.set("companyhub_tab", state.tab);
 
     const userName = state.data?.user?.name ? `• ${state.data.user.name}` : "";
     const last = state.last || "—";
 
     panel.innerHTML = `
-      <div class="head" id="peacehub-head">
+      <div class="head" id="companyhub-head">
         <div>
-          <div class="title">${escapeHtml(service)}</div>
-          <div class="sub" style="opacity:.9;">${escapeHtml(maker)}</div>
+          <div class="title">Company Hub <span style="opacity:.75;font-weight:900;">— made by Fries91</span></div>
           <div class="sub">Last: ${escapeHtml(last)} ${escapeHtml(userName)}</div>
         </div>
         <div style="display:flex;gap:6px;">
-          <button class="btn" id="ph-refresh" title="Refresh">↻</button>
-          <button class="btn" id="ph-close" title="Close">✕</button>
+          <button class="btn" id="ch-refresh" title="Refresh">↻</button>
+          <button class="btn" id="ch-close" title="Close">✕</button>
         </div>
       </div>
 
@@ -661,11 +1260,11 @@
         <div class="tab ${state.tab === "settings" ? "active" : ""}" data-tab="settings">Settings</div>
       </div>
 
-      <div class="body" id="peacehub-body"></div>
+      <div class="body" id="companyhub-body"></div>
     `;
 
-    qs("#ph-close", panel).onclick = () => toggle(false);
-    qs("#ph-refresh", panel).onclick = () => refresh(false);
+    qs("#ch-close", panel).onclick = () => toggle(false);
+    qs("#ch-refresh", panel).onclick = () => refresh(false);
 
     panel.querySelectorAll("[data-tab]").forEach(el => {
       el.addEventListener("click", () => {
@@ -674,7 +1273,7 @@
       });
     });
 
-    const body = qs("#peacehub-body", panel);
+    const body = qs("#companyhub-body", panel);
     if (state.tab === "hub") body.appendChild(viewHub());
     if (state.tab === "trains") body.appendChild(viewTrains());
     if (state.tab === "contracts") body.appendChild(viewContracts());
@@ -683,7 +1282,7 @@
     if (state.tab === "notifs") body.appendChild(viewNotifs());
     if (state.tab === "settings") body.appendChild(viewSettings());
 
-    const head = qs("#peacehub-head", panel);
+    const head = qs("#companyhub-head", panel);
     makeDraggableTap(head, {
       onTap: null,
       onSavePos: (x, y) => {
@@ -692,8 +1291,8 @@
         panel.style.right = "auto";
         panel.style.bottom = "auto";
         state.panelLeft = x; state.panelTop = y;
-        S.set("peacehub_panel_left", x);
-        S.set("peacehub_panel_top", y);
+        S.set("companyhub_panel_left", x);
+        S.set("companyhub_panel_top", y);
       },
       allowDrag: true
     });
@@ -719,5 +1318,7 @@
 
   // ---------------- Start ----------------
   render();
+  // show quick toast so you KNOW script is running
+  toastMsg("Company Hub loaded ✅");
 
 })();
